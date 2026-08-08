@@ -1,0 +1,1344 @@
+import asyncio
+import hashlib
+import json
+import sqlite3
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import closing
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+
+from backend.auto_trader import AutoTrader, STATUS_WIN
+from backend.robot_persistence import (
+    SQLiteRobotPersistence,
+    SupabaseRobotPersistence,
+    extract_robot_settings,
+)
+from bullex_service import main as bullex_main
+from bullex_service.session_store import SessionStore
+
+
+class SessionPersistenceTests(unittest.TestCase):
+    def test_ready_state_switches_bullex_to_real_and_confirms_it(self) -> None:
+        active_mode = {"value": "PRACTICE"}
+        change_balance = Mock(
+            side_effect=lambda mode: active_mode.update(value=mode)
+        )
+        session = bullex_main.ManagedSession(
+            user_id="switch-to-real",
+            client=SimpleNamespace(
+                get_profile_ansyc=lambda: {
+                    "balances": [
+                        {"id": 101, "type": 1},
+                        {"id": 202, "type": 4},
+                    ]
+                },
+                get_balance_mode=lambda: active_mode["value"],
+                change_balance=change_balance,
+                get_balance=lambda: 50,
+                get_currency=lambda: "BRL",
+            ),
+            desired_mode="REAL",
+        )
+        manager = bullex_main.SessionManager(None)
+
+        with patch.object(bullex_main.time, "sleep", return_value=None):
+            with self.assertLogs("bullex-service", level="INFO") as logs:
+                manager._populate_ready_state(session, user_id=session.user_id, attempt=1)
+
+        change_balance.assert_called_once_with("REAL")
+        self.assertEqual(active_mode["value"], "REAL")
+        output = "\n".join(logs.output)
+        self.assertIn("[REAL_BALANCE_ID_FOUND]", output)
+        self.assertIn("[REAL_MODE_FORCED]", output)
+        self.assertIn("[CHANGE_BALANCE_REAL_CALL]", output)
+        self.assertIn("[CHANGE_BALANCE_REAL_OK]", output)
+        self.assertIn("[REAL_MODE_CONFIRMED]", output)
+
+    def test_ready_state_marks_unconfirmed_real_mode_without_loading_practice_balance(self) -> None:
+        get_balance = Mock(return_value=10000)
+        session = bullex_main.ManagedSession(
+            user_id="still-practice",
+            client=SimpleNamespace(
+                get_balance_mode=lambda: "PRACTICE",
+                change_balance=Mock(),
+                get_balance=get_balance,
+                get_currency=lambda: "USD",
+            ),
+            desired_mode="REAL",
+        )
+        manager = bullex_main.SessionManager(None)
+
+        with patch.object(bullex_main.time, "sleep", return_value=None):
+            with self.assertLogs("bullex-service", level="WARNING") as logs:
+                manager._populate_ready_state(session, user_id=session.user_id, attempt=1)
+
+        self.assertEqual(session.active_mode, "PRACTICE")
+        self.assertFalse(session.real_mode_confirmed)
+        get_balance.assert_not_called()
+        self.assertIn("[REAL_MODE_FAILED]", "\n".join(logs.output))
+
+    def test_force_real_mode_retries_three_times_before_failing(self) -> None:
+        change_balance = Mock()
+        session = bullex_main.ManagedSession(
+            user_id="retry-still-practice",
+            client=SimpleNamespace(
+                get_balance_mode=Mock(return_value="PRACTICE"),
+                change_balance=change_balance,
+            ),
+            desired_mode="REAL",
+        )
+
+        with patch.object(bullex_main.time, "sleep", return_value=None):
+            with self.assertLogs("bullex-service", level="INFO") as logs:
+                with self.assertRaisesRegex(
+                    bullex_main.ServiceError,
+                    "BULLEX_ACTIVE_MODE_NOT_REAL",
+                ):
+                    bullex_main.force_real_mode(session, user_id=session.user_id)
+
+        self.assertEqual(change_balance.call_count, 3)
+        output = "\n".join(logs.output)
+        self.assertIn("[CHANGE_BALANCE_REAL_ATTEMPT]", output)
+        self.assertIn("[CHANGE_BALANCE_REAL_RESULT]", output)
+        self.assertIn("[ACTIVE_MODE_AFTER_CHANGE]", output)
+        self.assertIn("[REAL_MODE_FAILED]", output)
+
+    def test_ensure_real_balance_id_resyncs_stale_global_balance(self) -> None:
+        change_balance = Mock(
+            side_effect=lambda _mode: setattr(bullex_main.global_value, "balance_id", 1209400704)
+        )
+        session = bullex_main.ManagedSession(
+            user_id="resync-balance",
+            client=SimpleNamespace(
+                get_profile_ansyc=lambda: {
+                    "balances": [
+                        {"id": 1209400704, "type": 1, "amount": 100.0},
+                        {"id": 1209400705, "type": 4, "amount": 10000.0},
+                    ]
+                },
+                change_balance=change_balance,
+                position_change_all=Mock(),
+            ),
+        )
+        bullex_main.global_value.balance_id = None
+
+        with self.assertLogs("bullex-service", level="INFO") as logs:
+            balance_id = bullex_main.ensure_real_balance_id_for_buy(
+                session,
+                user_id=session.user_id,
+            )
+
+        self.assertEqual(balance_id, 1209400704)
+        self.assertEqual(bullex_main.global_value.balance_id, 1209400704)
+        self.assertEqual(session.state.balance_id, 1209400704)
+        change_balance.assert_called_once_with("REAL")
+        output = "\n".join(logs.output)
+        self.assertIn("[REAL_BALANCE_ID_RESYNC]", output)
+        self.assertIn("[REAL_BUY_BALANCE_ID]", output)
+
+    def test_ensure_prefers_fresh_get_balances_over_stale_profile(self) -> None:
+        """Regressão: profile cacheado com id velho + saldo na conta (id novo)."""
+        change_balance = Mock(
+            # Simula change_balance lendo profile velho e setando id obsoleto.
+            side_effect=lambda _mode: setattr(bullex_main.global_value, "balance_id", 1209400704)
+        )
+        position_change = Mock()
+        session = bullex_main.ManagedSession(
+            user_id="fresh-balances",
+            client=SimpleNamespace(
+                get_profile_ansyc=lambda: {
+                    "balances": [
+                        {"id": 1209400704, "type": 1, "amount": 0.0},
+                        {"id": 1209400705, "type": 4, "amount": 10000.0},
+                    ]
+                },
+                get_balances=lambda: {
+                    "msg": [
+                        {"id": 1226252784, "type": 1, "amount": 10657.46},
+                        {"id": 1226252785, "type": 4, "amount": 10000.0},
+                    ]
+                },
+                change_balance=change_balance,
+                position_change_all=position_change,
+            ),
+        )
+        bullex_main.global_value.balance_id = 1209400704
+
+        with self.assertLogs("bullex-service", level="INFO") as logs:
+            balance_id = bullex_main.ensure_real_balance_id_for_buy(
+                session,
+                user_id=session.user_id,
+            )
+
+        self.assertEqual(balance_id, 1226252784)
+        self.assertEqual(bullex_main.global_value.balance_id, 1226252784)
+        self.assertEqual(session.state.balance_id, 1226252784)
+        output = "\n".join(logs.output)
+        self.assertIn("[BALANCE_IDS_DISCOVERED] source=get_balances", output)
+        self.assertIn("[REAL_BALANCE_ID_PIN]", output)
+
+    def test_is_user_balance_not_found_error_detects_broker_message(self) -> None:
+        self.assertTrue(
+            bullex_main.is_user_balance_not_found_error("User balance not found")
+        )
+        self.assertTrue(
+            bullex_main.is_user_balance_not_found_error("falha: balance not found")
+        )
+        self.assertFalse(bullex_main.is_user_balance_not_found_error("ASSET_CLOSED"))
+
+    def test_buy_real_retries_once_on_user_balance_not_found(self) -> None:
+        buy_calls = {"count": 0}
+        balances_calls = {"count": 0}
+
+        def buy(amount, active, action, expiration):
+            buy_calls["count"] += 1
+            if bullex_main.global_value.balance_id == 1209400704:
+                return False, "User balance not found"
+            return True, "order-999"
+
+        def change_balance(mode: str) -> None:
+            bullex_main.global_value.balance_id = 1209400704
+
+        def get_balances():
+            # 1ª chamada falha → cai no profile cacheado (id velho).
+            # Depois retorna o catálogo fresco com o id REAL válido.
+            balances_calls["count"] += 1
+            if balances_calls["count"] == 1:
+                raise RuntimeError("balances_timeout")
+            return {
+                "msg": [
+                    {"id": 1226252784, "type": 1, "amount": 10657.46},
+                    {"id": 1226252785, "type": 4, "amount": 10000.0},
+                ]
+            }
+
+        session = bullex_main.ManagedSession(
+            user_id="buy-retry-balance",
+            client=SimpleNamespace(
+                check_connect=lambda: True,
+                get_balance_mode=Mock(return_value="REAL"),
+                get_profile_ansyc=lambda: {
+                    "balances": [
+                        {"id": 1209400704, "type": 1, "amount": 0.0},
+                        {"id": 1209400705, "type": 4, "amount": 10000.0},
+                    ]
+                },
+                get_balances=get_balances,
+                change_balance=change_balance,
+                position_change_all=Mock(),
+                buy=buy,
+            ),
+            desired_mode="REAL",
+            real_mode_confirmed=True,
+            active_mode="REAL",
+        )
+        bullex_main.global_value.balance_id = 1209400704
+        manager = bullex_main.SessionManager(None)
+        manager.upsert(session)
+
+        payload = bullex_main.BuyOrderRequest(
+            active="GBPUSD-OTC",
+            amount=50.0,
+            action="put",
+            expiration=5,
+            confirm_real=True,
+        )
+
+        with patch.object(bullex_main, "session_manager", manager):
+            with patch.object(bullex_main.time, "sleep", return_value=None):
+                with self.assertLogs("bullex-service", level="INFO") as logs:
+                    result = bullex_main.buy_real(payload, x_user_id=session.user_id)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["order_id"], "order-999")
+        self.assertGreaterEqual(buy_calls["count"], 2)
+        self.assertEqual(bullex_main.global_value.balance_id, 1226252784)
+        output = "\n".join(logs.output)
+        self.assertIn("[REAL_BUY_RETRY_BALANCE]", output)
+        self.assertIn("[REAL_BUY_RETRY_PINNED]", output)
+
+    def test_service_account_blocks_practice_balance(self) -> None:
+        account = {
+            "user_id": "practice-account",
+            "connected": True,
+            "active_mode": "PRACTICE",
+            "mode": "PRACTICE",
+            "balance": 9636.77,
+            "balance_practice": 9636.77,
+        }
+
+        payload = bullex_main.build_real_only_account_response(account)
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "BULLEX_ACTIVE_MODE_NOT_REAL")
+        self.assertEqual(payload["data"]["active_mode"], "PRACTICE")
+        self.assertEqual(payload["data"]["mode"], "PRACTICE")
+        self.assertIsNone(payload["data"]["balance"])
+
+    def test_connect_returns_controlled_error_when_bullex_stays_practice(self) -> None:
+        session = bullex_main.ManagedSession(
+            user_id="connect-still-practice",
+            client=SimpleNamespace(
+                get_balance_mode=Mock(return_value="PRACTICE"),
+                change_balance=Mock(),
+            ),
+            active_mode="PRACTICE",
+            real_mode_confirmed=False,
+        )
+        manager = bullex_main.SessionManager(None)
+        manager.get_probe_state(session.user_id).failure_count = 4
+        manager.last_account_cache[session.user_id] = {"stale": True}
+        manager.last_status_cache[session.user_id] = {"stale": True}
+
+        old_manager = bullex_main.session_manager
+        bullex_main.session_manager = manager
+        try:
+            with patch.object(manager, "connect", return_value=session):
+                with patch.object(bullex_main.time, "sleep", return_value=None):
+                    response = bullex_main.connect_session(
+                        bullex_main.ConnectRequest(
+                            email="real@example.com",
+                            password="secret",
+                            account_mode="PRACTICE",
+                        ),
+                        x_user_id=session.user_id,
+                    )
+        finally:
+            bullex_main.session_manager = old_manager
+
+        self.assertEqual(response.status_code, 409)
+        payload = json.loads(response.body)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "BULLEX_ACTIVE_MODE_NOT_REAL")
+        self.assertTrue(payload["data"]["connected"])
+        self.assertEqual(payload["data"]["active_mode"], "PRACTICE")
+        self.assertIsNone(payload["data"]["balance"])
+        self.assertEqual(session.client.change_balance.call_count, 3)
+        self.assertEqual(manager.get_probe_state(session.user_id).failure_count, 0)
+        self.assertNotIn(session.user_id, manager.last_account_cache)
+        self.assertNotIn(session.user_id, manager.last_status_cache)
+
+    def test_unconfirmed_real_mode_is_not_persisted_as_connected(self) -> None:
+        store = Mock()
+        manager = bullex_main.SessionManager(store)
+        session = bullex_main.ManagedSession(
+            user_id="practice-not-persisted",
+            client=SimpleNamespace(),
+            email="real@example.com",
+            desired_mode="REAL",
+            active_mode="PRACTICE",
+            real_mode_confirmed=False,
+            state=bullex_main.SessionState(SSID="ssid-practice"),
+        )
+
+        with self.assertLogs("bullex-service", level="WARNING") as logs:
+            manager._persist_connected(session)
+
+        store.save_connected.assert_not_called()
+        self.assertIn("reason=persist_blocked", "\n".join(logs.output))
+
+    def test_account_payload_keeps_real_and_practice_balances_separate(self) -> None:
+        session = bullex_main.ManagedSession(
+            user_id="separate-balances",
+            client=SimpleNamespace(
+                check_connect=lambda: True,
+                get_balance_mode=lambda: "REAL",
+                get_balances=lambda: {
+                    "msg": [
+                        {"type": 1, "amount": 42.5},
+                        {"type": 4, "amount": 10000},
+                    ]
+                },
+                get_currency=lambda: "BRL",
+            ),
+            email="real@example.com",
+        )
+
+        payload = bullex_main.build_account_payload(session)
+
+        self.assertTrue(payload["active_mode_real_detected"])
+        self.assertEqual(payload["active_mode_from_bullex"], "REAL")
+        self.assertEqual(payload["balance_real"], 42.5)
+        self.assertEqual(payload["balance_practice"], 10000.0)
+        self.assertEqual(payload["balance"], 42.5)
+
+    def test_build_account_payload_keeps_real_connected_with_zero_balance(self) -> None:
+        session = bullex_main.ManagedSession(
+            user_id="user-real-zero",
+            client=SimpleNamespace(
+                check_connect=lambda: True,
+                get_balance=lambda: 0,
+                get_currency=lambda: "BRL",
+                get_balance_mode=lambda: "REAL",
+            ),
+            email="real@example.com",
+        )
+
+        payload = bullex_main.build_account_payload(session)
+
+        self.assertTrue(payload["connected"])
+        self.assertEqual(payload["mode"], "REAL")
+        self.assertEqual(payload["currency"], "BRL")
+        self.assertEqual(payload["balance"], 0.0)
+        self.assertEqual(payload["real_balance_warning"], "BALANCE_ZERO")
+
+    def test_session_token_is_encrypted_and_password_is_never_stored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = str(Path(directory) / "sessions.db")
+            store = SessionStore(database_path, "test-secret")
+            store.save_connected(
+                "user-session",
+                "user@example.com",
+                "PRACTICE",
+                "sensitive-ssid-token",
+            )
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                columns = {
+                    row[1] for row in connection.execute("pragma table_info(bullex_sessions)").fetchall()
+                }
+                encrypted_token = connection.execute(
+                    "select encrypted_session_token from bullex_sessions where user_id = ?",
+                    ("user-session",),
+                ).fetchone()[0]
+
+            self.assertNotIn("password", columns)
+            self.assertNotIn("cookies", columns)
+            self.assertNotIn("session_data", columns)
+            self.assertNotEqual(encrypted_token, "sensitive-ssid-token")
+            with self.assertLogs("bullex-service", level="INFO") as logs:
+                restored = store.load_connected_user("user-session")
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.session_token, "sensitive-ssid-token")
+            self.assertIn("ssid_length=20", "\n".join(logs.output))
+
+    def test_session_manager_restores_with_persisted_ssid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected(
+                "user-session",
+                "user@example.com",
+                "PRACTICE",
+                "persisted-ssid",
+            )
+
+            fake_client = SimpleNamespace(
+                connect=Mock(side_effect=AssertionError("restore must not login with password")),
+                restore_with_ssid=Mock(return_value=(True, None)),
+                get_balance_mode=lambda: "REAL",
+                change_balance=Mock(),
+                get_balance=lambda: 100.0,
+                get_currency=lambda: "USD",
+            )
+            manager = bullex_main.SessionManager(store)
+            with (
+                patch.object(bullex_main, "Bullex", return_value=fake_client),
+                patch.object(manager, "_session_context", side_effect=lambda session: _FakeContext(session)),
+                patch.object(bullex_main.time, "sleep", return_value=None),
+            ):
+                self.assertIsNone(manager.get("user-session"))
+                restored = manager.restore_on_demand("user-session")
+
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.password, None)
+            self.assertEqual(restored.state.SSID, "persisted-ssid")
+            fake_client.restore_with_ssid.assert_called_once_with("persisted-ssid")
+            fake_client.connect.assert_not_called()
+
+    def test_session_manager_marks_restore_unsupported_without_login(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected(
+                "user-session",
+                "user@example.com",
+                "PRACTICE",
+                "persisted-ssid",
+            )
+
+            fake_client = SimpleNamespace(
+                connect=Mock(side_effect=AssertionError("restore must not login with password")),
+                get_balance_mode=lambda: "PRACTICE",
+            )
+            manager = bullex_main.SessionManager(store)
+            with (
+                patch.object(bullex_main, "Bullex", return_value=fake_client),
+                self.assertLogs("bullex-service", level="WARNING") as logs,
+            ):
+                with self.assertRaises(bullex_main.ServiceError):
+                    manager.restore_on_demand("user-session")
+
+            self.assertIsNone(manager.get("user-session"))
+            fake_client.connect.assert_not_called()
+            self.assertIn(
+                "[SESSION_RESTORE] status=unsupported reason=no_ssid_restore_method",
+                "\n".join(logs.output),
+            )
+
+    def test_session_manager_marks_invalid_ssid_as_broker_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected("user-session", "user@example.com", "PRACTICE", "persisted-ssid")
+            fake_client = SimpleNamespace(
+                connect=Mock(side_effect=AssertionError("restore must not login with password")),
+                restore_with_ssid=Mock(return_value=(False, "invalid_ssid")),
+                get_balance_mode=lambda: "PRACTICE",
+            )
+            manager = bullex_main.SessionManager(store)
+            with (
+                patch.object(bullex_main, "Bullex", return_value=fake_client),
+                patch.object(manager, "_session_context", side_effect=lambda session: _FakeContext(session)),
+                self.assertLogs("bullex-service", level="WARNING") as logs,
+            ):
+                with self.assertRaises(bullex_main.ServiceError):
+                    manager.restore_on_demand("user-session")
+
+            self.assertIsNone(manager.get("user-session"))
+            fake_client.connect.assert_not_called()
+            self.assertIn(
+                "status=unsupported reason=broker_invalidates_ssid",
+                "\n".join(logs.output),
+            )
+
+    def test_session_manager_replaces_existing_session_on_fresh_login(self) -> None:
+        manager = bullex_main.SessionManager(None)
+        existing_client = SimpleNamespace(
+            api=SimpleNamespace(close=Mock()),
+            check_connect=lambda: True,
+            websocket_alive=lambda: True,
+            get_balance_mode=lambda: "PRACTICE",
+            get_balance=lambda: 100.0,
+            get_currency=lambda: "USD",
+        )
+        existing = bullex_main.ManagedSession(
+            user_id="user-reuse",
+            client=existing_client,
+            email="user@example.com",
+            password="secret",
+            desired_mode="PRACTICE",
+        )
+        manager.upsert(existing)
+        new_client = SimpleNamespace(
+            api=SimpleNamespace(close=Mock()),
+            connect=Mock(return_value=(True, None)),
+            check_connect=lambda: True,
+            websocket_alive=lambda: True,
+            get_balance_mode=lambda: "REAL",
+            change_balance=Mock(),
+            get_balance=lambda: 100.0,
+            get_currency=lambda: "USD",
+        )
+
+        with (
+            patch.object(bullex_main, "Bullex", return_value=new_client),
+            patch.object(bullex_main.time, "sleep", return_value=None),
+        ):
+            session = manager.connect(
+                "user-reuse",
+                bullex_main.ConnectRequest(email="user@example.com", password="secret", account_mode="PRACTICE"),
+            )
+
+        self.assertIsNot(session, existing)
+        self.assertIs(session.client, new_client)
+        existing_client.api.close.assert_called_once()
+        self.assertEqual(manager.login_progress_payload("user-reuse")["state"], "READY")
+
+    def test_session_manager_retries_login_after_timeout(self) -> None:
+        first_client = SimpleNamespace(api=SimpleNamespace(close=Mock()))
+        second_client = SimpleNamespace(
+            get_balance_mode=lambda: "REAL",
+            change_balance=Mock(),
+            get_balance=lambda: 100.0,
+            get_currency=lambda: "USD",
+            check_connect=lambda: True,
+            websocket_alive=lambda: True,
+            connect=Mock(return_value=(True, None)),
+        )
+        manager = bullex_main.SessionManager(None)
+        attempts = {"count": 0}
+
+        def fake_run(operation, *, timeout_seconds=60):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise TimeoutError("slow login")
+            return operation()
+
+        with (
+            patch.object(bullex_main, "Bullex", side_effect=[first_client, second_client]),
+            patch.object(manager, "_session_context", side_effect=lambda session: _FakeContext(session)),
+            patch.object(manager, "_run_with_timeout", side_effect=fake_run),
+            patch.object(bullex_main.time, "sleep"),
+        ):
+            session = manager.connect(
+                "user-timeout",
+                bullex_main.ConnectRequest(email="user@example.com", password="secret", account_mode="PRACTICE"),
+            )
+
+        self.assertIs(session.client, second_client)
+        self.assertEqual(manager.login_progress_payload("user-timeout")["state"], "READY")
+        second_client.connect.assert_called_once()
+
+    def test_reconnect_restores_from_persisted_ssid_after_process_restart(self) -> None:
+        """Regressão: após restart do bullex-service (deploy), `self.sessions`
+        fica vazio para todo mundo. `/sessions/reconnect` não pode devolver
+        SESSION_NOT_FOUND (404) direto — tem que cair no restore por SSID
+        persistido, igual ao que já acontece no restore on-demand."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected(
+                "user-after-restart",
+                "user@example.com",
+                "REAL",
+                "persisted-ssid",
+            )
+
+            fake_client = SimpleNamespace(
+                connect=Mock(side_effect=AssertionError("reconnect must not require password")),
+                restore_with_ssid=Mock(return_value=(True, None)),
+                get_balance_mode=lambda: "REAL",
+                change_balance=Mock(),
+                get_balance=lambda: 100.0,
+                get_currency=lambda: "USD",
+            )
+            manager = bullex_main.SessionManager(store)
+            with (
+                patch.object(bullex_main, "Bullex", return_value=fake_client),
+                patch.object(manager, "_session_context", side_effect=lambda session: _FakeContext(session)),
+                patch.object(bullex_main.time, "sleep", return_value=None),
+            ):
+                self.assertIsNone(manager.get("user-after-restart"))
+                restored = manager.reconnect("user-after-restart")
+
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.state.SSID, "persisted-ssid")
+            fake_client.restore_with_ssid.assert_called_once_with("persisted-ssid")
+            fake_client.connect.assert_not_called()
+
+    def test_reconnect_raises_session_not_found_without_persisted_session(self) -> None:
+        """Sem sessão em memória e sem nada persistido, o erro correto ainda
+        é SESSION_NOT_FOUND — o gateway é quem decide não vazar esse status
+        cru pro frontend (fallback de credenciais salvas)."""
+        manager = bullex_main.SessionManager(None)
+
+        with self.assertRaises(bullex_main.ServiceError) as ctx:
+            manager.reconnect("user-without-session")
+
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_session_manager_reconnects_with_ssid_without_password(self) -> None:
+        manager = bullex_main.SessionManager(None)
+        old_client = SimpleNamespace(api=SimpleNamespace(close=Mock()))
+        session = bullex_main.ManagedSession(
+            user_id="user-ssid",
+            client=old_client,
+            email="user@example.com",
+            password=None,
+            desired_mode="PRACTICE",
+            state=bullex_main.SessionState(SSID="persisted-ssid"),
+        )
+        fake_client = SimpleNamespace(
+            restore_with_ssid=Mock(return_value=(True, None)),
+            get_balance_mode=lambda: "REAL",
+            change_balance=Mock(),
+            get_balance=lambda: 50.0,
+            get_currency=lambda: "USD",
+            check_connect=lambda: True,
+            websocket_alive=lambda: True,
+        )
+
+        with (
+            patch.object(bullex_main, "Bullex", return_value=fake_client),
+            patch.object(manager, "_session_context", side_effect=lambda current: _FakeContext(current)),
+            patch.object(bullex_main.time, "sleep", return_value=None),
+        ):
+            restored = manager._attempt_reconnect(session, "SESSION_EXPIRED")
+
+        self.assertIs(restored.client, fake_client)
+        fake_client.restore_with_ssid.assert_called_once_with("persisted-ssid")
+
+    def test_session_persistence_debug_does_not_expose_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected(
+                "user-session",
+                "user@example.com",
+                "PRACTICE",
+                "persisted-ssid",
+            )
+
+            debug = store.persistence_debug()
+
+            self.assertEqual(debug["stored_sessions"], 1)
+            self.assertEqual(
+                debug["users"][0],
+                {
+                    "user_id": "user-session",
+                    "ssid_present": True,
+                    "session_file_exists": True,
+                    "last_connected_at": debug["users"][0]["last_connected_at"],
+                },
+            )
+            self.assertNotIn("persisted-ssid", json.dumps(debug))
+
+    def test_session_persistence_debug_endpoint_reports_missing_key(self) -> None:
+        old_manager = bullex_main.session_manager
+        bullex_main.session_manager = bullex_main.SessionManager(None)
+        try:
+            debug = bullex_main.sessions_persistence_debug()
+        finally:
+            bullex_main.session_manager = old_manager
+
+        self.assertEqual(
+            debug,
+            {
+                "stored_sessions": 0,
+                "users": [],
+            },
+        )
+
+    def test_persistence_debug_route_is_registered(self) -> None:
+        routes = {
+            route.path: route.methods
+            for route in bullex_main.app.routes
+            if hasattr(route, "methods")
+        }
+
+        self.assertIn("/sessions/persistence-debug", routes)
+        self.assertIn("GET", routes["/sessions/persistence-debug"])
+
+    def test_save_and_load_logs_have_matching_ssid_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            with self.assertLogs("bullex-service", level="INFO") as logs:
+                store.save_connected("user-session", "user@example.com", "PRACTICE", "persisted-ssid")
+                store.load_connected_user("user-session")
+
+            messages = "\n".join(logs.output)
+            fingerprint = hashlib.sha256(b"persisted-ssid").hexdigest()[:12]
+            self.assertIn(f"[SESSION_SAVE] user_id=user-session ssid_present=True ssid_length=14", messages)
+            self.assertIn(f"[SESSION_LOAD] user_id=user-session ssid_present=True ssid_length=14", messages)
+            self.assertEqual(messages.count("persisted_fields=ssid"), 2)
+            self.assertEqual(messages.count("token_present=False"), 2)
+            self.assertEqual(messages.count("cookies_present=False"), 2)
+            self.assertEqual(messages.count("session_data_present=False"), 2)
+            self.assertEqual(messages.count(f"ssid_fingerprint={fingerprint}"), 2)
+
+    def test_gateway_persistence_debug_route_is_registered_and_forwards_raw_data(self) -> None:
+        from backend import main
+
+        routes = {
+            route.path: route.methods
+            for route in main.app.routes
+            if hasattr(route, "methods")
+        }
+        expected = {
+            "stored_sessions": 1,
+            "users": [
+                {
+                    "user_id": "user-session",
+                    "ssid_present": True,
+                    "session_file_exists": True,
+                    "last_connected_at": "2026-06-12T12:00:00+00:00",
+                }
+            ],
+        }
+
+        self.assertIn("/sessions/persistence-debug", routes)
+        self.assertIn("GET", routes["/sessions/persistence-debug"])
+
+        with patch.object(
+            main,
+            "call_bullex_service",
+            new=AsyncMock(return_value=(200, main.build_success(expected))),
+        ) as service_call:
+            response = asyncio.run(main.sessions_persistence_debug())
+
+        self.assertEqual(json.loads(response.body), expected)
+        service_call.assert_awaited_once_with(
+            "GET",
+            "/sessions/persistence-debug",
+            "persistence-debug",
+        )
+
+
+class _FakeContext:
+    def __init__(self, session) -> None:
+        self.session = session
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *_args):
+        return False
+
+
+class RobotPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_extract_robot_settings_keeps_only_supabase_settings_columns(self) -> None:
+        settings = extract_robot_settings(
+            {
+                "user_id": "user-a",
+                "enabled": True,
+                "entry_value": "10.5",
+                "stop_win": "50",
+                "stop_loss": 30,
+                "cycle_minutes": "5",
+                "min_confidence": "94",
+                "min_payout": "88.5",
+                "strategy_mode": "balanced",
+                "account_mode": "DEMO",
+                "allow_real": "false",
+                "confirm_real": "true",
+                "max_entries_per_cycle": "2",
+                "martingale_enabled": True,
+                "martingale_steps": 2,
+                "martingale_multiplier": 2.5,
+                "wins": 9,
+                "losses": 1,
+                "profit": 20,
+                "status": "RUNNING",
+                "connected": True,
+                "active_mode": "PRACTICE",
+                "timeframe": "M1",
+            }
+        )
+
+        # Atualizado 2026-08-07: timeframe é coluna real de robot_user_settings
+        # (persistência por usuário de M1/M5/M15, ver el_capo_full_bootstrap.sql),
+        # então extract_robot_settings deve mantê-lo.
+        self.assertEqual(
+            settings,
+            {
+                "entry_value": 10.5,
+                "stop_win": 50.0,
+                "stop_loss": 30.0,
+                "cycle_minutes": 5,
+                "min_confidence": 94,
+                "min_payout": 88.5,
+                "strategy_mode": "balanced",
+                "account_mode": "REAL",
+                "timeframe": "M1",
+                "allow_real": True,
+                "confirm_real": True,
+                "max_entries_per_cycle": 2,
+            },
+        )
+
+    async def test_supabase_settings_400_is_not_retried_until_settings_change(self) -> None:
+        persistence = SupabaseRobotPersistence("https://example.supabase.co", "service-key")
+        request = httpx.Request(
+            "POST",
+            "https://example.supabase.co/rest/v1/robot_user_settings?on_conflict=user_id",
+        )
+        response = httpx.Response(400, request=request, text='{"message":"bad column"}')
+        error = httpx.HTTPStatusError("bad request", request=request, response=response)
+        persistence._ensure_user = Mock()
+        persistence._request = Mock(side_effect=error)
+        first_settings = {"entry_value": 10, "allow_real": False}
+
+        persistence.save_settings("user-a", first_settings)
+        persistence.save_settings("user-a", dict(first_settings))
+        persistence.save_settings("user-a", {"entry_value": 11, "allow_real": False})
+
+        self.assertEqual(persistence._ensure_user.call_count, 2)
+        self.assertEqual(persistence._request.call_count, 2)
+        self.assertEqual(
+            persistence._request.call_args_list[0].kwargs["json"],
+            {
+                "user_id": "user-a",
+                "entry_value": 10.0,
+                "account_mode": "REAL",
+                "allow_real": True,
+                "confirm_real": True,
+            },
+        )
+        self.assertEqual(
+            persistence._request.call_args_list[1].kwargs["json"],
+            {
+                "user_id": "user-a",
+                "entry_value": 11.0,
+                "account_mode": "REAL",
+                "allow_real": True,
+                "confirm_real": True,
+            },
+        )
+
+    async def test_supabase_load_settings_creates_real_defaults_for_new_user(self) -> None:
+        persistence = SupabaseRobotPersistence("https://example.supabase.co", "service-key")
+        persistence._ensure_user = Mock()
+        persistence._request = Mock(side_effect=[[], httpx.Response(201, text="")])
+
+        settings = persistence.load_settings("user-new")
+
+        self.assertEqual(settings["account_mode"], "REAL")
+        self.assertTrue(settings["allow_real"])
+        self.assertTrue(settings["confirm_real"])
+        # Atualizado 2026-08-07: default de entry_value passou de 2 para 5
+        # (ROBOT_SETTING_DEFAULTS em robot_persistence.py).
+        self.assertEqual(settings["entry_value"], 5)
+        self.assertEqual(persistence._request.call_count, 2)
+        self.assertEqual(
+            persistence._request.call_args_list[1].kwargs["json"]["account_mode"],
+            "REAL",
+        )
+        self.assertTrue(persistence._request.call_args_list[1].kwargs["json"]["allow_real"])
+        self.assertTrue(persistence._request.call_args_list[1].kwargs["json"]["confirm_real"])
+
+    async def test_supabase_load_settings_repairs_legacy_demo_record(self) -> None:
+        persistence = SupabaseRobotPersistence("https://example.supabase.co", "service-key")
+        persistence._ensure_user = Mock()
+        legacy = {
+            "entry_value": 7,
+            "stop_win": 50,
+            "stop_loss": 30,
+            "cycle_minutes": 5,
+            "min_confidence": 80,
+            "min_payout": 80,
+            "strategy_mode": "conservative",
+            "account_mode": "DEMO",
+            "allow_real": False,
+            "confirm_real": False,
+            "max_entries_per_cycle": 1,
+        }
+        persistence._request = Mock(side_effect=[[legacy], httpx.Response(201, text="")])
+
+        settings = persistence.load_settings("legacy-user")
+
+        self.assertEqual(settings["account_mode"], "REAL")
+        self.assertTrue(settings["allow_real"])
+        self.assertTrue(settings["confirm_real"])
+        self.assertEqual(settings["entry_value"], 7)
+        self.assertEqual(persistence._request.call_count, 2)
+        repaired_payload = persistence._request.call_args_list[1].kwargs["json"]
+        self.assertEqual(repaired_payload["account_mode"], "REAL")
+        self.assertTrue(repaired_payload["allow_real"])
+        self.assertTrue(repaired_payload["confirm_real"])
+
+    async def test_extract_robot_settings_normalizes_practice_account_mode(self) -> None:
+        settings = extract_robot_settings(
+            {
+                "entry_value": 2,
+                "account_mode": "PRACTICE",
+                "strategy_mode": "conservative",
+            }
+        )
+
+        self.assertEqual(settings["account_mode"], "REAL")
+        self.assertTrue(settings["allow_real"])
+        self.assertTrue(settings["confirm_real"])
+
+    async def test_robot_user_settings_survive_restart_without_cross_user_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = str(Path(directory) / "robot-settings.db")
+            persistence = SQLiteRobotPersistence(database_path)
+            persistence.save_settings(
+                "user-a",
+                {
+                    "entry_value": 15,
+                    "stop_win": 80,
+                    "stop_loss": 25,
+                    "cycle_minutes": 5,
+                    "min_confidence": 96,
+                    "min_payout": 90,
+                    "strategy_mode": "balanced",
+                    "account_mode": "DEMO",
+                    "allow_real": False,
+                    "confirm_real": False,
+                    "max_entries_per_cycle": 1,
+                    "martingale_enabled": True,
+                    "martingale_steps": 1,
+                    "martingale_multiplier": 2.5,
+                },
+            )
+            persistence.save_settings(
+                "user-b",
+                {
+                    "entry_value": 2,
+                    "stop_win": 50,
+                    "stop_loss": 12,
+                    "cycle_minutes": 5,
+                    "min_confidence": 94,
+                    "min_payout": 88,
+                    "strategy_mode": "conservative",
+                    "account_mode": "DEMO",
+                    "allow_real": False,
+                    "confirm_real": False,
+                    "max_entries_per_cycle": 1,
+                    "martingale_enabled": False,
+                    "martingale_steps": 1,
+                    "martingale_multiplier": 2,
+                },
+            )
+
+            restarted = SQLiteRobotPersistence(database_path)
+            settings_a = restarted.load_settings("user-a")
+            settings_b = restarted.load_settings("user-b")
+
+            self.assertEqual(settings_a["entry_value"], 15)
+            self.assertEqual(settings_a["stop_loss"], 25)
+            self.assertTrue(settings_a["martingale_enabled"])
+            self.assertEqual(settings_a["martingale_multiplier"], 2.5)
+            self.assertEqual(settings_a["account_mode"], "REAL")
+            self.assertTrue(settings_a["allow_real"])
+            self.assertTrue(settings_a["confirm_real"])
+            self.assertEqual(settings_b["entry_value"], 2)
+            self.assertEqual(settings_b["stop_loss"], 12)
+            self.assertFalse(settings_b["martingale_enabled"])
+            self.assertEqual(settings_b["account_mode"], "REAL")
+            self.assertTrue(settings_b["allow_real"])
+            self.assertTrue(settings_b["confirm_real"])
+            settings_new = restarted.load_settings("user-new")
+            self.assertEqual(settings_new["account_mode"], "REAL")
+            self.assertTrue(settings_new["allow_real"])
+            self.assertTrue(settings_new["confirm_real"])
+            # Atualizado 2026-08-07: default de entry_value passou de 2 para 5.
+            self.assertEqual(settings_new["entry_value"], 5)
+
+    async def test_robot_state_loads_dedicated_settings_after_memory_reset(self) -> None:
+        from backend import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = SQLiteRobotPersistence(
+                str(Path(directory) / "robot-settings-state.db")
+            )
+            old_trader = main.auto_trader
+            old_persistence = main.robot_persistence
+            main.auto_trader = AutoTrader()
+            main.robot_persistence = persistence
+            try:
+                state_a = main.get_user_robot_state("user-a")
+                state_a.entry_value = 15
+                state_a.stop_loss = 22
+                future_a = main.persist_robot("user-a")
+                if future_a is not None:
+                    future_a.result(timeout=5)
+
+                state_b = main.get_user_robot_state("user-b")
+                state_b.stop_loss = 11
+                future_b = main.persist_robot("user-b")
+                if future_b is not None:
+                    future_b.result(timeout=5)
+
+                main.auto_trader = AutoTrader()
+                refreshed_a = main.get_user_robot_state("user-a")
+                refreshed_b = main.get_user_robot_state("user-b")
+                new_user = main.get_user_robot_state("user-new")
+
+                self.assertEqual(refreshed_a.entry_value, 15)
+                self.assertEqual(refreshed_a.stop_loss, 22)
+                # Atualizado 2026-08-07: default de entry_value passou de 2 para 5.
+                self.assertEqual(refreshed_b.entry_value, 5)
+                self.assertEqual(refreshed_b.stop_loss, 11)
+                self.assertEqual(new_user.entry_value, 5)
+                # Atualizado 2026-08-07: cadência contínua (ANALISE_CONTINUA.md)
+                # usa cycle_minutes = duração da vela do timeframe (M1 = 1),
+                # não mais o cooldown fixo antigo (timeframe x5).
+                self.assertEqual(new_user.cycle_minutes, 1)
+                self.assertEqual(new_user.min_confidence, 80)
+                self.assertEqual(new_user.min_payout, 80)
+            finally:
+                main.auto_trader = old_trader
+                main.robot_persistence = old_persistence
+
+    async def test_persist_robot_continues_when_save_settings_fails(self) -> None:
+        from backend import main
+
+        class _PersistenceStub:
+            def __init__(self) -> None:
+                self.saved_state = False
+                self.saved_trade = False
+                self.saved_settings_payload = None
+
+            def save_state(self, user_id: str, state: dict[str, object]) -> None:
+                self.saved_state = True
+
+            def save_settings(self, user_id: str, settings: dict[str, object]) -> None:
+                self.saved_settings_payload = settings
+                raise RuntimeError("settings boom")
+
+            def save_trade(self, user_id: str, trade: dict[str, object]) -> None:
+                self.saved_trade = True
+
+        old_trader = main.auto_trader
+        old_persistence = main.robot_persistence
+        main.auto_trader = AutoTrader()
+        stub = _PersistenceStub()
+        main.robot_persistence = stub
+        try:
+            state = main.auto_trader.start("user-save-settings-error")
+            state.last_trade = {"order_id": "order-1"}
+            with self.assertLogs("backend-gateway", level="WARNING") as logs:
+                future = main.persist_robot("user-save-settings-error")
+                if future is not None:
+                    future.result(timeout=5)
+
+            self.assertTrue(stub.saved_state)
+            self.assertTrue(stub.saved_trade)
+            self.assertEqual(stub.saved_settings_payload["account_mode"], "REAL")
+            self.assertIn("step=save_settings", "\n".join(logs.output))
+        finally:
+            main.auto_trader = old_trader
+            main.robot_persistence = old_persistence
+
+    async def test_persist_robot_write_runs_in_background_without_blocking_caller(self) -> None:
+        """
+        Gargalo real corrigido em 2026-08-07: `persist_robot` era chamado (~50
+        pontos do arquivo) toda vez que o estado do robô mudava, inclusive a
+        cada ciclo de análise de cada usuário ativo, e escrevia no Supabase de
+        forma SÍNCRONA (`httpx.Client`) — bloqueando o único event loop do
+        backend-gateway. Reproduzido com Playwright: login e
+        `GET /admin/dashboard` chegaram a levar 14–33s sem relação com o
+        endpoint em si (confirmado <2.5s isolado via curl). Ver
+        docs/PERFORMANCE_SISTEMA.md.
+
+        Este teste confirma que a chamada agenda a escrita em background (não
+        bloqueia por mais que `save_state` demore) e que o dado chega
+        corretamente após aguardar o `Future` retornado.
+        """
+        from backend import main
+
+        write_started = threading.Event()
+        release_write = threading.Event()
+
+        class _SlowPersistenceStub:
+            def __init__(self) -> None:
+                self.saved_payload: dict[str, object] | None = None
+
+            def save_state(self, user_id: str, state: dict[str, object]) -> None:
+                write_started.set()
+                # Simula latência real de rede até o Supabase.
+                release_write.wait(timeout=5)
+                self.saved_payload = state
+
+            def save_trade(self, user_id: str, trade: dict[str, object]) -> None:
+                pass
+
+        old_trader = main.auto_trader
+        old_persistence = main.robot_persistence
+        main.auto_trader = AutoTrader()
+        stub = _SlowPersistenceStub()
+        main.robot_persistence = stub
+        try:
+            main.auto_trader.start("user-bg-write")
+            call_started_at = time.monotonic()
+            future = main.persist_robot("user-bg-write")
+            call_duration = time.monotonic() - call_started_at
+
+            self.assertIsNotNone(future)
+            # A chamada em si deve retornar quase instantaneamente — a escrita
+            # lenta acontece na thread pool, não no caller.
+            self.assertLess(call_duration, 1.0)
+
+            self.assertTrue(write_started.wait(timeout=2), "escrita não iniciou em background")
+            self.assertIsNone(stub.saved_payload, "não deveria ter completado ainda")
+
+            release_write.set()
+            future.result(timeout=5)
+            self.assertIsNotNone(stub.saved_payload)
+        finally:
+            main.auto_trader = old_trader
+            main.robot_persistence = old_persistence
+
+    async def test_persist_robot_preserves_write_order_per_user(self) -> None:
+        """
+        O lock por usuário (`_get_robot_persist_lock`) garante que duas
+        escritas do MESMO usuário disparadas em sequência rápida terminem
+        persistidas na ordem de submissão — mesmo rodando em threads da
+        executor compartilhada — para não deixar um `save_state` mais antigo
+        sobrescrever um mais novo.
+        """
+        from backend import main
+
+        write_order: list[int] = []
+        write_lock = threading.Lock()
+
+        class _OrderTrackingPersistenceStub:
+            def save_state(self, user_id: str, state: dict[str, object]) -> None:
+                # A primeira escrita é deliberadamente mais lenta para tentar
+                # "ultrapassar" a segunda se não houvesse serialização.
+                if state.get("entry_value") == 1:
+                    time.sleep(0.05)
+                with write_lock:
+                    write_order.append(int(state["entry_value"]))
+
+            def save_trade(self, user_id: str, trade: dict[str, object]) -> None:
+                pass
+
+        old_trader = main.auto_trader
+        old_persistence = main.robot_persistence
+        main.auto_trader = AutoTrader()
+        main.robot_persistence = _OrderTrackingPersistenceStub()
+        try:
+            state = main.auto_trader.start("user-order-check")
+            state.entry_value = 1
+            future_1 = main.persist_robot("user-order-check")
+            state.entry_value = 2
+            future_2 = main.persist_robot("user-order-check")
+
+            for future in (future_1, future_2):
+                if future is not None:
+                    future.result(timeout=5)
+
+            self.assertEqual(write_order, [1, 2])
+        finally:
+            main.auto_trader = old_trader
+            main.robot_persistence = old_persistence
+
+    async def test_robot_settings_requires_user_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = SQLiteRobotPersistence(str(Path(directory) / "robot.db"))
+
+            with self.assertRaisesRegex(ValueError, "USER_ID_REQUIRED"):
+                persistence.save_settings("", {})
+            with self.assertRaisesRegex(ValueError, "USER_ID_REQUIRED"):
+                persistence.load_settings("")
+
+    async def test_robot_state_and_history_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = SQLiteRobotPersistence(str(Path(directory) / "robot.db"))
+            trader = AutoTrader()
+            state = trader.start("user-robot")
+            state.entry_value = 5
+            state.cycle_minutes = 3
+            state.min_confidence = 90
+            state.min_payout = 82
+            state.stop_win = 100
+            state.stop_loss = 40
+            trader.record_trade(
+                "user-robot",
+                {
+                    "order_id": "order-1",
+                    "active": "EURUSD-OTC",
+                    "direction": "CALL",
+                    "amount": 5,
+                    "payout": 88,
+                    "result": "PENDING_RESULT",
+                    "sent_at": "2026-06-12T12:00:00+00:00",
+                },
+            )
+            trader.finish_trade("user-robot", "order-1", "WIN", 4.4)
+            persistence.save_state("user-robot", state.to_dict())
+            persistence.save_trade("user-robot", state.last_trade)
+
+            self.assertEqual(persistence.load_state("user-robot")["entry_value"], 5)
+            self.assertIsNone(persistence.load_state("other-user"))
+            restored_trader = AutoTrader()
+            user_id, payload = persistence.load_states()[0]
+            restored = restored_trader.restore(user_id, payload, persistence.load_trades(user_id))
+
+            self.assertTrue(restored.enabled)
+            # Atualizado 2026-08-07: finish_trade grava o resultado literal
+            # (WIN/LOSS/DRAW) em state.status, não mais um STATUS_RESULT_RECEIVED
+            # genérico (ver AutoTrader.finish_trade em backend/auto_trader.py).
+            self.assertEqual(restored.status, STATUS_WIN)
+            self.assertEqual(restored.entry_value, 5)
+            self.assertEqual(restored.wins, 1)
+            self.assertEqual(restored.profit, 4.4)
+            self.assertEqual(restored_trader.history(user_id)["trades"][0]["order_id"], "order-1")
+            self.assertEqual(restored_trader.source(user_id), "memory")
+
+    async def test_startup_uses_memory_only_restore_handler(self) -> None:
+        from backend import main
+
+        self.assertEqual(len(main.app.router.on_startup), 1)
+        self.assertIs(main.app.router.on_startup[0], main.restore_robot_states)
+
+    async def test_startup_loads_memory_without_bullex_backoff_or_workers(self) -> None:
+        from backend import main
+
+        user_id = "startup-restored-user"
+        saved_trader = AutoTrader()
+        saved_state = saved_trader.start(user_id)
+        persistence = SimpleNamespace(
+            load_states=Mock(return_value=[(user_id, saved_state.to_dict())]),
+            load_trades=Mock(return_value=[]),
+        )
+        old_trader = main.auto_trader
+        old_persistence = main.robot_persistence
+        old_tasks = main.robot_tasks
+        old_restorable = dict(main.restorable_robot_states)
+        old_active_users = dict(main.active_users)
+        old_hydrated_users = set(main.robot_state_hydrated_users)
+        main.auto_trader = AutoTrader()
+        main.robot_persistence = persistence
+        main.robot_tasks = {}
+        main.restorable_robot_states.clear()
+        main.active_users.clear()
+        try:
+            with (
+                patch.object(main, "call_bullex_service", new=AsyncMock()) as service_call,
+                patch.object(main, "ensure_robot_worker") as worker_start,
+                self.assertLogs("backend-gateway", level="INFO") as logs,
+            ):
+                for handler in main.app.router.on_startup:
+                    result = handler()
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            persistence.load_states.assert_called_once_with()
+            persistence.load_trades.assert_called_once_with(user_id)
+            service_call.assert_not_awaited()
+            worker_start.assert_not_called()
+            self.assertEqual(main.robot_tasks, {})
+            self.assertIn(user_id, main.restorable_robot_states)
+            self.assertFalse(main.auto_trader.get(user_id).connected)
+            self.assertFalse(main.is_user_active(user_id))
+            main.mark_session_failure(user_id)
+            cache = main.get_session_cache(user_id)
+            self.assertEqual(cache.failure_count, 0)
+            self.assertIsNone(cache.next_retry_at)
+            output = "\n".join(logs.output)
+            self.assertIn("[STARTUP_RESTORE_DISABLED]", output)
+            self.assertIn("[USER_STATE_LOADED_NO_WORKER]", output)
+            self.assertIn("[ON_DEMAND_RESTORE_ONLY]", output)
+            self.assertIn("[STARTUP_READY]", output)
+            self.assertNotIn("[USER_BACKOFF_ACTIVE]", output)
+            self.assertNotIn("[SESSION_CHECK_SKIPPED]", output)
+            self.assertNotIn("[ROBOT_WORKER_BLOCKED_DISCONNECTED]", output)
+        finally:
+            main.auto_trader = old_trader
+            main.robot_persistence = old_persistence
+            main.robot_tasks = old_tasks
+            main.restorable_robot_states.clear()
+            main.restorable_robot_states.update(old_restorable)
+            main.active_users.clear()
+            main.active_users.update(old_active_users)
+            main.robot_state_hydrated_users.clear()
+            main.robot_state_hydrated_users.update(old_hydrated_users)
+            main.session_response_cache.pop(user_id, None)
+
+    async def test_robot_state_returns_memory_default_without_restoring_connection(self) -> None:
+        from backend import main
+
+        old_trader = main.auto_trader
+        main.auto_trader = AutoTrader()
+        try:
+            service_call = AsyncMock(
+                return_value=(
+                    200,
+                    main.build_success(
+                        {"connected": True, "active_mode": "PRACTICE"}
+                    ),
+                )
+            )
+            with (
+                patch.object(
+                    main,
+                    "call_bullex_service",
+                    new=service_call,
+                ),
+                patch.object(main, "sync_user_store_from_payload"),
+            ):
+                response = await main.robot_state({"user_id": "user-state"})
+
+            payload = json.loads(response.body)
+            self.assertFalse(payload["data"]["enabled"])
+            self.assertEqual(payload["data"]["status"], "STOPPED")
+            self.assertFalse(payload["data"]["connected"])
+            service_call.assert_not_awaited()
+        finally:
+            main.auto_trader = old_trader

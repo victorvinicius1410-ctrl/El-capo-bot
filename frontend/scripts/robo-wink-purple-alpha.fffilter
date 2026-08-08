@@ -1,0 +1,3 @@
+[0:v]hue=h=175:s=1.4,eq=brightness=0.02:contrast=1.15,format=rgba,split[rgb][msk];
+[msk]format=gray,geq=lum='min(if(gt(pow((X-256)/155\,2)+pow((Y-242)/175\,2)\,0.92)\,0\,255)\,if(lt(lum(X\,Y)\,62)\,0\,if(lt(lum(X\,Y)\,100)\,(lum(X\,Y)-62)*255/38\,255)))'[alpha];
+[rgb][alpha]alphamerge,format=yuva420p[out]

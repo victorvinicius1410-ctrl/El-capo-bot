@@ -1,0 +1,99 @@
+# El Capo AutoBot — stack de produção na VPS
+# Uso: docker compose -p elcapooneline --env-file .env up -d --build
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: backend-gateway
+    env_file:
+      - .env
+    environment:
+      BULLEX_SERVICE_URL: "http://bullex-service:8000"
+      ROBOT_DB_PATH: "/data/backend-persistence.db"
+      PROD_REDIS_URL: "redis://redis:6379/0"
+      DEV_REDIS_URL: "redis://redis:6379/0"
+      # Fase 4: API/WS sem workers locais — robot-runtime executa os ciclos.
+      ROBOT_RUNTIME_MODE: "external"
+    volumes:
+      - backend-data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      - bullex-service
+      - redis
+      - robot-runtime
+
+  robot-runtime:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: robot-runtime
+    command: ["python", "-m", "backend.robot_runtime_main"]
+    env_file:
+      - .env
+    environment:
+      BULLEX_SERVICE_URL: "http://bullex-service:8000"
+      ROBOT_DB_PATH: "/data/backend-persistence.db"
+      PROD_REDIS_URL: "redis://redis:6379/0"
+      DEV_REDIS_URL: "redis://redis:6379/0"
+      ROBOT_RUNTIME_MODE: "worker"
+    volumes:
+      - backend-data:/data
+    restart: unless-stopped
+    depends_on:
+      - bullex-service
+      - redis
+
+  webhook-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: webhook-worker
+    user: "appuser"
+    command: ["celery", "-A", "backend.workers.webhook_tasks.celery_app", "worker", "--loglevel=INFO"]
+    env_file:
+      - .env
+    environment:
+      PROD_REDIS_URL: "redis://redis:6379/0"
+      DEV_REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.2-alpine
+    container_name: webhook-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - webhook-redis-data:/data
+    expose:
+      - "6379"
+    restart: unless-stopped
+
+  bullex-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bullex-service
+    env_file:
+      - .env
+    environment:
+      BULLEX_MAX_CONCURRENT_API_CALLS: "3"
+      BULLEX_SESSION_DB_PATH: "/data/bullex-sessions.db"
+    volumes:
+      - bullex-session-data:/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+    name: elcapooneline_backend-data
+    external: true
+  bullex-session-data:
+    name: elcapooneline_bullex-session-data
+    external: true
+  webhook-redis-data:

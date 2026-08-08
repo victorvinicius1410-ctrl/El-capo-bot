@@ -1,0 +1,434 @@
+create extension if not exists pgcrypto;
+
+create table if not exists public.users (
+  id text primary key,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+create table if not exists public.bullex_connections (
+  id bigint generated always as identity primary key,
+  user_id text not null references public.users(id) on delete cascade,
+  bullex_email text,
+  connected boolean not null default false,
+  requires_2fa boolean not null default false,
+  account_mode text,
+  currency text,
+  last_balance numeric,
+  last_connected_at timestamptz,
+  encrypted_password text,
+  credentials_saved_at timestamptz,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.bullex_connections
+  add column if not exists last_connected_at timestamptz;
+
+alter table public.bullex_connections
+  add column if not exists encrypted_password text;
+
+alter table public.bullex_connections
+  add column if not exists credentials_saved_at timestamptz;
+
+create unique index if not exists bullex_connections_user_id_key
+  on public.bullex_connections (user_id);
+
+create table if not exists public.market_assets (
+  id bigint generated always as identity primary key,
+  user_id text not null references public.users(id) on delete cascade,
+  active_id integer,
+  symbol text not null,
+  name text,
+  enabled boolean not null default true,
+  payout numeric,
+  last_seen_at timestamptz,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+create unique index if not exists market_assets_user_symbol_key
+  on public.market_assets (user_id, symbol);
+
+create table if not exists public.robot_states (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null references public.users(id) on delete cascade,
+  state jsonb not null default '{}'::jsonb,
+  enabled boolean not null default false,
+  account_mode text not null default 'REAL',
+  strategy_mode text not null default 'conservative',
+  entry_value numeric not null default 2,
+  cycle_minutes integer not null default 5,
+  min_confidence integer not null default 80,
+  min_payout numeric not null default 80,
+  stop_win numeric not null default 50,
+  stop_loss numeric not null default 30,
+  wins integer not null default 0,
+  losses integer not null default 0,
+  profit numeric not null default 0,
+  accuracy numeric not null default 0,
+  connected boolean not null default false,
+  active_mode text,
+  connection_checked_at timestamptz,
+  connection_status_source text not null default 'cached',
+  connection_failure_count integer not null default 0,
+  state_json jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.robot_states
+  add column if not exists id uuid default gen_random_uuid(),
+  add column if not exists state jsonb not null default '{}'::jsonb,
+  add column if not exists enabled boolean not null default false,
+  add column if not exists account_mode text not null default 'REAL',
+  add column if not exists strategy_mode text not null default 'conservative',
+  add column if not exists entry_value numeric not null default 2,
+  add column if not exists cycle_minutes integer not null default 5,
+  add column if not exists min_confidence integer not null default 80,
+  add column if not exists min_payout numeric not null default 80,
+  add column if not exists stop_win numeric not null default 50,
+  add column if not exists stop_loss numeric not null default 30,
+  add column if not exists wins integer not null default 0,
+  add column if not exists losses integer not null default 0,
+  add column if not exists profit numeric not null default 0,
+  add column if not exists accuracy numeric not null default 0,
+  add column if not exists connected boolean not null default false,
+  add column if not exists active_mode text,
+  add column if not exists connection_checked_at timestamptz,
+  add column if not exists connection_status_source text not null default 'cached',
+  add column if not exists connection_failure_count integer not null default 0,
+  add column if not exists state_json jsonb not null default '{}'::jsonb,
+  add column if not exists created_at timestamptz not null default timezone('utc'::text, now()),
+  add column if not exists updated_at timestamptz not null default timezone('utc'::text, now());
+
+alter table public.robot_states
+  alter column account_mode set default 'REAL';
+
+update public.robot_states
+set account_mode = 'REAL'
+where upper(coalesce(account_mode, '')) in ('DEMO', 'PRACTICE');
+
+alter table public.robot_states
+  alter column cycle_minutes set default 5,
+  alter column min_confidence set default 80,
+  alter column min_payout set default 80;
+
+create table if not exists public.robot_user_settings (
+  user_id text primary key references public.users(id) on delete cascade,
+  entry_value numeric not null default 2,
+  stop_win numeric not null default 50,
+  stop_loss numeric not null default 30,
+  cycle_minutes integer not null default 5,
+  min_confidence integer not null default 80,
+  min_payout numeric not null default 80,
+  strategy_mode text not null default 'conservative',
+  account_mode text not null default 'REAL',
+  timeframe text not null default 'M1',
+  market_mode text not null default 'OTC',
+  allow_real boolean not null default true,
+  confirm_real boolean not null default true,
+  max_entries_per_cycle integer not null default 1,
+  martingale_enabled boolean not null default false,
+  martingale_steps integer not null default 1,
+  martingale_multiplier numeric not null default 2,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.robot_user_settings
+  add column if not exists entry_value numeric not null default 2,
+  add column if not exists stop_win numeric not null default 50,
+  add column if not exists stop_loss numeric not null default 30,
+  add column if not exists cycle_minutes integer not null default 5,
+  add column if not exists min_confidence integer not null default 80,
+  add column if not exists min_payout numeric not null default 80,
+  add column if not exists strategy_mode text not null default 'conservative',
+  add column if not exists account_mode text not null default 'REAL',
+  add column if not exists timeframe text not null default 'M1',
+  add column if not exists market_mode text not null default 'OTC',
+  add column if not exists allow_real boolean not null default true,
+  add column if not exists confirm_real boolean not null default true,
+  add column if not exists max_entries_per_cycle integer not null default 1,
+  add column if not exists martingale_enabled boolean not null default false,
+  add column if not exists martingale_steps integer not null default 1,
+  add column if not exists martingale_multiplier numeric not null default 2,
+  add column if not exists created_at timestamptz not null default timezone('utc'::text, now()),
+  add column if not exists updated_at timestamptz not null default timezone('utc'::text, now());
+
+alter table public.robot_user_settings
+  alter column account_mode set default 'REAL',
+  alter column allow_real set default true,
+  alter column confirm_real set default true;
+
+update public.robot_user_settings
+set account_mode = 'REAL',
+    allow_real = true,
+    confirm_real = true
+where account_mode is distinct from 'REAL'
+   or allow_real is distinct from true
+   or confirm_real is distinct from true;
+
+do $$
+begin
+  if to_regclass('public.robot_settings') is not null then
+    execute $migration$
+      update public.robot_settings
+      set account_mode = 'REAL',
+          allow_real = true,
+          confirm_real = true
+      where account_mode is distinct from 'REAL'
+         or allow_real is distinct from true
+         or confirm_real is distinct from true
+    $migration$;
+
+    execute $migration$
+      alter table public.robot_settings
+        alter column account_mode set default 'REAL',
+        alter column allow_real set default true,
+        alter column confirm_real set default true
+    $migration$;
+  end if;
+end $$;
+
+update public.robot_states
+set state = jsonb_set(
+              jsonb_set(
+                jsonb_set(coalesce(state, '{}'::jsonb), '{account_mode}', '"REAL"'::jsonb, true),
+                '{allow_real}', 'true'::jsonb, true
+              ),
+              '{confirm_real}', 'true'::jsonb, true
+            ),
+    state_json = jsonb_set(
+                   jsonb_set(
+                     jsonb_set(coalesce(state_json, '{}'::jsonb), '{account_mode}', '"REAL"'::jsonb, true),
+                     '{allow_real}', 'true'::jsonb, true
+                   ),
+                   '{confirm_real}', 'true'::jsonb, true
+                 );
+
+alter table public.robot_states
+  alter column id set default gen_random_uuid();
+
+update public.robot_states
+set id = gen_random_uuid()
+where id is null;
+
+alter table public.robot_states
+  alter column id set not null;
+
+update public.robot_states
+set state = state_json
+where state = '{}'::jsonb
+  and state_json <> '{}'::jsonb;
+
+update public.robot_states
+set state_json = state
+where state_json = '{}'::jsonb
+  and state <> '{}'::jsonb;
+
+create unique index if not exists robot_states_id_key
+  on public.robot_states (id);
+
+create unique index if not exists robot_states_user_id_key
+  on public.robot_states (user_id);
+
+create table if not exists public.robot_trades (
+  id bigint generated always as identity primary key,
+  user_id text not null references public.users(id) on delete cascade,
+  order_id text not null,
+  active text,
+  direction text,
+  entry_value numeric,
+  result text,
+  payout numeric,
+  profit numeric,
+  executed_at timestamptz not null default timezone('utc'::text, now()),
+  trade_json jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.robot_trades
+  add column if not exists active text,
+  add column if not exists direction text,
+  add column if not exists entry_value numeric,
+  add column if not exists result text,
+  add column if not exists payout numeric,
+  add column if not exists profit numeric,
+  add column if not exists executed_at timestamptz not null default timezone('utc'::text, now()),
+  add column if not exists trade_json jsonb not null default '{}'::jsonb,
+  add column if not exists created_at timestamptz not null default timezone('utc'::text, now()),
+  add column if not exists updated_at timestamptz not null default timezone('utc'::text, now());
+
+create unique index if not exists robot_trades_user_order_key
+  on public.robot_trades (user_id, order_id);
+
+create table if not exists public.robot_trade_history (
+  id bigint generated always as identity primary key,
+  user_id text not null references public.users(id) on delete cascade,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  account_mode text not null check (account_mode = 'REAL'),
+  active text not null,
+  direction text not null check (direction in ('CALL', 'PUT')),
+  amount numeric not null,
+  confidence numeric not null,
+  payout numeric not null,
+  order_id text not null,
+  result text not null check (result in ('WIN', 'LOSS')),
+  profit numeric not null,
+  opened_at timestamptz not null,
+  finished_at timestamptz not null,
+  timeframe text not null,
+  is_gale boolean not null default false,
+  gale_step integer not null default 0,
+  parent_order_id text,
+  cycle_result text,
+  final_result text,
+  original_amount numeric not null default 0,
+  gale_amount numeric not null default 0,
+  analysis_json jsonb not null default '{}'::jsonb
+);
+
+alter table public.robot_trade_history
+  add column if not exists is_gale boolean not null default false,
+  add column if not exists gale_step integer not null default 0,
+  add column if not exists parent_order_id text,
+  add column if not exists cycle_result text,
+  add column if not exists final_result text,
+  add column if not exists original_amount numeric not null default 0,
+  add column if not exists gale_amount numeric not null default 0,
+  add column if not exists analysis_json jsonb not null default '{}'::jsonb;
+
+create unique index if not exists robot_trade_history_user_order_key
+  on public.robot_trade_history (user_id, order_id);
+
+create index if not exists robot_trade_history_user_finished_idx
+  on public.robot_trade_history (user_id, finished_at desc);
+
+update public.robot_trade_history
+set account_mode = 'REAL'
+where account_mode is distinct from 'REAL';
+
+alter table public.robot_trade_history
+  drop constraint if exists robot_trade_history_account_mode_check;
+
+alter table public.robot_trade_history
+  add constraint robot_trade_history_account_mode_check
+  check (account_mode = 'REAL');
+
+create table if not exists public.robot_history (
+  id uuid primary key default gen_random_uuid(),
+  user_id text not null references public.users(id) on delete cascade,
+  event_type text,
+  history_json jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.robot_history
+  add column if not exists event_type text,
+  add column if not exists history_json jsonb not null default '{}'::jsonb,
+  add column if not exists created_at timestamptz not null default timezone('utc'::text, now()),
+  add column if not exists updated_at timestamptz not null default timezone('utc'::text, now());
+
+create index if not exists robot_history_user_created_at_idx
+  on public.robot_history (user_id, created_at desc);
+
+create table if not exists public.robot_restore_status (
+  user_id text primary key references public.users(id) on delete cascade,
+  session_restored boolean not null default false,
+  robot_restored boolean not null default false,
+  last_restore_at timestamptz,
+  updated_at timestamptz not null default timezone('utc'::text, now())
+);
+
+alter table public.robot_restore_status
+  add column if not exists session_restored boolean not null default false,
+  add column if not exists robot_restored boolean not null default false,
+  add column if not exists last_restore_at timestamptz,
+  add column if not exists updated_at timestamptz not null default timezone('utc'::text, now());
+
+create unique index if not exists robot_restore_status_user_id_key
+  on public.robot_restore_status (user_id);
+
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = timezone('utc'::text, now());
+  return new;
+end;
+$$;
+
+create or replace function public.sync_robot_state_json_alias()
+returns trigger
+language plpgsql
+as $$
+begin
+  if coalesce(new.state, '{}'::jsonb) = '{}'::jsonb
+     and coalesce(new.state_json, '{}'::jsonb) <> '{}'::jsonb then
+    new.state = new.state_json;
+  elsif coalesce(new.state_json, '{}'::jsonb) = '{}'::jsonb
+     and coalesce(new.state, '{}'::jsonb) <> '{}'::jsonb then
+    new.state_json = new.state;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists set_users_updated_at on public.users;
+create trigger set_users_updated_at
+before update on public.users
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists set_bullex_connections_updated_at on public.bullex_connections;
+create trigger set_bullex_connections_updated_at
+before update on public.bullex_connections
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists set_market_assets_updated_at on public.market_assets;
+create trigger set_market_assets_updated_at
+before update on public.market_assets
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists sync_robot_states_state_alias on public.robot_states;
+create trigger sync_robot_states_state_alias
+before insert or update on public.robot_states
+for each row
+execute function public.sync_robot_state_json_alias();
+
+drop trigger if exists set_robot_states_updated_at on public.robot_states;
+create trigger set_robot_states_updated_at
+before update on public.robot_states
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists set_robot_user_settings_updated_at on public.robot_user_settings;
+create trigger set_robot_user_settings_updated_at
+before update on public.robot_user_settings
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists set_robot_trades_updated_at on public.robot_trades;
+create trigger set_robot_trades_updated_at
+before update on public.robot_trades
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists set_robot_history_updated_at on public.robot_history;
+create trigger set_robot_history_updated_at
+before update on public.robot_history
+for each row
+execute function public.set_updated_at();
+
+drop trigger if exists set_robot_restore_status_updated_at on public.robot_restore_status;
+create trigger set_robot_restore_status_updated_at
+before update on public.robot_restore_status
+for each row
+execute function public.set_updated_at();

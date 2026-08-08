@@ -1,0 +1,358 @@
+# Estratégia do Robô El Capo — pipeline de análise e portão de entrada
+
+Documento de referência da lógica de seleção e aprovação de operações.
+Criado em 2026-07-21 junto com a correção do portão de qualidade da entrada.
+
+## Estado atual (2026-08-07)
+
+O robô opera com a **estratégia clássica** (`confidence_model_version =
+backup-classic`) + bloqueio `SR_ZONE` + **bloqueios anti-loss** medidos no
+histórico real (2026-08-04). Cadência de análise contínua (a cada vela
+M1/M5/M15) permanece ativa. A ordem enviada à corretora segue a **mesma
+direção** aprovada pela análise (sem inversão).
+
+| Aspecto | Valor atual |
+|---|---|
+| Modelo de confiança | `backup-classic` (score bruto); **portão usa `strategy_score`**, não confiança bruta |
+| Velas analisadas por ativo | **100** (`ROBOT_CANDLE_COUNT`) do timeframe da operação |
+| Perfis | aggressive 70 / balanced 80 / conservative 90 |
+| Setups de price action | `CONTINUATION`, `REVERSAL`, `SUPPORT_RESISTANCE` |
+| Zona de suporte/resistência | **Bloqueio crítico `SR_ZONE`** |
+| Anti-loss (2026-08-04) | `LAST_3_ALIGNMENT`, `WEAK_CONTINUATION_PUT`, `CONTINUATION_DEAD_RSI`, `TREND_CLEAR`, cooldown pós-LOSS |
+| Estratégias nomeadas no pipeline | Desativadas |
+| Direção executada | **Igual ao sinal aprovado**: análise CALL executa CALL; análise PUT executa PUT |
+
+### Edge medido por timeframe (backtest walk-forward, 2026-07-29)
+
+Candles reais da BullEx, 8 ativos OTC × 1000 velas por timeframe, portão de
+confiança 80 (o configurado pelos usuários), payout 88% (empate = 53,2%).
+Metodologia e comandos em [`BACKTEST_VALIDACAO.md`](./BACKTEST_VALIDACAO.md).
+
+| Timeframe | Operações | Acerto | Resultado |
+|---|---|---|---|
+| **M1** | 226 | **54,4%** | positivo (acima do empate) |
+| M5 | 279 | 48,7% | negativo |
+| M15 | 334 | 50,9% | negativo |
+
+Consequência prática: **a estratégia só tem vantagem em M1**. Contas em M5/M15
+tendem a perder no longo prazo mesmo com a análise funcionando corretamente. O
+perfil (aggressive/balanced/conservative) não altera o resultado quando o
+usuário exige confiança ≥ 80, porque o portão do usuário é mais restritivo que
+o do perfil.
+
+## 1. Pipeline de um ciclo de análise
+
+Arquivos: `backend/signal_engine.py` (análise técnica) e `backend/main.py`
+(orquestração do ciclo, funções `update_cycle_analysis`,
+`resolve_cycle_entry_candidate` e `candidate_meets_cycle_threshold`).
+
+1. **Varredura** (`scan_local_signals`): o robô analisa os ativos permitidos
+   para o modo de mercado **efetivo** (ver §7), buscando **100 candles**
+   (`ROBOT_CANDLE_COUNT`) do timeframe da operação para cada ativo.
+2. **Análise técnica** (`analyze_signal`): confluência de EMA9/EMA21, RSI(14),
+   sequência dos últimos 3 e 5 candles, força do candle atual, pavios,
+   setup de price action (continuação/reversão/suporte-resistência),
+   volatilidade (ATR) e payout. A confiança é o **score bruto** (modelo
+   `backup-classic`), limitado a 0–100 em `_build_signal`. Gera
+   `confidence`, `strategy_score`, `approved_filters` e `blocked_filters`.
+3. **Filtros de qualidade** (`_apply_quality_filters`): cada critério aprova
+   ou bloqueia. Bloqueios **críticos** (lista `CRITICAL_TRADE_BLOCKS` em
+   `main.py`) tornam o sinal reprovado (`trade_allowed = False`):
+   `CANDLE_STRENGTH`, `DOJI_FILTER`, `PRICE_ACTION_SETUP`, `REVERSAL_AGAINST`,
+   `LEVEL_CONFLICT`, `LEVEL_REJECTION`, `SR_ZONE`, `TREND_CLEAR` (só sideways),
+   `LAST_3_ALIGNMENT`, `WEAK_CONTINUATION_PUT`,
+   além dos operacionais (`ACTIVE_CLOSED`, `ASSET_COOLDOWN`,
+   `GLOBAL_LOSS_COOLDOWN`, `CANDLES_UNAVAILABLE`, stops etc.). Soft
+   (só penalizam score): `TREND_STRENGTH`, `SIDEWAYS_FILTER`, `WICK_REJECTION`,
+   `CONTINUATION_DEAD_RSI`, `SUPPORT_RESISTANCE`, `LAST_5_CONFIRMATION`,
+   `NO_ALTERNATING_LAST_3`, `EMA_TREND`, `RSI_RANGE`.
+
+### Política anti-loss (2026-08-04)
+
+Auditoria do histórico real (CONTINUATION analisada, 7d / 24h) mostrou padrões
+repetidos com WR muito abaixo do empate (~53%). Esses contextos **não operam**:
+
+| Bloqueio | Regra | Evidência |
+|---|---|---|
+| `LAST_3_ALIGNMENT` | CONTINUATION só se `last_3_direction` = UP (CALL) / DOWN (PUT) | WR **8,3%** quando contra as 3 velas |
+| `WEAK_CONTINUATION_PUT` | CONTINUATION+PUT vetado em EURUSD, AUDUSD, USDCAD, USDCHF (OTC/aberto) | WR agregado 30–41% nesses pares |
+| `CONTINUATION_DEAD_RSI` | Soft (penalidade 18); portão `strategy_score` ainda barre a maioria | WR **28,6%** — hard zerava frequência |
+| `TREND_CLEAR` | **Crítico só se `trend==SIDEWAYS`**; força fraca → soft `TREND_STRENGTH` | WR **30,4%** no sideways |
+| Portão por `strategy_score` | `candidate_meets_cycle_threshold` exige score **após** penalidades ≥ `min_confidence`; confiança bruta não abre ordem | conf ≥95 tinha WR **37,8%** |
+| Ranking | `candidate_rank` = `(strategy_score, payout, confidence)` — confiança só desempata | evita preferir score bruto alto |
+| `FREQUENCY_RECOVERY` | Após **8** ciclos `NO_OPPORTUNITY`, suaviza: `TREND_CLEAR`, `PRICE_ACTION_SETUP`, `CANDLE_STRENGTH`, `DOJI_FILTER`, `LEVEL_REJECTION`; score mínimo 70. **Não** afrouxa `LAST_3`, `WEAK_CONTINUATION_PUT`, `SR_ZONE`, `LEVEL_CONFLICT` | Prod: 88 ciclos com `allowed=0` |
+
+| Filtro | Papel |
+|---|---|
+| `TREND_CLEAR` | **Crítico** — apenas `trend == SIDEWAYS` |
+| `TREND_STRENGTH` | Soft — UP/DOWN com strength abaixo do perfil |
+| `SIDEWAYS_FILTER` | Soft (penaliza score); redundante com `TREND_CLEAR` |
+| `WICK_REJECTION` / `CONTINUATION_DEAD_RSI` | Soft (penalizam score) |
+| `LAST_3_ALIGNMENT` / `WEAK_CONTINUATION_PUT` | **Críticos** anti-loss |
+| `SR_ZONE` / `LEVEL_*` / corpo fraco (`CANDLE_STRENGTH`) | **Críticos** de estrutura |
+
+Flags em `signal_engine.py`: `LAST_3_ALIGNMENT_HARD_BLOCK`,
+`CONTINUATION_DEAD_RSI_HARD_BLOCK`, `WEAK_CONTINUATION_PUT_HARD_BLOCK`,
+`TREND_CLEAR_HARD_BLOCK` (todas `True`). Lista: `WEAK_CONTINUATION_PUT_ASSETS`.
+Perfil `conservative`: strength mínima **15** (era 20).
+
+**Nota sobre confiança:** em opções binárias OTC o score técnico alto **não**
+prova edge. A decisão usa filtros estruturais + `strategy_score`.
+
+Horários UTC fracos foram observados, mas **não** viraram hard block nesta
+rodada (pedido do cliente).
+
+Testes: `tests/test_loss_pattern_blocks.py`.
+
+### Política de suporte / resistência (2026-07-29)
+
+O robô **não entra com o preço dentro da zona de suporte/resistência**, em
+nenhuma direção e em nenhum setup.
+
+| Situação | Resultado |
+|---|---|
+| Preço na zona de nível (`near_support` ou `near_resistance`) | Bloqueio crítico **`SR_ZONE`** |
+| Conflito de nível (ex.: CALL na resistência) | Bloqueio crítico `LEVEL_CONFLICT` |
+| Reversão/S-R sem rejeição confirmada no nível | Bloqueio crítico `LEVEL_REJECTION` |
+| Só “perto do nível” sem setup | Soft penalty `SUPPORT_RESISTANCE` (não reprova) |
+| Preço no meio do range | Segue o pipeline normal |
+
+Implementação:
+
+| Item | Onde |
+|---|---|
+| Chave liga/desliga | `SR_ZONE_HARD_BLOCK` (topo de `signal_engine.py`) |
+| Definição da zona | `_support_resistance_context`: nível = min/max das 24 velas anteriores; tolerância = `max(12% do range, 65% do range médio)` |
+| Campo no sinal | `in_support_resistance_zone` (bool, vai para o payload e o histórico) |
+| Filtro | `check("SR_ZONE", ...)` em `_apply_quality_filters`, penalidade 20 no `strategy_score` |
+| Bloqueio crítico | `CRITICAL_TRADE_BLOCKS` e `RECOVERY_NON_RELAXABLE_TRADE_BLOCKS` (`main.py`) — nem o modo recovery relaxa |
+| Testes | `tests/test_sr_zone_block.py` |
+
+Impacto medido antes de ativar (mesma amostra da tabela de timeframes, M1):
+
+| Cenário | Operações | Acerto | Resultado (stake 1) |
+|---|---|---|---|
+| Sem `SR_ZONE` | 228 | 53,9% | +3,24 |
+| Com `SR_ZONE` | 226 | **54,4%** | **+5,24** |
+| Só as entradas cortadas | 2 | **0,0%** | −2,00 |
+
+Ou seja: o bloqueio custa ~1% das entradas e as que ele remove eram perdedoras
+na amostra. Para voltar ao comportamento clássico (zona liberada com rejeição
+confirmada) basta `SR_ZONE_HARD_BLOCK = False`.
+
+Detalhe histórico das estratégias nomeadas (fora do pipeline atual):
+[`ESTRATEGIAS_NOMEADAS.md`](./ESTRATEGIAS_NOMEADAS.md).
+
+4. **Ranqueamento**: os candidatos são ordenados por `strategy_score`,
+   depois `confidence`, depois `payout` (`candidate_rank`). O melhor que
+   passa nos limites do usuário vira `cycle_best_trade_candidate`.
+5. **Entrada** (`resolve_cycle_entry_candidate` + loop de ordens): na janela
+   de entrada o candidato é revalidado pelo portão final antes do envio. A
+   análise, a aprovação e a ordem enviada à BullEx usam a **mesma direção**
+   técnica (§2a).
+
+### 2a. Direção alinhada à análise (2026-08-07)
+
+O El Capo mantém integralmente a análise técnica, o score, os filtros, o
+ranking e o portão de qualidade na direção encontrada pelo pipeline. Depois da
+aprovação final, a entrada enviada à BullEx **segue a mesma direção** da
+análise (política anterior de inversão CALL↔PUT foi desativada em 2026-08-07):
+
+| Direção aprovada pela análise | Direção enviada à corretora |
+|---|---|
+| `CALL` | `CALL` |
+| `PUT` | `PUT` |
+
+Implementação: `resolve_robot_execution_direction` valida e devolve a direção
+analisada no loop de ordens em `backend/main.py` (entrada inicial e gale).
+O helper `opposite_execution_direction` permanece disponível para utilitário/
+testes, mas **não** é mais usado na montagem da ordem. A resolução acontece
+depois de `resolve_entry_validation_reason`, portanto não modifica a leitura
+das velas nem os filtros.
+
+O histórico da ordem registra:
+
+- `analyzed_direction`: direção aprovada pela análise;
+- `direction`: direção efetivamente enviada à BullEx (igual à analisada);
+- `execution_direction_inverted=false`: confirma que não houve inversão
+  (o campo continua existindo para auditar ordens antigas com `true`).
+
+Ordens de **gale** repetem a direção da primeira ordem efetivamente
+executada (já alinhada à análise).
+
+## 2. Portão final de entrada (`candidate_meets_cycle_threshold`)
+
+Um candidato só vira ordem se **todas** as condições forem verdadeiras:
+
+| Verificação | Regra |
+|---|---|
+| Direção | `CALL` ou `PUT` |
+| Ativo | aberto e não suspenso (`candidate_pre_order_block_reason`) |
+| **Dados frescos** | não pode ter `stale` / `from_cache` / `STALE_MARKET_DATA` |
+| **Aprovação da estratégia** | `trade_allowed == True` (obrigatório) |
+| **Bloqueios críticos** | nenhum item de `blocked_filters` pode estar em `CRITICAL_TRADE_BLOCKS` (inclui `SR_ZONE`) |
+| Payout | `>= min_payout` do usuário |
+| Confiança / score | **`strategy_score` ≥ `min_confidence`** do usuário (estrito) ou ≥ 70 no ramo de fallback. A confiança bruta **não** abre ordem sozinha. |
+| **Memória de padrões** | Caderno **global** (todas as contas): veta contextos fracos (`PATTERN_MEMORY_WEAK`) — ver [`MEMORIA_PADROES.md`](./MEMORIA_PADROES.md) |
+
+Exceção: ordens de **gale** não passam por esse portão (repetem a entrada
+anterior por definição do martingale).
+
+## 3. Fallback operacional
+
+- `resolve_cycle_entry_candidate` tem um ramo de fallback que aceita o melhor
+  candidato **aprovado** com confiança entre 70 e o `min_confidence` do
+  usuário (marcado com `fallback_candidate_used=true` no histórico). Após a
+  correção, esse ramo também exige `trade_allowed=True` e zero bloqueios
+  críticos.
+- `select_fallback_candidate` ("movimento simples das últimas velas") gera
+  candidatos com `trade_allowed=False` — com o portão atual eles **não são
+  mais executados**; servem apenas para exibição no painel quando nenhum
+  setup de verdade existe. O robô então agenda a **próxima janela de
+  análise da vela** (`NO_TRADE`), em cadência contínua (M1/M5/M15 a cada
+  vela — ver `ROBO_E_SUPORTE.md` e `ANALISE_CONTINUA.md`). A janela de
+  compra permanece 0–8s no início da vela; o worker faz poll fino para
+  não perder a entrada.
+
+## 4. Confirmação multi-timeframe (estado atual)
+
+`confirm_ranked_candidates_multi_timeframe` está deliberadamente em modo
+"estratégia clássica": preenche os campos `mtf_*` para telemetria mas **não
+bloqueia** por confluência entre M1/M5/M15. Essa decisão veio do código-fonte
+enviado pelo cliente (docstring "Estratégia clássica do backup"). Se quiser
+reativar o gate MTF, a lógica completa está em
+`confirm_candidate_multi_timeframe` + `merge_multi_timeframe_signals`
+(`signal_engine.py`).
+
+## 5. Testes
+
+- `tests/test_loss_pattern_blocks.py` — bloqueios anti-loss (last_3, PUT fraco,
+  RSI morto, TREND_CLEAR crítico, portão por strategy_score, cooldown pós-LOSS).
+- `tests/test_pattern_memory.py` — memória de padrões (chave, veto, gale,
+  isolamento multi-tenant e portão).
+- `tests/test_sr_zone_block.py` — política `SR_ZONE` (sinal, portão e recovery).
+- `tests/test_entry_quality_gate.py` — portão de entrada.
+- `tests/test_confidence_calibration.py` — helper `_calibrate_confidence`
+  ainda existe, mas `analyze_signal` usa `backup-classic`; também cobre
+  rejeição de candidatos stale/`from_cache`.
+- `tests/test_named_strategies.py` — detecção do módulo isolado + confirma
+  que `analyze_signal` **não** anexa campos nomeados no pipeline clássico.
+- `tests/test_candle_analysis.py` / `test_strategy_filters.py` /
+  `test_operation_cycle_strategies.py` / `test_multi_timeframe_analysis.py` /
+  `test_strategy_backtest.py` — suíte clássica.
+
+## 6. Histórico de mudanças
+
+- **2026-08-07 (execução alinhada à análise)** — Remove a política de
+  inversão CALL↔PUT na montagem da ordem. `resolve_robot_execution_direction`
+  envia à BullEx a mesma direção aprovada pelo pipeline; gale continua
+  repetindo a direção executada. Histórico mantém `analyzed_direction` /
+  `direction` / `execution_direction_inverted` (agora `false` nas novas
+  ordens). Teste:
+  `AutoTraderStateTests.test_execution_direction_follows_analysis_direction`.
+- **2026-08-05 (execução contrária — revertida em 2026-08-07)** — Entrada
+  inicial executava a direção oposta (CALL→PUT, PUT→CALL). Mantido no
+  histórico apenas como registro; política ativa é a alinhada (§2a).
+- **2026-08-04 (frequência v4)** — Após 22 min ainda `allowed=0` em 10/10
+  ativos (PRICE_ACTION_SETUP, corpo, sideways, SR). **Frequency recovery**
+  após 8 ciclos sem entrada: suaviza TREND_CLEAR / PRICE_ACTION /
+  CANDLE_STRENGTH / DOJI / LEVEL_REJECTION; mantém LAST_3, WEAK_PUT, SR_ZONE,
+  LEVEL_CONFLICT. Corpo conservative 0.40; CANDLE/DOJI soft permanente.
+  Sergio segue `enabled=False` (precisa ligar no painel).
+- **2026-08-04 (frequência v3)** — Victor com 60 ciclos `NO_PATTERN_FOUND`
+  e bloqueio `TREND_CLEAR`+SIDEWAYS em mercado lateral; Sergio ainda
+  `enabled=False`. Ajuste: `TREND_CLEAR` crítico só em SIDEWAYS; força
+  fraca = soft `TREND_STRENGTH`; `CONTINUATION_DEAD_RSI` soft; log
+  `[SIGNAL SCAN SUMMARY]` e `[NO_OPPORTUNITY_STREAK]` em WARNING.
+- **2026-08-04 (frequência v2)** — Conta Sergio estava `enabled=False`
+  (STOPPED). Victor ainda caía em `ACTIVE_CLOSED` pelo path
+  `resolve_cycle_entry_candidate` (PAYOUT + SIDEWAYS). Unificado
+  `classify_no_opportunity_reason`. `WICK_REJECTION` e `SIDEWAYS_FILTER`
+  viraram soft; `TREND_CLEAR` strength ≥ 15; perfil conservative strength 15.
+  Anti-loss estrutural mantido.
+- **2026-08-04 (frequência sem afrouxar anti-loss)** — Diagnóstico: robô
+  “parado” por (1) `GLOBAL_LOSS_COOLDOWN` 3 min/30 min gerando centenas de
+  bloqueios; (2) `[ENTRY_WINDOW_MISSED]` em ~6,3s com janela 0–5s; (3) bug
+  que classificava rejeição de estratégia + `PAYOUT_UNAVAILABLE` como
+  `ACTIVE_CLOSED` e forçava backoff operacional de 30s em vez da próxima
+  janela de análise. Ajustes: cooldown **60s / 10 min**, compra **0–8s**,
+  poll de entrada mais fino, e `NO_PATTERN_FOUND` quando há bloqueio de
+  qualidade. Hard blocks anti-loss **mantidos**.
+- **2026-08-04 (anti-loss)** — Hard blocks a partir da auditoria de losses:
+  `LAST_3_ALIGNMENT`, `WEAK_CONTINUATION_PUT` (EURUSD/AUDUSD/USDCAD/USDCHF),
+  `CONTINUATION_DEAD_RSI` (RSI 50–59), `TREND_CLEAR` crítico, portão e ranking
+  por `strategy_score` (confiança bruta não decide), `GLOBAL_LOSS_COOLDOWN`
+  após 1 LOSS ligado no guard (calibrado depois para 60s / 10 min). Velas
+  por ativo: 100. Ver §"Política anti-loss".
+- **2026-08-03 (caderno global)** — Memória de padrões unificada: todas as
+  contas alimentam e consultam o mesmo caderno
+  (`robot_pattern_memory_global`). Cadernos pessoais permanecem como arquivo;
+  SQL v4 + `unify_all_into_global` somam o histórico existente. Ver
+  [`MEMORIA_PADROES.md`](./MEMORIA_PADROES.md).
+- **2026-07-31 (cooldown GBPJPY em loop)** — Ativo rejeitado pela corretora
+  (`asset is not available`) voltava a ser analisado/comprado a cada vela M1
+  porque cache/`from_cache` furavam o cooldown e `ACTIVE_COOLDOWN` não era
+  hard block. Agora: skip duro **só desse símbolo**, cooldown **60s**, marca
+  canal fechado no cache. Análise dos outros ativos segue a cada vela.
+  Ver `ROBO_E_SUPORTE.md` §1.
+- **2026-07-31 (entrada anunciada sem compra)** — Na hora do buy, canal
+  turbo fechado era mascarado como “baixa qualidade”; overlay/voz ainda
+  promoviam `best_candidate`. `resolve_entry_validation_reason` + balão/voz
+  só com `pending_signal`. Ver `ROBO_E_SUPORTE.md` e `NARRACAO_ROBO.md`.
+- **2026-07-31 (memória de padrões)** — Portão estatístico por
+  ativo×hora×setup×direção×TF (`PATTERN_MEMORY_WEAK`). Fail-open com amostra
+  &lt; 12; bloqueia WR &lt; 52%. Desde 2026-08-03 o caderno é **global**
+  (todas as contas). Ver [`MEMORIA_PADROES.md`](./MEMORIA_PADROES.md).
+- **2026-07-29 (bloqueio de suporte/resistência)** — `SR_ZONE` volta como
+  bloqueio crítico, agora sem exceções: preço na zona de nível não opera. A
+  auditoria confirmou que o resto da análise é idêntico ao backup; o backtest
+  walk-forward com candles reais embasou a decisão e revelou que só **M1** tem
+  vantagem (54,4% vs 48,7% em M5). Ver §"Estado atual" e
+  [`BACKTEST_VALIDACAO.md`](./BACKTEST_VALIDACAO.md).
+- **2026-07-26 (restauração clássica)** — Volta a estratégia `backup-classic`
+  do backup (`/root/backup/Backend`): score bruto, filtros com
+  `SUPPORT_RESISTANCE` / `LEVEL_REJECTION`, sem hard-block `SR_ZONE` e sem
+  estratégias nomeadas no pipeline. Análise contínua por vela e rejeição de
+  dados stale no portão foram mantidas. Backup **não** foi modificado.
+- **2026-07-29** — Revalidação de canal na compra deixa de ser só-cache: busca
+  `/payouts` fresco quando o cache passa de 10s (teto 1,2s por ativo, 2,0s por
+  ciclo; falha → cache). Reduz rejeição `NO_AVAILABLE_ASSET` no buy. Ver
+  `ROBO_E_SUPORTE.md` §1.
+- **2026-07-26 (estratégias nomeadas)** — Adicionou Retração S/R, Exaustão e
+  Fluxo (`named_strategies.py`) + isenção `SR_ZONE`. **Fora do pipeline
+  ativo** após a restauração clássica; ver `ESTRATEGIAS_NOMEADAS.md`.
+- **2026-07-26 (noite)** — Bloqueio duro `SR_ZONE` (revertido pela restauração).
+- **2026-07-26** — Correções de canal turbo/binary fechado e UI falsa de
+  entrada (`pending_signal` apenas).
+- **2026-07-25** — Confiança calibrada (`calibrated-v1`); BOTH→OTC; stale
+  bloqueado. Calibração deixou de ser aplicada no score de entrada após a
+  restauração clássica.
+- **2026-07-24** — Análise contínua por vela (remove cooldown 5/15/45).
+- **2026-07-21 (noite)** — Portão de qualidade: exige `trade_allowed=True` e
+  ausência de bloqueios críticos.
+
+## 7. Modo de mercado (OTC / Aberto / Ambos)
+
+Funções: `normalize_market_mode`, `is_forex_open_market_open`,
+`effective_market_mode`, `coerce_selectable_market_mode`,
+`resolve_analysis_assets` em `backend/main.py`.
+
+| Escolha do usuário | Sessão forex | Modo efetivo (varredura/ordens) |
+|---|---|---|
+| OTC | qualquer | OTC (`*-OTC`) |
+| Ambos (BOTH) | qualquer | **sempre OTC** |
+| Aberto (OPEN) | aberta (dom 22:00 UTC → sex 22:00 UTC) | OPEN (pares sem `-OTC`) |
+| Aberto (OPEN) | fechada | **OTC** (fallback; UI mostra cadeado + horas até abrir) |
+
+Motivo do BOTH→OTC: varrer OTC+aberto (~20 ativos) em fila sequencial
+estourava timeouts de payout (~4s), usava cache stale e perdia a janela
+de compra 0–5s (`ENTRY_WINDOW_MISSED` / `asset not available`).
+
+UI (`RobotControlPanel`, `StartOperationDialog`): as três opções ficam
+sempre visíveis. Com forex fechado, **Mercado aberto** aparece com ícone
+de cadeado e o texto `Abre em X horas` (próxima abertura: domingo 22:00
+UTC). Não é possível selecionar até a sessão reabrir. Ver
+`CONFIGURACOES.md`.
+
+Campos no payload do robô: `open_market_available`,
+`open_market_hours_until`, `market_mode_effective`.

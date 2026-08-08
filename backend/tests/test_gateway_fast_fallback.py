@@ -1,0 +1,997 @@
+import asyncio
+import json
+import time
+import unittest
+from datetime import timedelta
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from fastapi.testclient import TestClient
+
+from backend import main
+from backend.auto_trader import AutoTrader
+
+
+class SlowClientContext:
+    is_closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aclose(self):
+        self.is_closed = True
+
+    async def request(self, **_kwargs):
+        await asyncio.sleep(1)
+        raise AssertionError("wait_for should cancel the slow upstream request")
+
+
+class RecordingClientContext:
+    def __init__(self) -> None:
+        self.requests = []
+        self.is_closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aclose(self):
+        self.is_closed = True
+
+    async def request(self, **kwargs):
+        self.requests.append(kwargs)
+        return httpx.Response(
+            200,
+            json=main.build_success({"connected": True, "active_mode": "PRACTICE"}),
+        )
+
+
+class StaticClientContext:
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.is_closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aclose(self):
+        self.is_closed = True
+
+    async def request(self, **_kwargs):
+        return self.response
+
+
+class HttpErrorClientContext:
+    is_closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def aclose(self):
+        self.is_closed = True
+
+    async def request(self, **_kwargs):
+        raise httpx.ConnectError("upstream unavailable")
+
+
+class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.old_trader = main.auto_trader
+        main.auto_trader = AutoTrader()
+        main.session_response_cache.clear()
+        main.active_users.clear()
+        # Client keep-alive compartilhado: limpar entre testes para o patch
+        # de ``httpx.AsyncClient`` ser honrado em ``get_bullex_http_client``.
+        main._bullex_http_client = None
+
+    def tearDown(self) -> None:
+        main.auto_trader = self.old_trader
+        main.session_response_cache.clear()
+        main.active_users.clear()
+        main._bullex_http_client = None
+
+    @staticmethod
+    def cache_account(user_id: str, *, balance: float = 42.5) -> None:
+        payload = main.build_success(
+            {
+                "connected": True,
+                "active_mode": "PRACTICE",
+                "mode": "PRACTICE",
+                "balance": balance,
+                "currency": "USD",
+                "email": "cached@example.com",
+            }
+        )
+        entry = main.BullexResponseCacheEntry(
+            status_code=200,
+            payload=payload,
+            expires_at=main.utc_now() - timedelta(seconds=1),
+        )
+        cache = main.get_session_cache(user_id)
+        cache.responses["/account"] = entry
+        cache.last_successful_responses["/account"] = entry
+
+    async def test_account_timeout_returns_last_valid_cache_quickly(self) -> None:
+        user_id = "fast-timeout-account"
+        self.cache_account(user_id)
+        main.mark_user_active(user_id)
+
+        started = time.monotonic()
+        with (
+            patch.object(main, "BULLEX_UPSTREAM_TIMEOUT_SECONDS", 0.01),
+            patch("backend.main.httpx.AsyncClient", return_value=SlowClientContext()),
+            self.assertLogs("backend-gateway", level="WARNING") as logs,
+        ):
+            status_code, payload = await main.call_bullex_service(
+                "GET",
+                "/account",
+                user_id,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(status_code, 200)
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["data"]["connected"])
+        self.assertTrue(payload["data"]["from_cache"])
+        self.assertEqual(payload["warning"], main.BULLEX_TEMPORARY_UNAVAILABLE)
+        output = "\n".join(logs.output)
+        self.assertIn("[ACCOUNT_FETCH_TIMEOUT]", output)
+        self.assertIn("[ACCOUNT_FETCH_FALLBACK]", output)
+        self.assertIn("[UPSTREAM_ERROR_HANDLED]", output)
+
+    async def test_account_and_status_mark_user_active(self) -> None:
+        # Atualizado 2026-08-07: active_mode default do robô é "REAL" (LEI —
+        # robô só opera em conta REAL) e `finalize_account_contract_with_poll_recovery`
+        # recupera contrato REAL via `memory_account_fallback` mesmo sem conexão
+        # prévia confirmada, para não desligar o robô por saldo omitido
+        # (ver ROBO_E_SUPORTE.md, `[REAL_BALANCE_POLL_RECOVERED]`). O contrato
+        # recuperado marca `sync_connection(connected=True)`, refletindo no
+        # /bullex/status seguinte.
+        user_id = "active-polling-user"
+        disconnected = (
+            404,
+            {
+                "ok": False,
+                "data": {"connected": False},
+                "error": "SESSION_NOT_FOUND",
+            },
+        )
+
+        with patch.object(
+            main,
+            "call_bullex_service",
+            new=AsyncMock(return_value=disconnected),
+        ) as service_call:
+            account = await main.bullex_account({"user_id": user_id})
+            status = await main.bullex_status({"user_id": user_id})
+
+        account_payload = json.loads(account.body)
+        self.assertEqual(account.status_code, 200)
+        self.assertTrue(account_payload["ok"])
+        self.assertFalse(account_payload["data"]["connected"])
+        self.assertEqual(account_payload["data"]["active_mode"], "REAL")
+
+        status_payload = json.loads(status.body)
+        self.assertEqual(status.status_code, 200)
+        self.assertTrue(status_payload["ok"])
+        self.assertTrue(status_payload["data"]["connected"])
+        # Conta + status (+ eventual poll-recovery de contrato REAL).
+        self.assertGreaterEqual(service_call.await_count, 2)
+        self.assertLessEqual(service_call.await_count, 3)
+        self.assertTrue(main.is_user_active(user_id))
+
+    async def test_active_user_in_backoff_gets_controlled_200_payload(self) -> None:
+        # Atualizado 2026-08-07: gateway não mais fabrica connected:false ao
+        # entrar em backoff sem cache útil (ver ROBO_E_SUPORTE.md,
+        # `[BACKOFF_BYPASS_NO_CACHE]`); em vez disso, para /account e
+        # /sessions/status ele usa a "grace" da última conta REAL confirmada
+        # (`recent_real_account_connection_payload`) para evitar bater no
+        # upstream em loop. Cacheia essa conta REAL antes do backoff.
+        user_id = "active-backoff-user"
+        self.cache_account(user_id, balance=42.5)
+        cache = main.get_session_cache(user_id)
+        cache.responses["/account"].payload["data"]["active_mode"] = "REAL"
+        cache.last_successful_responses["/account"].payload["data"]["active_mode"] = "REAL"
+        main.mark_user_active(user_id)
+        cache.next_retry_at = main.utc_now() + timedelta(seconds=42)
+
+        with patch("backend.main.httpx.AsyncClient") as upstream_client:
+            response = await main.bullex_status({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["data"]["connected"])
+        self.assertEqual(payload["data"]["active_mode"], "REAL")
+        upstream_client.assert_not_called()
+
+    async def test_robot_worker_sleeps_during_session_backoff(self) -> None:
+        user_id = "worker-backoff-user"
+        main.mark_user_active(user_id)
+        state = main.auto_trader.start(user_id)
+        state.connected = True
+        state.active_mode = "REAL"
+        main.get_session_cache(user_id).next_retry_at = main.utc_now() + timedelta(seconds=10)
+
+        async def stop_after_sleep(seconds: float) -> None:
+            self.assertGreaterEqual(seconds, 9)
+            state.enabled = False
+
+        with (
+            patch("backend.main.asyncio.sleep", new=AsyncMock(side_effect=stop_after_sleep)) as sleep,
+            patch.object(main, "execute_robot_cycle", new=AsyncMock()) as execute_cycle,
+            self.assertLogs("backend-gateway", level="INFO") as logs,
+        ):
+            await main.robot_worker(user_id)
+
+        sleep.assert_awaited()
+        execute_cycle.assert_not_awaited()
+        output = "\n".join(logs.output)
+        self.assertIn("[ROBOT_WORKER_BACKOFF_SLEEP]", output)
+        self.assertNotIn("[BACKOFF_IGNORED_FOR_ROBOT_WORKER]", output)
+
+    def test_offline_failure_does_not_create_user_backoff(self) -> None:
+        user_id = "offline-backoff-user"
+        main.auto_trader.start(user_id)
+
+        with self.assertLogs("backend-gateway", level="INFO") as logs:
+            main.mark_session_failure(user_id)
+
+        cache = main.get_session_cache(user_id)
+        self.assertEqual(cache.failure_count, 0)
+        self.assertIsNone(cache.next_retry_at)
+        output = "\n".join(logs.output)
+        self.assertIn("[BACKOFF_SKIPPED_OFFLINE_USER]", output)
+        self.assertNotIn("[USER_BACKOFF_ACTIVE]", output)
+
+    async def test_restore_requests_never_create_failure_backoff(self) -> None:
+        cases = (
+            (
+                "restore-http-error",
+                HttpErrorClientContext(),
+            ),
+            (
+                "restore-offline-response",
+                StaticClientContext(
+                    httpx.Response(
+                        404,
+                        json={
+                            "ok": False,
+                            "data": {"connected": False},
+                            "error": "SESSION_NOT_FOUND",
+                        },
+                    )
+                ),
+            ),
+            (
+                "restore-other-failure",
+                StaticClientContext(
+                    httpx.Response(
+                        400,
+                        json=main.build_error("INVALID_REQUEST"),
+                    )
+                ),
+            ),
+        )
+
+        for user_id, client_context in cases:
+            with self.subTest(user_id=user_id):
+                main.mark_user_active(user_id)
+                with (
+                    patch("backend.main.httpx.AsyncClient", return_value=client_context),
+                    self.assertLogs("backend-gateway", level="INFO") as logs,
+                ):
+                    await main.call_bullex_service(
+                        "GET",
+                        "/sessions/status",
+                        user_id,
+                        allow_failure_backoff=False,
+                    )
+
+                cache = main.get_session_cache(user_id)
+                self.assertEqual(cache.failure_count, 0)
+                self.assertIsNone(cache.next_retry_at)
+                output = "\n".join(logs.output)
+                self.assertIn("[BACKOFF_SKIPPED_RESTORE]", output)
+                self.assertNotIn("[USER_BACKOFF_ACTIVE]", output)
+
+    def test_connect_activity_expires_after_five_minutes(self) -> None:
+        user_id = "expired-active-user"
+        main.active_users[user_id] = main.utc_now() - timedelta(seconds=301)
+
+        self.assertFalse(main.is_user_active(user_id))
+        self.assertNotIn(user_id, main.active_users)
+
+    async def test_account_uses_short_cache_without_upstream_call(self) -> None:
+        user_id = "fast-account-cache-hit"
+        self.cache_account(user_id)
+        cached = main.get_session_cache(user_id).responses["/account"]
+        cached.expires_at = main.utc_now() + timedelta(
+            seconds=main.ACCOUNT_CACHE_TTL_SECONDS
+        )
+
+        with (
+            patch("backend.main.httpx.AsyncClient") as upstream_client,
+            self.assertLogs("backend-gateway", level="INFO") as logs,
+        ):
+            status_code, payload = await main.call_bullex_service(
+                "GET",
+                "/account",
+                user_id,
+            )
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(payload["data"]["balance"], 42.5)
+        upstream_client.assert_not_called()
+        self.assertIn("[ACCOUNT_CACHE_HIT]", "\n".join(logs.output))
+
+    async def test_order_result_uses_one_second_cache_without_upstream_loop(self) -> None:
+        user_id = "order-result-cache-hit"
+        client = RecordingClientContext()
+
+        with (
+            patch("backend.main.httpx.AsyncClient", return_value=client),
+            self.assertLogs("backend-gateway", level="INFO") as logs,
+        ):
+            first_status, first_payload = await main.call_bullex_service(
+                "GET",
+                "/orders/order-123/result",
+                user_id,
+            )
+            second_status, second_payload = await main.call_bullex_service(
+                "GET",
+                "/orders/order-123/result",
+                user_id,
+            )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(first_payload, second_payload)
+        self.assertEqual(len(client.requests), 1)
+        self.assertIn("[ORDER_RESULT_POLL_THROTTLED]", "\n".join(logs.output))
+
+    async def test_polling_endpoints_expose_minimum_retry_headers(self) -> None:
+        user_id = "poll-headers-user"
+        main.mark_user_active(user_id)
+
+        with (
+            patch.object(main, "_robot_state_impl", new=AsyncMock(return_value=main.json_response(200, main.build_success({})))),
+            patch.object(main, "_bullex_status_impl", new=AsyncMock(return_value=main.json_response(200, main.build_success({})))),
+            patch.object(main, "_bullex_account_impl", new=AsyncMock(return_value=main.json_response(200, main.build_success({})))),
+            patch.object(main, "call_bullex_service", new=AsyncMock(return_value=(200, main.build_success({"result": "PENDING_RESULT"})))),
+        ):
+            robot = await main.robot_state({"user_id": user_id})
+            status = await main.bullex_status({"user_id": user_id})
+            account = await main.bullex_account({"user_id": user_id})
+            order = await main.bullex_order_result("order-headers", {"user_id": user_id})
+
+        self.assertEqual(robot.headers["retry-after"], "30")
+        self.assertEqual(status.headers["retry-after"], "25")
+        self.assertEqual(account.headers["retry-after"], "25")
+        self.assertEqual(order.headers["retry-after"], "1")
+
+    async def test_session_restore_bypasses_stale_status_cache(self) -> None:
+        user_id = "restore-bypasses-cache"
+        stale_payload = main.build_error("SESSION_NOT_FOUND")
+        stale_payload["data"] = {"connected": False}
+        cache = main.get_session_cache(user_id)
+        cache.responses["/sessions/status"] = main.BullexResponseCacheEntry(
+            status_code=404,
+            payload=stale_payload,
+            expires_at=main.utc_now() + timedelta(seconds=60),
+        )
+        client = RecordingClientContext()
+
+        with patch("backend.main.httpx.AsyncClient", return_value=client):
+            status_code, payload = await main.call_bullex_service(
+                "GET",
+                "/sessions/status",
+                user_id,
+                allow_session_restore=True,
+            )
+
+        self.assertEqual(status_code, 200)
+        self.assertTrue(payload["data"]["connected"])
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(client.requests[0]["headers"]["x-allow-session-restore"], "true")
+
+    async def test_robot_state_is_memory_only_and_balance_zero_stays_connected(self) -> None:
+        user_id = "fast-robot-state"
+        state = main.auto_trader.start(user_id)
+        state.connected = True
+        state.active_mode = "PRACTICE"
+        self.cache_account(user_id, balance=0)
+
+        with (
+            patch.object(main, "call_bullex_service", new=AsyncMock()) as upstream,
+            patch.object(main, "get_user_account_snapshot") as persistent_snapshot,
+            self.assertLogs("backend-gateway", level="INFO") as logs,
+        ):
+            response = await main.robot_state({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["data"]["connected"])
+        self.assertEqual(payload["data"]["balance"], 0)
+        upstream.assert_not_awaited()
+        persistent_snapshot.assert_not_called()
+        self.assertIn("[ROBOT_STATE_FAST_RETURN]", "\n".join(logs.output))
+
+    async def test_real_robot_does_not_start_with_zero_balance(self) -> None:
+        user_id = "real-zero-start"
+        state = main.auto_trader.get(user_id)
+        state.account_mode = "REAL"
+        state.allow_real = True
+        state.confirm_real = True
+        state.connected = True
+        state.active_mode = "REAL"
+        state.connection_checked_at = main.utc_now()
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(
+                    return_value=(
+                        200,
+                        main.build_success(
+                            {
+                                "connected": True,
+                                "active_mode_real_detected": True,
+                                "active_mode_from_bullex": "REAL",
+                                "balance_real": 0,
+                                "balance_practice": 10000,
+                                "balance": 0,
+                                "mode": "REAL",
+                            }
+                        ),
+                    )
+                ),
+            ),
+            patch.object(main, "ensure_robot_worker") as worker_start,
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_start({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "INSUFFICIENT_BALANCE")
+        self.assertEqual(
+            payload["message"],
+            "Você está sem saldo para iniciar. Faça um depósito na BullEx.",
+        )
+        self.assertEqual(payload["data"]["status"], "INSUFFICIENT_BALANCE")
+        self.assertFalse(payload["data"]["enabled"])
+        self.assertFalse(payload["data"]["worker_running"])
+        self.assertEqual(
+            payload["data"]["status_message"],
+            "Você está sem saldo para iniciar. Faça um depósito na BullEx.",
+        )
+        worker_start.assert_not_called()
+        self.assertNotIn(user_id, main.robot_tasks)
+
+    async def test_real_robot_start_reconnects_and_retries_when_balance_missing(self) -> None:
+        """Sessão viva no gateway (cache) mas caída no bullex-service (ex.: restart
+        de deploy invalidou o SSID em memória) não deve travar o start para sempre
+        em INSUFFICIENT_BALANCE — o start tenta reconectar com credenciais salvas
+        e reconsulta /account antes de bloquear."""
+        user_id = "real-reconnect-recovers-balance"
+        state = main.auto_trader.get(user_id)
+        state.account_mode = "REAL"
+        state.allow_real = True
+        state.confirm_real = True
+        state.connected = True
+        state.active_mode = "REAL"
+        state.connection_checked_at = main.utc_now()
+
+        account_without_balance = main.build_success(
+            {
+                "connected": True,
+                "active_mode_from_bullex": "REAL",
+                "balance_real": None,
+                "balance": None,
+                "mode": "REAL",
+            }
+        )
+        account_with_balance = main.build_success(
+            {
+                "connected": True,
+                "active_mode_from_bullex": "REAL",
+                "balance_real": 250,
+                "balance": 250,
+                "mode": "REAL",
+            }
+        )
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(side_effect=[(200, account_without_balance), (200, account_with_balance)]),
+            ) as upstream,
+            patch.object(
+                main,
+                "try_auto_reconnect_with_saved_credentials",
+                new=AsyncMock(return_value=True),
+            ) as reconnect,
+            patch.object(main, "ensure_robot_worker") as worker_start,
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_start({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        reconnect.assert_awaited_once_with(user_id)
+        self.assertEqual(upstream.await_count, 2)
+        second_call_kwargs = upstream.await_args_list[1].kwargs
+        self.assertTrue(second_call_kwargs.get("force_refresh"))
+        worker_start.assert_called_once()
+
+    async def test_real_robot_start_still_blocks_when_reconnect_fails(self) -> None:
+        user_id = "real-reconnect-fails-blocks"
+        state = main.auto_trader.get(user_id)
+        state.account_mode = "REAL"
+        state.allow_real = True
+        state.confirm_real = True
+        state.connected = True
+        state.active_mode = "REAL"
+        state.connection_checked_at = main.utc_now()
+
+        account_without_balance = main.build_success(
+            {
+                "connected": True,
+                "active_mode_from_bullex": "REAL",
+                "balance_real": None,
+                "balance": None,
+                "mode": "REAL",
+            }
+        )
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(return_value=(200, account_without_balance)),
+            ),
+            patch.object(
+                main,
+                "try_auto_reconnect_with_saved_credentials",
+                new=AsyncMock(return_value=False),
+            ) as reconnect,
+            patch.object(main, "get_cached_account_snapshot", return_value={}),
+            patch.object(main, "memory_account_fallback", return_value=None),
+            patch.object(main, "ensure_robot_worker") as worker_start,
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_start({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        # Saldo None após reconnect falho = sessão/saldo desconhecido, não
+        # "sem depósito". Antes devolvia INSUFFICIENT_BALANCE falso.
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "BULLEX_NOT_CONNECTED")
+        reconnect.assert_awaited_once_with(user_id)
+        worker_start.assert_not_called()
+
+    async def test_start_rejects_stale_memory_fallback_without_balance(self) -> None:
+        """Fallback de memória com modo REAL mas sem saldo não pode iniciar.
+
+        Reproduz o bug de marketing: SESSION_NOT_FOUND + memory_fallback ok
+        sem balance → antes virava INSUFFICIENT_BALANCE com balance=None.
+        """
+        user_id = "marketing-stale-memory-no-balance"
+        state = main.auto_trader.get(user_id)
+        state.account_mode = "REAL"
+        state.allow_real = True
+        state.confirm_real = True
+        state.connected = True
+        state.active_mode = "REAL"
+        state.connection_checked_at = main.utc_now()
+        state.entry_value = 5
+
+        failed_account = {
+            "ok": False,
+            "error": "REAL_BALANCE_NOT_DETECTED",
+            "data": {"connected": False, "active_mode": None, "balance_real": None},
+        }
+        stale_memory = main.build_success(
+            {
+                "connected": True,
+                "active_mode": "REAL",
+                "mode": "REAL",
+                "balance": None,
+                "balance_real": None,
+            }
+        )
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(return_value=(200, failed_account)),
+            ),
+            patch.object(
+                main,
+                "try_auto_reconnect_with_saved_credentials",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(main, "get_cached_account_snapshot", return_value={}),
+            patch.object(main, "get_user_account_snapshot", return_value={}),
+            patch.object(main, "memory_account_fallback", return_value=stale_memory),
+            patch.object(main, "ensure_robot_worker") as worker_start,
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_start({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "BULLEX_NOT_CONNECTED")
+        worker_start.assert_not_called()
+
+    async def test_real_robot_does_not_start_when_entry_exceeds_balance(self) -> None:
+        user_id = "real-entry-over-balance"
+        state = main.auto_trader.get(user_id)
+        state.account_mode = "REAL"
+        state.allow_real = True
+        state.confirm_real = True
+        state.connected = True
+        state.active_mode = "REAL"
+        state.connection_checked_at = main.utc_now()
+        state.entry_value = 10
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(
+                    return_value=(
+                        200,
+                        main.build_success(
+                            {
+                                "connected": True,
+                                "active_mode_from_bullex": "REAL",
+                                "balance_real": 5,
+                                "balance": 5,
+                                "mode": "REAL",
+                            }
+                        ),
+                    )
+                ),
+            ),
+            patch.object(main, "ensure_robot_worker") as worker_start,
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_start({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "INSUFFICIENT_BALANCE")
+        self.assertEqual(payload["message"], "Seu saldo é menor que o valor da entrada.")
+        self.assertEqual(payload["data"]["status"], "INSUFFICIENT_BALANCE")
+        self.assertFalse(payload["data"]["enabled"])
+        self.assertFalse(payload["data"]["worker_running"])
+        worker_start.assert_not_called()
+        self.assertNotIn(user_id, main.robot_tasks)
+
+    async def test_real_robot_starts_with_confirmed_mode_and_sufficient_balance(self) -> None:
+        user_id = "real-confirmed-start"
+        state = main.auto_trader.get(user_id)
+        state.connected = True
+        state.active_mode = "REAL"
+        state.connection_checked_at = main.utc_now()
+        state.entry_value = 2
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(
+                    return_value=(
+                        200,
+                        main.build_success(
+                            {
+                                "connected": True,
+                                "active_mode": "REAL",
+                                "active_mode_from_bullex": "REAL",
+                                "balance_real": 25,
+                                "balance_practice": 10000,
+                                "balance": 25,
+                                "mode": "REAL",
+                            }
+                        ),
+                    )
+                ),
+            ),
+            patch.object(main, "ensure_robot_worker") as worker_start,
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_start({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["data"]["enabled"])
+        self.assertTrue(payload["data"]["allow_real"])
+        self.assertTrue(payload["data"]["confirm_real"])
+        worker_start.assert_called_once_with(user_id)
+
+    async def test_status_exception_returns_memory_fallback(self) -> None:
+        user_id = "fast-status-fallback"
+        state = main.auto_trader.start(user_id)
+        state.connected = True
+        state.active_mode = "REAL"
+
+        with patch.object(
+            main,
+            "call_bullex_service",
+            new=AsyncMock(side_effect=RuntimeError("upstream down")),
+        ):
+            response = await main.bullex_status({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["data"]["connected"])
+        self.assertEqual(payload["warning"], main.BULLEX_TEMPORARY_UNAVAILABLE)
+
+    async def test_account_ignores_practice_balance_and_blocks_robot(self) -> None:
+        user_id = "practice-balance-must-not-leak"
+        state = main.auto_trader.get(user_id)
+        state.connected = True
+        state.active_mode = "PRACTICE"
+
+        with (
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(
+                    return_value=(
+                        200,
+                        main.build_success(
+                            {
+                                "connected": True,
+                                "active_mode_from_bullex": "PRACTICE",
+                                "balance_real": 25,
+                                "balance_practice": 10000,
+                                "balance": 10000,
+                                "mode": "PRACTICE",
+                            }
+                        ),
+                    )
+                ),
+            ),
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.bullex_account({"user_id": user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "BULLEX_ACTIVE_MODE_NOT_REAL")
+        self.assertIsNone(payload["data"]["balance"])
+        self.assertEqual(payload["data"]["active_mode"], "PRACTICE")
+        self.assertEqual(payload["data"]["balance_real"], 25)
+        self.assertEqual(payload["data"]["balance_practice"], 10000)
+        self.assertFalse(payload["data"]["active_mode_real_detected"])
+        self.assertEqual(
+            payload["data"]["robot"]["status"],
+            "BULLEX_ACTIVE_MODE_NOT_REAL",
+        )
+
+    async def test_connect_uses_sixty_second_policy_and_maps_timeout(self) -> None:
+        with (
+            patch.object(main, "BULLEX_CONNECT_TIMEOUT_SECONDS", 0.01),
+            patch("backend.main.httpx.AsyncClient", return_value=SlowClientContext()),
+            self.assertLogs("backend-gateway", level="WARNING") as logs,
+        ):
+            status_code, payload = await main.call_bullex_service(
+                "POST",
+                "/sessions/connect",
+                "connect-timeout",
+                json_body={"email": "user@example.com", "password": "secret"},
+            )
+
+        self.assertEqual(status_code, 504)
+        self.assertEqual(payload["error"], "LOGIN_TIMEOUT")
+        output = "\n".join(logs.output)
+        self.assertIn("[CONNECT_TIMEOUT_HANDLED]", output)
+        self.assertNotIn("[BAD_GATEWAY_PREVENTED]", output)
+
+
+class GatewayControlledErrorCorsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_api_key = main.config.panel_api_key
+        self.old_trader = main.auto_trader
+        main.config.panel_api_key = "test-key"
+        main.auto_trader = AutoTrader()
+        main.session_response_cache.clear()
+        main.active_users.clear()
+        self.client = TestClient(main.app)
+
+    def tearDown(self) -> None:
+        main.config.panel_api_key = self.old_api_key
+        main.auto_trader = self.old_trader
+        main.session_response_cache.clear()
+        main.active_users.clear()
+
+    def test_account_exception_is_controlled_json_with_cors_headers(self) -> None:
+        # Atualizado 2026-08-07: com active_mode default "REAL", o fallback de
+        # memória (`memory_account_fallback`) confirma o contrato mesmo sem
+        # nenhuma conexão prévia, então a exceção upstream não derruba `ok`
+        # (ver ROBO_E_SUPORTE.md, `[REAL_BALANCE_POLL_RECOVERED]`).
+        with patch.object(
+            main,
+            "call_bullex_service",
+            new=AsyncMock(side_effect=RuntimeError("upstream down")),
+        ):
+            response = self.client.get(
+                "/bullex/account",
+                headers={
+                    "Origin": "https://elcapobot.online",
+                    "x-api-key": "test-key",
+                    "x-user-id": "cors-controlled-error",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertFalse(response.json()["data"]["connected"])
+        self.assertIsNone(response.json()["data"]["balance"])
+        self.assertIsNone(response.json()["data"]["balance_real"])
+        self.assertIsNone(response.json()["error"])
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://elcapobot.online",
+        )
+
+    def test_status_exception_is_controlled_json_with_cors_headers(self) -> None:
+        with patch.object(
+            main,
+            "call_bullex_service",
+            new=AsyncMock(side_effect=RuntimeError("status upstream down")),
+        ):
+            response = self.client.get(
+                "/bullex/status",
+                headers={
+                    "Origin": "https://elcapobot.online",
+                    "x-api-key": "test-key",
+                    "x-user-id": "cors-status-error",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        self.assertEqual(
+            response.json()["error"],
+            main.BULLEX_TEMPORARY_UNAVAILABLE,
+        )
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://elcapobot.online",
+        )
+
+    def test_unexpected_robot_state_exception_keeps_cors_headers(self) -> None:
+        with patch.object(
+            main,
+            "recover_sync_timeout_if_needed",
+            side_effect=RuntimeError("unexpected state failure"),
+        ):
+            response = self.client.get(
+                "/robot/state",
+                headers={
+                    "Origin": "https://elcapobot.online",
+                    "x-api-key": "test-key",
+                    "x-user-id": "cors-robot-error",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        self.assertEqual(response.json()["data"]["status"], "STOPPED")
+        self.assertFalse(response.json()["data"]["real_ready"])
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://elcapobot.online",
+        )
+
+    def test_connect_converts_upstream_502_to_login_failed_with_cors(self) -> None:
+        with patch.object(
+            main,
+            "call_bullex_service",
+            new=AsyncMock(
+                return_value=(
+                    502,
+                    {"ok": False, "error": main.BULLEX_TEMPORARY_UNAVAILABLE},
+                )
+            ),
+        ):
+            response = self.client.post(
+                "/bullex/connect",
+                headers={
+                    "Origin": "https://elcapobot.online",
+                    "x-api-key": "test-key",
+                    "x-user-id": "connect-upstream-502",
+                },
+                json={"email": "user@example.com", "password": "secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["error"], main.BULLEX_TEMPORARY_UNAVAILABLE)
+        self.assertEqual(
+            response.json()["detail"],
+            main.BULLEX_TEMPORARY_UNAVAILABLE,
+        )
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://elcapobot.online",
+        )
+
+    def test_connect_start_and_stop_never_leak_unhandled_exception(self) -> None:
+        headers = {
+            "Origin": "https://elcapobot.online",
+            "x-api-key": "test-key",
+            "x-user-id": "protected-endpoint-error",
+        }
+        cases = (
+            (
+                "/bullex/connect",
+                {"email": "user@example.com", "password": "secret"},
+                patch.object(
+                    main,
+                    "call_bullex_service",
+                    new=AsyncMock(side_effect=RuntimeError("connect failure")),
+                ),
+            ),
+            (
+                "/robot/start",
+                None,
+                patch.object(
+                    main,
+                    "get_user_robot_state",
+                    side_effect=RuntimeError("start failure"),
+                ),
+            ),
+            (
+                "/robot/stop",
+                None,
+                patch.object(
+                    main.auto_trader,
+                    "stop",
+                    side_effect=RuntimeError("stop failure"),
+                ),
+            ),
+        )
+
+        for path, body, failure in cases:
+            with self.subTest(path=path), failure:
+                response = self.client.post(path, headers=headers, json=body)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["error"],
+                    main.BULLEX_TEMPORARY_UNAVAILABLE,
+                )
+                if path == "/bullex/connect":
+                    self.assertIn("connect failure", response.json()["detail"])
+                self.assertEqual(
+                    response.headers.get("access-control-allow-origin"),
+                    "https://elcapobot.online",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

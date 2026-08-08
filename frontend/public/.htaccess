@@ -1,0 +1,30 @@
+DirectoryIndex index.html
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # Serve existing files/directories directly.
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # Fallback for client-side routes when the hosting panel does not map them automatically.
+  RewriteRule ^ index.html [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+  # Match versioned static assets explicitly.
+  SetEnvIf Request_URI "^/assets/" STATIC_ASSET=1
+  SetEnvIf Request_URI "^/favicon\.svg$" STATIC_ASSET=1
+  SetEnvIf Request_URI "^/robo\.png$" STATIC_ASSET=1
+  SetEnvIf Request_URI "^/robo-wink\.webm$" STATIC_ASSET=1
+  SetEnvIf Request_URI "^/robot-start\.mp3$" STATIC_ASSET=1
+
+  # Route pages must not be cached, otherwise old HTML can reference deleted chunks.
+  Header always set Cache-Control "no-cache, no-store, must-revalidate" env=!STATIC_ASSET
+  Header always set Pragma "no-cache" env=!STATIC_ASSET
+  Header always set Expires "0" env=!STATIC_ASSET
+
+  # Fingerprinted assets can be cached safely for a long time.
+  Header always set Cache-Control "public, max-age=31536000, immutable" env=STATIC_ASSET
+</IfModule>

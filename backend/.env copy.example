@@ -1,0 +1,69 @@
+# =============================================================================
+# Backend — El Capo AutoBot (.env.example)
+# Copie para Backend/.env.local e preencha os valores.
+# NUNCA commite .env.local com secrets reais.
+# =============================================================================
+
+# Ambiente: development | staging | production
+APP_ENV=development
+
+# -----------------------------------------------------------------------------
+# Supabase (OBRIGATÓRIO para login/sessão/admin/financeiro)
+# Project Settings → API no painel Supabase
+# -----------------------------------------------------------------------------
+SUPABASE_URL=https://SEU-PROJETO.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=sua_service_role_key_secreta
+
+# -----------------------------------------------------------------------------
+# Gateway / painel
+# -----------------------------------------------------------------------------
+# Deve bater com VITE_PANEL_API_KEY do Frontend/.env
+PANEL_API_KEY=troque-esta-chave
+
+# Emails admin (fallback local / allowlist). Separados por vírgula.
+ADMIN_EMAILS=admin@seudominio.com
+
+# Origins permitidas (CORS). Inclua o frontend local e produção.
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,https://app.elcapobot.online
+
+# URL pública do frontend (links de recuperação, redirects)
+FRONTEND_URL=https://app.elcapobot.online
+
+# URL pública da API (webhooks / links externos)
+PUBLIC_API_URL=http://127.0.0.1:8080
+
+# Em development, permite headers legados x-user-id / x-api-key para QA local.
+# Nunca true em production.
+AUTH_ALLOW_LEGACY_HEADERS=true
+
+# -----------------------------------------------------------------------------
+# BullEx (serviço interno)
+# -----------------------------------------------------------------------------
+BULLEX_SERVICE_URL=http://127.0.0.1:8001
+BULLEX_SESSION_DB_PATH=./data/bullex-sessions.db
+BULLEX_MAX_CONCURRENT_API_CALLS=1
+# Base64 URL-safe (Fernet / 32 bytes). Gere uma chave própria.
+BULLEX_SESSION_ENCRYPTION_KEY=dGVzdC1sb2NhbC1rZXktZWxjYXBvLWJvdC0zMmJ5dGVzIQ==
+
+# Persistência local do robô (quando não usa só Supabase)
+ROBOT_DB_PATH=./data/backend-persistence.db
+ROBOT_REAL_MAX_ENTRY=10
+
+# -----------------------------------------------------------------------------
+# Webhooks de saída (opcional em local)
+# Prefixo segue APP_ENV: DEV_ | STAGING_ | PROD_
+# -----------------------------------------------------------------------------
+DEV_WEBHOOKS_ENABLED=false
+# 32 bytes em Base64 URL-safe (obrigatório se WEBHOOKS_ENABLED=true)
+DEV_ENCRYPTION_KEY=
+DEV_REDIS_URL=redis://127.0.0.1:6379/0
+
+# -----------------------------------------------------------------------------
+# Cakto / financeiro (opcional em local)
+# Prefixo: DEV_ | STAGING_ | PROD_
+# -----------------------------------------------------------------------------
+DEV_CAKTO_ENABLED=false
+DEV_CAKTO_WEBHOOK_SECRET=
+DEV_CAKTO_OAUTH_CLIENT_ID=
+DEV_CAKTO_OAUTH_CLIENT_SECRET=
+# DEV_CAKTO_OAUTH_TOKEN=
