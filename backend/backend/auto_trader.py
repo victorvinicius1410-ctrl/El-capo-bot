@@ -323,6 +323,11 @@ class RobotConfigUpdate(BaseModel):
 @dataclass
 class RobotState:
     enabled: bool = False
+    # Espelho persistido de `enabled` sem as regras de status de `to_dict`.
+    was_running: bool = False
+    # Ligado no restore quando `was_running` era True: a parada foi restart de
+    # manutenção, não o cliente desligando. Só informa a UI — NÃO religa nada.
+    paused_by_maintenance: bool = False
     account_mode: AccountMode = "REAL"
     timeframe: Timeframe = "M1"
     market_mode: MarketMode = "OTC"
@@ -427,6 +432,12 @@ class RobotState:
     def to_dict(self) -> dict[str, Any]:
         self.status = normalize_robot_status(self.status)
         data = strip_ai_fields(asdict(self))
+        # Intenção crua do usuário, ANTES das regras de status abaixo zerarem
+        # `enabled` (stop win/loss, desconexão, modo não-REAL). Sem isso o estado
+        # persistido nunca registra quem estava ligado, e um restart não tem como
+        # distinguir "cliente desligou" de "manutenção derrubou" — ver
+        # `paused_by_maintenance` no restore.
+        data["was_running"] = bool(self.enabled)
         for key in (
             "current_cycle_started_at",
             "next_cycle_at",
@@ -986,7 +997,65 @@ class AutoTrader:
             for trade in self._histories[user_id]
             if trade.get("order_id") is not None
         }
+        self._recompute_score_from_history(state, self._histories[user_id])
         return state
+
+    @staticmethod
+    def _recompute_score_from_history(
+        state: RobotState,
+        trades: list[dict[str, Any]],
+    ) -> None:
+        """
+        Recalcula placar e lucro da sessão a partir do histórico.
+
+        O contador em memória zerava a todo restart do serviço e era
+        sobrescrito por snapshots atrasados — em 08/08 clientes viram o placar
+        cair sozinho (4x0 → 1x0). O histórico é a fonte de verdade.
+
+        Usa a MESMA janela de ``build_management_summary`` (operações de hoje,
+        posteriores ao último reset), para placar e stop win/loss não
+        divergirem. Não altera a decisão de parada: ela já vinha do histórico.
+
+        Args:
+            state: Estado restaurado, alterado no lugar.
+            trades: Histórico persistido do usuário.
+        """
+        if not trades:
+            # Lista vazia é ambígua: pode ser cliente novo OU falha transitória
+            # na leitura da persistência. Zerar aqui apagaria um placar válido,
+            # então preserva o que veio da persistência — o próximo restore
+            # corrige. "Tem histórico, mas nada na janela" cai no cálculo normal
+            # abaixo e zera corretamente.
+            return
+        today = utc_now().date()
+        reset_at = state.stop_reset_at if isinstance(state.stop_reset_at, datetime) else None
+        wins = 0
+        losses = 0
+        profit = 0.0
+        for trade in trades:
+            result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
+            if result not in {"WIN", "LOSS"}:
+                continue
+            finished_at = trade.get("finished_at")
+            if isinstance(finished_at, str):
+                try:
+                    finished_at = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+            if not isinstance(finished_at, datetime):
+                continue
+            if finished_at.date() != today:
+                continue
+            if reset_at is not None and finished_at < reset_at:
+                continue
+            if result == "WIN":
+                wins += 1
+            else:
+                losses += 1
+            profit += float(trade.get("profit") or 0)
+        state.wins = wins
+        state.losses = losses
+        state.profit = round(profit, 2)
 
     def recover_sync_timeout(self, user_id: str) -> tuple[bool, RobotState]:
         state = self.get(user_id)
@@ -1094,6 +1163,9 @@ class AutoTrader:
         state = self.get(user_id)
         now = utc_now()
         state.enabled = True
+        state.was_running = True
+        # O cliente religou: o aviso de "parado pela manutenção" cumpriu o papel.
+        state.paused_by_maintenance = False
         state.cycle_minutes = cycle_minutes_for_timeframe(state.timeframe)
         state.status = STATUS_WAITING_NEXT_CYCLE
         state.rejection_reason = None
@@ -1157,6 +1229,10 @@ class AutoTrader:
         """
         state = self.get(user_id)
         state.enabled = False
+        # Parada deliberada do cliente: o próximo restart não deve alegar
+        # manutenção nem oferecer "religar".
+        state.was_running = False
+        state.paused_by_maintenance = False
         state.status = STATUS_STOPPED
         state.rejection_reason = None
         state.last_rejection_reason = None

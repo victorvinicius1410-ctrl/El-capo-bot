@@ -108,6 +108,15 @@ class Bullex:
         self.api.set_session(headers=self.SESSION_HEADER,
                              cookies=self.SESSION_COOKIE)
 
+        # Login por email/senha: sempre limpo, nunca reaproveitando SSID.
+        #
+        # `BullexAPI.connect()` tem um atalho "temp ssid reconnect for speed up"
+        # que dispara quando `global_value.SSID` não é None. Como o BullexAPI
+        # agora herda o SessionGlobals da sessão, um SSID morto caía nesse
+        # atalho e o erro voltava como `invalid_credentials` — mesmo com a senha
+        # certa. Quem quer reusar SSID usa `restore_with_ssid()`.
+        global_value.SSID = None
+
         check, reason = self.api.connect()
 
         if check == True:

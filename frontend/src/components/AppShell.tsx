@@ -368,6 +368,7 @@ function buildAdminModelState(
   const showingResult = result != null && now - result.at < 2_200;
   return {
     enabled: true,
+    paused_by_maintenance: false,
     worker_running: true,
     connected: true,
     status: showingResult ? "RESULT_RECEIVED" : "WAITING_NEXT_CYCLE",

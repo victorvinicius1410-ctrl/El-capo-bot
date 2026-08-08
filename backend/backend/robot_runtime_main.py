@@ -26,12 +26,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("robot-runtime")
 
 
-def _hydrate_user_from_persistence(gateway: object, user_id: str) -> None:
-    """Recarrega estado/trades do usuário a partir da persistência (Supabase/SQLite)."""
+def _hydrate_user_from_persistence(
+    gateway: object,
+    user_id: str,
+    *,
+    force: bool = False,
+) -> None:
+    """
+    Recarrega estado/trades do usuário a partir da persistência.
+
+    Args:
+        gateway: Módulo/objeto com ``robot_persistence`` e ``auto_trader``.
+        user_id: Cliente alvo.
+        force: Ignora o estado em memória e recarrega mesmo assim. Use no
+            ``start``/``stop``, onde a decisão do cliente veio pelo gateway e
+            ainda não existe no runtime.
+    """
     persistence = getattr(gateway, "robot_persistence", None)
     auto_trader = getattr(gateway, "auto_trader", None)
     if persistence is None or auto_trader is None:
         return
+    # Enquanto o robô roda, a MEMÓRIA do runtime é a fonte de verdade — não a
+    # persistência. O comando `ensure` chega a cada ~5s do polling do painel e
+    # re-hidratar aqui sobrescrevia o placar vivo com o último snapshot gravado
+    # (que é assíncrono, então quase sempre atrasado). Em 08/08 isso derrubou o
+    # placar de um cliente de 4x0/+343 para 1x0/+85 no meio da sessão.
+    #
+    # `force=True` é OBRIGATÓRIO no `start`: quem liga o robô é o gateway, que
+    # grava `enabled=True` na persistência. Sem hidratar aqui o runtime ficaria
+    # com o `enabled=False` antigo e `ensure_robot_worker` recusaria subir o
+    # worker — painel dizendo "ativo" e nada operando.
+    if not force:
+        has_state = getattr(auto_trader, "has_state", None)
+        if callable(has_state) and has_state(user_id):
+            return
     try:
         for uid, state_payload in persistence.load_states():
             if str(uid) != user_id:
@@ -65,7 +93,10 @@ async def _handle_command(gateway: object, payload: dict) -> None:
     if not user_id or not action:
         return
     if action in {"start", "ensure"}:
-        _hydrate_user_from_persistence(gateway, user_id)
+        # `start` = decisão explícita do cliente, chegou pelo gateway: precisa
+        # recarregar. `ensure` = polling do painel a cada ~5s: NÃO pode
+        # sobrescrever o placar vivo (ver comentário em _hydrate_user...).
+        _hydrate_user_from_persistence(gateway, user_id, force=(action == "start"))
         # Painel online no gateway → marca ativo no runtime para ensure passar.
         mark = getattr(gateway, "mark_user_active", None)
         if callable(mark):
@@ -73,7 +104,8 @@ async def _handle_command(gateway: object, payload: dict) -> None:
         gateway.ensure_robot_worker(user_id)  # type: ignore[attr-defined]
         logger.info("[ROBOT_RUNTIME_CMD] action=%s user_id=%s", action, user_id)
     elif action == "stop":
-        _hydrate_user_from_persistence(gateway, user_id)
+        # Também é decisão explícita do cliente vinda do gateway.
+        _hydrate_user_from_persistence(gateway, user_id, force=True)
         state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
         state.enabled = False
         task = getattr(gateway, "robot_tasks", {}).pop(user_id, None)

@@ -82,6 +82,12 @@ export interface RobotGaleInfo {
 
 export interface RobotState {
   enabled: boolean;
+  /**
+   * O robô estava ligado e foi parado por um restart do servidor, não pelo
+   * cliente. Serve só para o painel oferecer "religar" — o backend mantém a
+   * trava de segurança e nada volta a operar sem o clique.
+   */
+  paused_by_maintenance: boolean;
   worker_running: boolean;
   connected: boolean;
   status: string;
@@ -471,6 +477,7 @@ export function normalizeRobotState(payload: unknown): RobotState {
 
   return {
     enabled: toBool(raw.enabled),
+    paused_by_maintenance: toBool(raw.paused_by_maintenance ?? raw.pausedByMaintenance),
     worker_running: toBool(raw.worker_running ?? raw.workerRunning ?? raw.running ?? raw.is_running),
     connected: !disconnected,
     status,
@@ -607,6 +614,7 @@ export function normalizeRobotState(payload: unknown): RobotState {
 export function getStoppedRobotState(disconnected = false): RobotState {
   return {
     enabled: false,
+    paused_by_maintenance: false,
     worker_running: false,
     connected: !disconnected,
     status: disconnected ? "ACCOUNT_DISCONNECTED" : "STOPPED",

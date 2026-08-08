@@ -111,6 +111,9 @@ MARKET_DATA_OP_TIMEOUT_SECONDS = 12
 MIN_API_CALL_SPACING_SECONDS = 0.05
 SESSION_STATUS_THROTTLE_SECONDS = 10
 SESSION_OFFLINE_TTL_SECONDS = 60
+# Restore passivo (poll de status) que falha não pode virar loop de login na
+# corretora — cada tentativa abre um websocket novo e conta no rate limit.
+SESSION_RESTORE_COOLDOWN_SECONDS = 30.0
 SESSION_FAILURE_BACKOFF_SECONDS = (10, 30, 60, 300)
 LOGIN_TIMEOUT_SECONDS = 60
 LOGIN_RETRY_DELAY_SECONDS = 5
@@ -308,6 +311,7 @@ class SessionManager:
         self.last_account_cache: dict[str, dict[str, Any]] = {}
         self.last_status_cache: dict[str, dict[str, Any]] = {}
         self._probe_cache: dict[str, SessionProbeState] = {}
+        self._restore_retry_at: dict[str, float] = {}
         # Dados de mercado (candles/payouts) são iguais para qualquer usuário
         # observando o mesmo ativo/intervalo — cache compartilhado evita que
         # N usuários gerem N chamadas upstream redundantes disputando o
@@ -720,7 +724,11 @@ class SessionManager:
                     user_id,
                     current_mode,
                 )
-                return
+                # Propaga em vez de devolver sessão "meio pronta": sem saldo e
+                # sem SSID persistido, ela ficava viva com connected=true e o
+                # painel mostrava "Sessão incompleta (sem email/saldo)". O saldo
+                # PRACTICE continua não sendo carregado — o erro sobe.
+                raise
             self._set_login_progress(user_id, "LOADING_BALANCE", attempt=attempt, active=True)
             session.client.get_balance()
             session.client.get_currency()
@@ -1030,6 +1038,10 @@ class SessionManager:
                 self._persist_connected(new_session)
                 return new_session
             except Exception:
+                # Fecha o websocket órfão: a thread dele continua viva e segue
+                # escrevendo em bullexapi.global_value (on_close/on_error),
+                # contaminando o check_connect das outras sessões.
+                self._close_session(new_session)
                 self.remove(user_id)
                 raise
 
@@ -1078,7 +1090,8 @@ class SessionManager:
                     "[SESSION-RECONNECT-NO-MEMORY] user_id=%s action=restore_on_demand",
                     user_id,
                 )
-                return self.restore_on_demand(user_id)
+                # Reconexão explícita: ignora o cooldown do restore passivo.
+                return self.restore_on_demand(user_id, force=True)
             session = self.require(user_id)
             return self._attempt_reconnect(session, "MANUAL")
 
@@ -1161,7 +1174,15 @@ class SessionManager:
             logger.warning("[SESSION-RECONNECT-FAILED] %s %s", user_id, exc.message)
             self._mark_disconnected(user_id, exc.message)
 
-    def restore_on_demand(self, user_id: str) -> ManagedSession:
+    def restore_on_demand(self, user_id: str, *, force: bool = False) -> ManagedSession:
+        """Recria a sessão a partir do SSID persistido.
+
+        Args:
+            user_id: Usuário autenticado.
+            force: Ignora o cooldown de retry. Use em reconexão explícita
+                (botão do painel / ``/sessions/reconnect``); o poll de status
+                deve respeitar o cooldown para não martelar a corretora.
+        """
         existing = self.get(user_id)
         if existing is not None:
             logger.info(
@@ -1179,6 +1200,16 @@ class SessionManager:
                 )
                 return existing
 
+            retry_at = self._restore_retry_at.get(user_id, 0.0)
+            now = time.monotonic()
+            if not force and now < retry_at:
+                logger.info(
+                    "[SESSION_RESTORE_SKIPPED] user_id=%s reason=cooldown retry_in=%.1f",
+                    user_id,
+                    retry_at - now,
+                )
+                raise ServiceError(SESSION_DISCONNECTED, 409)
+
             logger.info("[SESSION_RESTORE_ON_DEMAND] user_id=%s", user_id)
             if self.store is None:
                 raise ServiceError(SESSION_NOT_FOUND, 404)
@@ -1194,7 +1225,9 @@ class SessionManager:
             )
             restore_with_ssid = getattr(session.client, "restore_with_ssid", None)
             if not callable(restore_with_ssid):
-                self.store.mark_disconnected(session.user_id)
+                # SSID inútil sem método de restore: revoga para não ficar
+                # retentando o mesmo token em todo poll de status.
+                self.store.mark_disconnected(session.user_id, revoke_token=True)
                 logger.warning(
                     "[SESSION_RESTORE] status=unsupported reason=no_ssid_restore_method user_id=%s",
                     session.user_id,
@@ -1205,17 +1238,29 @@ class SessionManager:
             try:
                 with self._session_context(session):
                     ok, reason = restore_with_ssid(persisted.session_token)
-                    restore_failure_reason = str(reason or "restore_rejected")
+                    # Só é "motivo de falha" quando o restore de fato falhou —
+                    # senão um erro posterior (ex.: modo REAL) revogaria um SSID
+                    # que a corretora acabou de aceitar.
+                    if not ok:
+                        restore_failure_reason = str(reason or "restore_rejected")
                 self._finalize_connect(session, ok, reason, user_id=session.user_id, attempt=1)
                 self.upsert(session)
                 self._persist_connected(session)
                 self._clear_login_progress(session.user_id)
+                self._restore_retry_at.pop(session.user_id, None)
                 logger.info("[SESSION_RESTORE] user_id=%s status=success", session.user_id)
                 return session
             except Exception as exc:
                 self._close_session(session)
                 self.remove(session.user_id)
-                self.store.mark_disconnected(session.user_id)
+                self._restore_retry_at[session.user_id] = (
+                    time.monotonic() + SESSION_RESTORE_COOLDOWN_SECONDS
+                )
+                # Só revoga o SSID quando a corretora respondeu que ele não vale
+                # mais. Timeout/rate limit/erro de rede são transitórios: manter
+                # o token deixa o próximo restore funcionar sem pedir senha.
+                ssid_rejected = restore_failure_reason in {"invalid_ssid", "restore_rejected"}
+                self.store.mark_disconnected(session.user_id, revoke_token=ssid_rejected)
                 if restore_failure_reason == "invalid_ssid":
                     logger.warning(
                         "[SESSION_RESTORE] user_id=%s status=unsupported reason=broker_invalidates_ssid",
@@ -1302,6 +1347,23 @@ class SessionManager:
             )
         broker_code = _extract_broker_error_code(reason)
         if broker_code == "invalid_credentials":
+            # Guarda a resposta crua da corretora: só o `code` não distingue
+            # senha errada de conta bloqueada / limite de tentativas, e o
+            # painel mostra "email ou senha inválidos" nos três casos.
+            # Identificador mascarado + tamanho da senha: revela autofill do
+            # navegador (senha do painel no campo da corretora) sem registrar
+            # credencial nenhuma no log.
+            email_value = str(getattr(session, "email", "") or "")
+            local, _, domain = email_value.partition("@")
+            masked_email = f"{local[:3]}***@{domain}" if domain else "(vazio)"
+            logger.warning(
+                "[BROKER_LOGIN_REJECTED] user_id=%s code=%s identifier=%s password_length=%s detail=%s",
+                user_id,
+                broker_code,
+                masked_email,
+                len(str(getattr(session, "password", "") or "")),
+                str(reason)[:300],
+            )
             raise ServiceError("invalid_credentials", 401)
         raise ServiceError(f"falha ao conectar: {reason}", 401)
 

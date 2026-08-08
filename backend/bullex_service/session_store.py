@@ -73,12 +73,21 @@ class SessionStore:
             )
 
     def load_connected_user(self, user_id: str) -> PersistedSession | None:
+        """Carrega o SSID persistido para restaurar a sessão.
+
+        Não exige ``connected = 1``: uma queda transitória do websocket chama
+        ``mark_disconnected`` (connected = 0) sem revogar o token, e exigir a
+        flag deixava o SSID salvo inalcançável — o restore caía em
+        ``SESSION_NOT_FOUND`` e forçava login com senha (sujeito ao rate limit
+        da corretora). Quem desconecta de propósito usa ``revoke_token=True``,
+        que zera o token e continua bloqueando o restore aqui.
+        """
         with self._connect() as connection:
             row = connection.execute(
                 """
                 select user_id, email, account_mode, encrypted_session_token, last_connected_at
                 from bullex_sessions
-                where user_id = ? and connected = 1 and encrypted_session_token is not null
+                where user_id = ? and encrypted_session_token is not null
                 limit 1
                 """,
                 (user_id,),

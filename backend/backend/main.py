@@ -375,6 +375,17 @@ BULLEX_UPSTREAM_TIMEOUT_SECONDS = 5.0
 # Com 2s, scan sequencial de 10–20 ativos estourava e OTC caía em CANDLES_TIMEOUT.
 BULLEX_MARKET_DATA_TIMEOUT_SECONDS = 8.0
 BULLEX_CONNECT_TIMEOUT_SECONDS = 60.0
+# Fila de aquisição de conexão no pool do httpx. Sem teto explícito, uma
+# requisição fica presa esperando slot livre e só morre no wait_for externo —
+# sem NUNCA chegar no bullex-service (queda de 08/08: 0 req chegando enquanto
+# o robot-runtime acumulava 201 timeouts em 10min).
+BULLEX_POOL_TIMEOUT_SECONDS = 3.0
+# O httpx precisa vencer a corrida contra o wait_for externo. Com os dois no
+# MESMO valor eles empatavam; quando o wait_for vencia, cancelava a request no
+# meio e a conexão vazava do pool (ver [BULLEX_POOL_STATS]). A folga é tirada do
+# timeout do httpx — o wait_for continua no valor original, preservando o
+# contrato de erro das rotas (ex.: connect -> 504/LOGIN_TIMEOUT).
+BULLEX_CLIENT_TIMEOUT_MARGIN_SECONDS = 0.5
 BULLEX_TEMPORARY_UNAVAILABLE = "BULLEX_TEMPORARY_UNAVAILABLE"
 BULLEX_REQUESTS_LIMIT_EXCEEDED = "BULLEX_REQUESTS_LIMIT_EXCEEDED"
 # Quando a corretora bloqueia login por IP, o auto-reconnect NÃO deve tentar
@@ -2025,6 +2036,12 @@ feedback_store: FeedbackStore = create_feedback_store()
 bullex_auto_reconnect_at: dict[str, datetime] = {}
 # Soft reconnect via SSID (não conta como login HTTP; cooldown mais curto).
 bullex_ssid_reconnect_at: dict[str, datetime] = {}
+# Quem clicou "Desconectar Bullex" no painel fica aqui até conectar de novo por
+# vontade própria. Sem isso o botão não funcionava para quem tinha senha salva:
+# a desconexão acontecia de verdade e o auto-reconnect logava de volta em
+# segundos. Em 08/08 foram 356 cliques de 77 clientes — 76 deles clicando
+# repetido, um chegou a 25 vezes, achando que o botão estava quebrado.
+bullex_manual_disconnect: set[str] = set()
 # Gate global: após requests_limit_exceeded, ninguém tenta login até o TTL.
 bullex_login_rate_limited_until: datetime | None = None
 BULLEX_AUTO_RECONNECT_COOLDOWN_SECONDS = 60
@@ -2208,6 +2225,7 @@ def sync_marketing_display_to_robot(
                 "gale_step": None,
             }
             robot_persistence.save_trade_history(user_id, trade)
+            invalidate_daily_history_cache(user_id)
             synced_trades.append(trade)
         auto_trader.replace_history(user_id, synced_trades)
     except Exception:
@@ -3237,10 +3255,30 @@ def get_bullex_http_client() -> httpx.AsyncClient:
     closed = bool(getattr(_bullex_http_client, "is_closed", False))
     if _bullex_http_client is None or closed:
         _bullex_http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(BULLEX_UPSTREAM_TIMEOUT_SECONDS),
+            timeout=httpx.Timeout(
+                BULLEX_UPSTREAM_TIMEOUT_SECONDS,
+                pool=BULLEX_POOL_TIMEOUT_SECONDS,
+            ),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=40),
         )
     return _bullex_http_client
+
+
+def bullex_pool_stats() -> str:
+    """
+    Fotografia do pool de conexões do client (diagnóstico de saturação).
+
+    Returns:
+        ``"total=N ativas=N ociosas=N"`` ou ``"indisponivel"`` se o httpx mudar
+        a estrutura interna (API privada, best-effort).
+    """
+    try:
+        connections = _bullex_http_client._transport._pool.connections
+        total = len(connections)
+        idle = sum(1 for connection in connections if connection.is_idle())
+        return f"total={total} ativas={total - idle} ociosas={idle}"
+    except Exception:
+        return "indisponivel"
 
 
 async def aclose_bullex_http_client() -> None:
@@ -3402,12 +3440,26 @@ async def call_bullex_service(
                 headers=headers,
                 json=json_body,
                 params=params,
-                timeout=timeout_seconds,
+                # Folga proposital: o httpx expira ANTES do wait_for e encerra a
+                # request por conta própria, devolvendo a conexão ao pool. O
+                # wait_for permanece no valor original, só como rede de
+                # segurança contra travamento real.
+                timeout=max(0.05, timeout_seconds - BULLEX_CLIENT_TIMEOUT_MARGIN_SECONDS),
             ),
             timeout=timeout_seconds,
         )
-    except (asyncio.TimeoutError, httpx.TimeoutException):
+    except (asyncio.TimeoutError, httpx.TimeoutException) as timeout_exc:
         log_fetch_metric(path, request_started_at, user_id=user_id, source="timeout")
+        # Diagnóstico puro: NÃO altera o fluxo de erro já existente abaixo.
+        # `PoolTimeout` = a request morreu na fila do pool, sem sequer sair para
+        # o bullex-service — assinatura da queda de 08/08.
+        logger.warning(
+            "[BULLEX_POOL_STATS] user_id=%s path=%s kind=%s %s",
+            user_id,
+            path,
+            type(timeout_exc).__name__,
+            bullex_pool_stats(),
+        )
         if path == "/account":
             logger.warning(
                 "[ACCOUNT_FETCH_TIMEOUT] user_id=%s timeout_seconds=%s",
@@ -4257,6 +4309,12 @@ async def try_auto_reconnect_with_saved_credentials(user_id: str) -> bool:
     Returns:
         True se a reconexão restabeleceu ``connected=true``.
     """
+    if user_id in bullex_manual_disconnect:
+        # Desconexão manual vence a reconexão automática — é decisão explícita
+        # do cliente. Só `POST /bullex/connect` (ou /bullex/reconnect) libera.
+        logger.info("[BULLEX_AUTO_RECONNECT_SKIPPED] user_id=%s reason=manual_disconnect", user_id)
+        return False
+
     # Soft path primeiro: não respeita o gate de login HTTP (SSID não autentica).
     if await try_ssid_session_reconnect(user_id):
         return True
@@ -5292,6 +5350,40 @@ def extract_asset_open(payload: dict[str, Any], symbol: str, timeframe: str) -> 
     return None
 
 
+# `build_management_summary` roda em TODA serialização do estado (cada poll do
+# painel, cada tick do ciclo, cada push do WS) e lia o histórico do dia no
+# Supabase com cliente SÍNCRONO — ~1,5 leitura/segundo POR usuário, cada uma
+# congelando o event loop do robot-runtime (queda de 08/08). O TTL é curto e a
+# gravação de qualquer operação invalida na hora, então stop win/loss continuam
+# enxergando o resultado assim que ele é registrado.
+DAILY_HISTORY_CACHE_TTL_SECONDS = 5.0
+_daily_history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def invalidate_daily_history_cache(user_id: str) -> None:
+    """Descarta o histórico do dia em cache (chamar ao gravar operação)."""
+    _daily_history_cache.pop(str(user_id), None)
+
+
+def load_daily_history_cached(user_id: str) -> list[dict[str, Any]]:
+    """
+    Histórico do dia com TTL curto, para não bloquear o event loop a cada poll.
+
+    Args:
+        user_id: Cliente dono do histórico.
+
+    Returns:
+        Mesma lista que ``load_robot_history_items(user_id, 1)`` retornaria.
+    """
+    now = monotonic()
+    cached = _daily_history_cache.get(user_id)
+    if cached is not None and now - cached[0] < DAILY_HISTORY_CACHE_TTL_SECONDS:
+        return cached[1]
+    items = load_robot_history_items(user_id, 1)
+    _daily_history_cache[user_id] = (now, items)
+    return items
+
+
 def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
     today = datetime.now(timezone.utc).date()
     reset_at = parse_datetime(getattr(state, "stop_reset_at", None))
@@ -5300,7 +5392,7 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
     net_profit = 0.0
     trades_count = 0
     try:
-        trades = load_robot_history_items(user_id, 1)
+        trades = load_daily_history_cached(user_id)
     except Exception:
         logger.warning("[MANAGEMENT_HISTORY_FALLBACK] user_id=%s", user_id, exc_info=True)
         trades = auto_trader.history(user_id).get("trades", [])
@@ -7005,6 +7097,11 @@ def get_user_robot_state(user_id: str) -> Any:
             payload = {
                 **payload,
                 "enabled": False,
+                # A trava acima continua: robô só volta com /robot/start do
+                # cliente. Este sinal apenas conta ao painel que a parada foi
+                # manutenção/restart, não decisão do usuário — para a UI oferecer
+                # "religar" em vez de fingir que ele mesmo desligou.
+                "paused_by_maintenance": bool(payload.get("was_running")),
                 "connected": False,
                 "active_mode": None,
                 "connection_checked_at": None,
@@ -8509,6 +8606,7 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
             if state.last_trade:
                 try:
                     robot_persistence.save_trade_history(user_id, state.last_trade)
+                    invalidate_daily_history_cache(user_id)
                     # Espelha também em robot_trades para restore do placar/memória.
                     robot_persistence.save_trade(user_id, state.last_trade)
                     try:
@@ -8603,6 +8701,7 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
                 )
             try:
                 robot_persistence.save_trade_history(user_id, state.last_trade)
+                invalidate_daily_history_cache(user_id)
                 robot_persistence.save_trade(user_id, state.last_trade)
                 try:
                     trade_for_memory = dict(state.last_trade)
@@ -8701,6 +8800,7 @@ async def timeout_monitored_trade(user_id: str, order_id: str) -> None:
         if timed_out and state.last_trade:
             try:
                 robot_persistence.save_trade_history(user_id, state.last_trade)
+                invalidate_daily_history_cache(user_id)
                 logger.info(
                     "[HISTORY_SAVED] user_id=%s order_id=%s result=TIMEOUT final_result=TIMEOUT",
                     user_id,
@@ -12023,6 +12123,8 @@ async def _bullex_connect_impl(
     auth: dict[str, str],
 ) -> JSONResponse:
     user_id = auth["user_id"]
+    # Conexão pedida pelo cliente: encerra o bloqueio da desconexão manual.
+    bullex_manual_disconnect.discard(user_id)
     logger.info("[CONNECT_REQUEST] user_id=%s", user_id)
     remaining = bullex_login_rate_limit_remaining()
     if remaining > 0:
@@ -12679,6 +12781,9 @@ async def bullex_buy_real(
 @app.post("/bullex/disconnect")
 async def bullex_disconnect(auth: dict[str, str] = Depends(require_headers)) -> JSONResponse:
     user_id = auth["user_id"]
+    # ANTES da chamada: o poll do painel corre em paralelo e poderia disparar o
+    # auto-reconnect na janela entre desconectar e marcar.
+    bullex_manual_disconnect.add(user_id)
     status_code, payload = await call_bullex_service("POST", "/sessions/disconnect", user_id)
     payload = normalize_service_payload(payload)
     auto_trader.disconnect_account(user_id)
@@ -12755,6 +12860,8 @@ async def bullex_credentials_forget(
 @app.post("/bullex/reconnect")
 async def bullex_reconnect(auth: dict[str, str] = Depends(require_headers)) -> JSONResponse:
     user_id = auth["user_id"]
+    # Reconexão pedida pelo cliente: encerra o bloqueio da desconexão manual.
+    bullex_manual_disconnect.discard(user_id)
     clear_session_backoff(user_id)
     # Preferência: reconectar sessão viva; se falhar e houver credenciais, faz login novo.
     status_code, payload = await call_bullex_service("POST", "/sessions/reconnect", user_id)

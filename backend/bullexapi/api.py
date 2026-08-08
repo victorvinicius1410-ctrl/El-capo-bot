@@ -1,5 +1,6 @@
 """Module for bullex API."""
 
+import os
 import time
 import json
 import logging
@@ -242,7 +243,19 @@ class BullexAPI(object):  # pylint: disable=too-many-instance-attributes
         self.users_availability = None
         self.digital_payout = None
         # SessionGlobals vivo desta instância (WS + _session_context).
-        self._session_globals = global_value.SessionGlobals()
+        #
+        # Herda o SessionGlobals ativo no ContextVar em vez de criar um novo:
+        # `stable_api.connect()` e `restore_with_ssid()` trocam `self.api` por
+        # um BullexAPI novo DEPOIS de `_activate_session`. Criando um objeto
+        # zerado aqui, a thread do websocket gravava
+        # ``check_websocket_if_connect = 1`` nesse objeto novo enquanto
+        # ``start_websocket`` esperava no antigo — timeout de 15s em 100% dos
+        # logins/restores, mesmo com o WS conectando de verdade.
+        # Só herda quando há sessão ativa no ContextVar. Fora dela usa objeto
+        # próprio — `get_session_globals()` devolveria o fallback do processo,
+        # e aí duas sessões acabariam compartilhando o mesmo estado.
+        _active = global_value.current_session_globals.get()
+        self._session_globals = _active if _active is not None else global_value.SessionGlobals()
 
     def _websocket_proxy_kwargs(self):
         """Extrai kwargs de proxy para ``websocket.run_forever`` a partir de ``self.proxies``."""
@@ -884,6 +897,32 @@ class BullexAPI(object):  # pylint: disable=too-many-instance-attributes
         self.session.cookies.clear_session_cookies()
         requests.utils.add_dict_to_cookiejar(self.session.cookies, cookies)
 
+    def _websocket_keepalive_kwargs(self):
+        """Ping/pong de aplicação para o ``run_forever``.
+
+        Sem ping, a conexão ociosa com a corretora é derrubada em silêncio pelo
+        NAT/proxy (o pool residencial de ``BULLEX_PROXY_URLS`` corta conexões
+        paradas), e a sessão só "morre" na próxima operação — daí o
+        ``SESSION_DISCONNECTED``/409 depois de um tempo sem operar.
+
+        Returns:
+            kwargs de keepalive; ``{}`` quando desativado por env.
+        """
+        try:
+            interval = int(os.getenv("BULLEX_WS_PING_INTERVAL_SECONDS", "20"))
+        except ValueError:
+            interval = 20
+        try:
+            timeout = int(os.getenv("BULLEX_WS_PING_TIMEOUT_SECONDS", "10"))
+        except ValueError:
+            timeout = 10
+        if interval <= 0:
+            return {}
+        # websocket-client exige ping_timeout < ping_interval.
+        if timeout <= 0 or timeout >= interval:
+            timeout = max(1, interval // 2)
+        return {"ping_interval": interval, "ping_timeout": timeout}
+
     def start_websocket(self):
         global_value.check_websocket_if_connect = None
         global_value.check_websocket_if_error = False
@@ -898,6 +937,7 @@ class BullexAPI(object):  # pylint: disable=too-many-instance-attributes
                 "ca_certs": "cacert.pem",
             }
         }
+        run_kwargs.update(self._websocket_keepalive_kwargs())
         # Propaga proxy HTTP/SOCKS para o websocket (mesmo egress do login).
         proxy_kwargs = self._websocket_proxy_kwargs()
         if proxy_kwargs:

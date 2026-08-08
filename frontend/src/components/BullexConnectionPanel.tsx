@@ -254,8 +254,12 @@ export function BullexConnectionPanel() {
         {connected && metricsMissing ? (
           <p className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             Sessão incompleta (sem email/saldo da corretora). Clique em{" "}
-            <strong>Desconectar Bullex</strong> e conecte de novo com email e senha para
-            restaurar as métricas.
+            <strong>Desconectar Bullex</strong> e depois em{" "}
+            <strong>{credentialsSaved ? "Entrar com outra conta" : "Entrar na Bullex"}</strong>{" "}
+            para informar email e senha da corretora — é isso que restaura as métricas.
+            {credentialsSaved
+              ? " Reconectar com o login salvo não resolve: ele recria a mesma sessão incompleta."
+              : ""}
           </p>
         ) : null}
 

@@ -41,6 +41,9 @@ export function RobotControlPanel() {
   const [error, setError] = useState<string | null>(null);
 
   const running = Boolean(robotState.data?.enabled || robotState.data?.worker_running);
+  // Só faz sentido enquanto o robô está parado: assim que religa, o backend
+  // limpa a flag e o aviso some sozinho.
+  const pausedByMaintenance = Boolean(robotState.data?.paused_by_maintenance) && !running;
   const connected = isBullExConnected({ account: account.data, accountStatus: accountStatus.data });
   const currency = account.data?.currency ?? null;
   const balance = account.data?.balance ?? null;
@@ -328,6 +331,12 @@ export function RobotControlPanel() {
           </label>
         </div>
 
+        {pausedByMaintenance ? (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-600 dark:text-amber-400">
+            Seu robô foi pausado por uma manutenção no servidor — nenhuma operação
+            foi perdida. Clique em <strong>Iniciar robô</strong> para voltar a operar.
+          </p>
+        ) : null}
         {balanceError ? <p className="text-sm text-destructive">{balanceError}</p> : null}
         {error && error !== balanceError ? <p className="text-sm text-destructive">{error}</p> : null}
 

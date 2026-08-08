@@ -273,8 +273,123 @@ Clique em **Desconectar Bullex** → spinner → pill continua **Conectado**
 | FE | `syncing` só com `connected && metricsMissing` (BACKOFF sozinho não trava login) |
 | Testes | `test_manual_disconnect_cache.py`, testes FE de suppress manual |
 
+## Incidente: sessão cai sozinha e `/robot/start` devolve 409 (2026-08-08)
+
+### Sintoma
+
+- Cliente conecta normalmente; **depois de um tempo** o painel mostra
+  “Conta Bullex desconectada ou sessão expirada. Reconecte em Configurações →
+  Conta Corretora”. Repete várias vezes ao longo do dia.
+- `POST /robot/start` → **409** (`BULLEX_NOT_CONNECTED`).
+- Às vezes o painel fica **Conectado** com **E-mail `—`**, **Saldo `—`** e
+  “Nenhum login salvo ainda” → “Sessão incompleta (sem email/saldo)”.
+- Console do browser: `WebSocket … /ws/robot-state … is closed before the
+  connection is established` (2×).
+
+### Causas
+
+| # | Causa | Efeito |
+|---|-------|--------|
+| 1 | `run_forever` sem `ping_interval` (`bullexapi/api.py`) | WS ocioso com a corretora morre no NAT/proxy residencial; só se descobre na próxima operação → `[SESSION-DEAD]` → 409 |
+| 2 | `load_connected_user` exigia `connected = 1` | Toda queda transitória chama `mark_disconnected` (connected=0) e **inutilizava o SSID salvo**; restore virava `SESSION_NOT_FOUND` e caía no login por senha, barrado pelo rate limit |
+| 3 | `_populate_ready_state` retornava cedo quando `force_real_mode` falhava | Sessão “meio pronta”: `connected=true`, sem `get_balance`/`get_currency` e sem SSID persistido → painel com `—` e “Nenhum login salvo ainda” |
+
+O WS `/ws/robot-state` **não** é causa: `closed before the connection is
+established` é o browser avisando que o **cliente** fechou o socket durante o
+handshake (cleanup do effect em `useLiveTradingData`, ex.: troca de aba). Falha
+real de servidor aparece como 404 / `bad response` / 502 — ver tabela de
+troubleshooting em [`ROBOT_STATE_WEBSOCKET.md`](./ROBOT_STATE_WEBSOCKET.md).
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| `bullexapi/api.py` | `_websocket_keepalive_kwargs`: `ping_interval=20s`, `ping_timeout=10s` no `run_forever` (env `BULLEX_WS_PING_INTERVAL_SECONDS` / `BULLEX_WS_PING_TIMEOUT_SECONDS`; `0` desliga) |
+| `bullex_service/session_store.py` | `load_connected_user` não exige `connected = 1` — só token presente. Quem desconecta de propósito usa `revoke_token=True` e continua bloqueado |
+| `SessionManager.restore_on_demand` | Revoga o SSID só quando a corretora **rejeitou** (`invalid_ssid`/`restore_rejected`); timeout/rate limit preservam o token. Cooldown de 30s (`SESSION_RESTORE_COOLDOWN_SECONDS`) para o poll não virar loop de login; `force=True` em reconexão explícita |
+| `SessionManager._populate_ready_state` | Modo REAL não confirmado **propaga** `BULLEX_ACTIVE_MODE_NOT_REAL` em vez de devolver sessão zumbi (saldo PRACTICE continua não sendo carregado) |
+| `SessionManager.connect` | Fecha o websocket órfão no `except` antes do `remove` (a thread seguia viva escrevendo em `global_value`) |
+
+Testes: `tests/test_persistence_restore.py::SessionKeepAliveAndRestoreTests` e
+`::SessionPersistenceTests::test_ready_state_raises_on_unconfirmed_real_mode_without_loading_practice_balance`.
+
+### Pendente (causa estrutural)
+
+`bullexapi` guarda conexão em **estado global de módulo**
+(`bullexapi/global_value.py`): `check_connect()` lê
+`global_value.check_websocket_if_connect`, e a thread WS de **cada** usuário
+escreve nele (`ws/client.py` on_open/on_close/on_error), além de
+`start_websocket()` zerar a flag globalmente a cada login. O `_activate`/
+`_capture` do `SessionManager` (o `MVP_SAFE_MODE` do log) só protege a chamada
+em primeiro plano — as threads de callback continuam contaminando as outras
+sessões. Sintoma: usuário B cai porque o socket do usuário A fechou.
+
+Correção definitiva = uma sessão Bullex por processo (worker por usuário ou
+pool com afinidade por `user_id`), ou mover o estado do `ws/client.py` para um
+objeto por sessão. Os fixes acima reduzem a frequência, **não** eliminam.
+
+## Incidente: 100% dos logins com `Websocket connection timeout` (2026-08-08)
+
+### Sintoma
+
+Nenhuma sessão da corretora subia — `LOGIN_SUCCESS` e `SESSION-ALIVE` zerados,
+`[BULLEX_SSID_RECONNECT_FAILED]` ~273/15min, `[ROBOT_WORKER_BLOCKED_DISCONNECTED]`
+~1180/15min e `/sessions/reconnect` → 404 em série. No painel: “Conta Bullex
+desconectada ou sessão expirada”. Última sessão boa: 2026-08-07T23:48Z.
+
+### Causa raiz
+
+Regressão do isolamento por sessão (Fase 3, `SessionGlobals` + `ContextVar`):
+
+1. `SessionManager._activate_session` prende o `SessionGlobals` da sessão no
+   ContextVar **e** no `session.client.api` daquele momento.
+2. `stable_api.connect()` e `restore_with_ssid()` fazem `self.api = BullexAPI(...)`
+   logo depois — e o `__init__` criava `self._session_globals = SessionGlobals()`
+   **zerado**.
+3. A thread do websocket chamava `bind_api_session_globals(api_novo)` e gravava
+   `check_websocket_if_connect = 1` nesse objeto novo.
+4. `start_websocket` esperava no objeto **antigo** (ContextVar da thread
+   chamadora) → nunca via o `1` → `Websocket connection timeout` aos 15s, mesmo
+   com o log `INFO:websocket:Websocket connected`.
+
+O proxy e a rede estavam saudáveis (handshake WS pelo proxy em ~0,7s).
+
+### Correção
+
+`bullexapi/api.py` (`BullexAPI.__init__`): herda o `SessionGlobals` ativo no
+ContextVar quando há sessão; fora de `_session_context` usa objeto próprio
+(`get_session_globals()` devolveria o fallback do processo, o que faria duas
+sessões compartilharem estado).
+
+```python
+_active = global_value.current_session_globals.get()
+self._session_globals = _active if _active is not None else global_value.SessionGlobals()
+```
+
+Efeito medido no minuto seguinte ao deploy: `Websocket connection timeout` de
+100% → **0**; `LOGIN_SUCCESS`, `[SESSION_RESTORE] status=success`,
+`[REAL_MODE_CONFIRMED] active_mode=REAL` voltaram.
+
+### Regressão logo depois: `invalid_credentials` com a senha certa
+
+Herdar o `SessionGlobals` fez o `BullexAPI` novo enxergar o **SSID antigo** da
+sessão. `BullexAPI.connect()` tem um atalho “temp ssid reconnect for speed up”
+que só dispara com `global_value.SSID != None` — antes, um api novo sempre
+tinha SSID vazio e ia direto para o login limpo. Com o SSID morto herdado, o
+atalho falhava e o erro voltava ao painel como **“Email ou senha Bullex
+inválidos”**.
+
+Correção: `stable_api.connect()` zera `global_value.SSID` antes de
+`self.api.connect()` — login por senha é sempre limpo; quem quer reusar SSID
+usa `restore_with_ssid()`. Medido após o deploy: `invalid_credentials` 15 → **0**.
+
 ## Histórico
 
+- **2026-08-08** — `BullexAPI.__init__` criava `SessionGlobals` zerado depois do
+  `_activate_session`, quebrando 100% dos logins com timeout de websocket; ver
+  seção incidente acima.
+- **2026-08-08** — Keepalive do WS da corretora, SSID salvo sobrevivendo a
+  queda transitória e fim da sessão “meio pronta”; ver seção incidente acima.
 - **2026-08-07 (noite — disconnect stuck)** — Desconectar não “pegava” por
   cache REAL + auto-reconnect; ver seção incidente acima.
 - **2026-08-07 (noite — wipe bullex_email)** — Sync de account com

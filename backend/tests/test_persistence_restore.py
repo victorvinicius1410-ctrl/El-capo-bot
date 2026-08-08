@@ -60,7 +60,13 @@ class SessionPersistenceTests(unittest.TestCase):
         self.assertIn("[CHANGE_BALANCE_REAL_OK]", output)
         self.assertIn("[REAL_MODE_CONFIRMED]", output)
 
-    def test_ready_state_marks_unconfirmed_real_mode_without_loading_practice_balance(self) -> None:
+    def test_ready_state_raises_on_unconfirmed_real_mode_without_loading_practice_balance(self) -> None:
+        """Modo REAL não confirmado derruba o login em vez de virar sessão zumbi.
+
+        Antes o método retornava normalmente: a sessão ficava registrada com
+        ``connected=true``, sem saldo (``get_balance`` nunca roda) e sem SSID
+        persistido — o painel exibia "Sessão incompleta (sem email/saldo)".
+        """
         get_balance = Mock(return_value=10000)
         session = bullex_main.ManagedSession(
             user_id="still-practice",
@@ -76,7 +82,11 @@ class SessionPersistenceTests(unittest.TestCase):
 
         with patch.object(bullex_main.time, "sleep", return_value=None):
             with self.assertLogs("bullex-service", level="WARNING") as logs:
-                manager._populate_ready_state(session, user_id=session.user_id, attempt=1)
+                with self.assertRaisesRegex(
+                    bullex_main.ServiceError,
+                    "BULLEX_ACTIVE_MODE_NOT_REAL",
+                ):
+                    manager._populate_ready_state(session, user_id=session.user_id, attempt=1)
 
         self.assertEqual(session.active_mode, "PRACTICE")
         self.assertFalse(session.real_mode_confirmed)
@@ -764,6 +774,114 @@ class SessionPersistenceTests(unittest.TestCase):
             "/sessions/persistence-debug",
             "persistence-debug",
         )
+
+
+class SessionKeepAliveAndRestoreTests(unittest.TestCase):
+    """Regressões da queda de sessão silenciosa (SESSION_DISCONNECTED / 409)."""
+
+    #: Campos globais do bullexapi tocados por ``_session_context``.
+    GLOBAL_FIELDS = (
+        "check_websocket_if_connect",
+        "ssl_Mutual_exclusion",
+        "ssl_Mutual_exclusion_write",
+        "SSID",
+        "check_websocket_if_error",
+        "websocket_error_reason",
+        "balance_id",
+    )
+
+    def setUp(self) -> None:
+        # `restore_on_demand` passa por `_activate`/`_capture`, que escrevem em
+        # bullexapi.global_value. Sem restaurar, o estado vaza para os testes
+        # seguintes (ver TESTES_E_QUALIDADE.md, "Caso B — vazamento global").
+        self._global_snapshot = {
+            field: getattr(bullex_main.global_value, field, None)
+            for field in self.GLOBAL_FIELDS
+        }
+
+    def tearDown(self) -> None:
+        for field, value in self._global_snapshot.items():
+            setattr(bullex_main.global_value, field, value)
+
+    def test_websocket_run_forever_sends_application_ping(self) -> None:
+        """Sem ping, o proxy/NAT derruba a conexão ociosa com a corretora."""
+        from bullexapi.api import BullexAPI
+
+        kwargs = BullexAPI._websocket_keepalive_kwargs(None)
+
+        self.assertEqual(kwargs["ping_interval"], 20)
+        self.assertEqual(kwargs["ping_timeout"], 10)
+        self.assertLess(kwargs["ping_timeout"], kwargs["ping_interval"])
+
+    def test_websocket_ping_timeout_never_exceeds_interval(self) -> None:
+        """websocket-client recusa ping_timeout >= ping_interval."""
+        from bullexapi.api import BullexAPI
+
+        env = {
+            "BULLEX_WS_PING_INTERVAL_SECONDS": "10",
+            "BULLEX_WS_PING_TIMEOUT_SECONDS": "30",
+        }
+        with patch.dict("os.environ", env):
+            kwargs = BullexAPI._websocket_keepalive_kwargs(None)
+
+        self.assertEqual(kwargs["ping_interval"], 10)
+        self.assertLess(kwargs["ping_timeout"], 10)
+
+    def test_persisted_ssid_survives_transient_disconnect(self) -> None:
+        """Queda transitória não pode inutilizar o SSID salvo.
+
+        ``mark_disconnected`` (connected=0) acontece a cada falha de probe; se o
+        restore exigisse ``connected = 1``, o SSID salvo ficava inalcançável e o
+        usuário caía no login por senha (sujeito ao rate limit da corretora).
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected("user-flap", "user@example.com", "REAL", "ssid-vivo")
+
+            store.mark_disconnected("user-flap")
+            restored = store.load_connected_user("user-flap")
+
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.session_token, "ssid-vivo")
+
+    def test_manual_disconnect_still_blocks_restore(self) -> None:
+        """Desconectar de propósito revoga o token e continua bloqueando."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected("user-manual", "user@example.com", "REAL", "ssid-vivo")
+
+            store.mark_disconnected("user-manual", revoke_token=True)
+
+            self.assertIsNone(store.load_connected_user("user-manual"))
+
+    def test_failed_restore_enters_cooldown_and_force_bypasses_it(self) -> None:
+        """Restore que falha não pode virar loop de login a cada poll."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(str(Path(directory) / "sessions.db"), "test-secret")
+            store.save_connected("user-cooldown", "user@example.com", "REAL", "ssid-morto")
+            manager = bullex_main.SessionManager(store)
+
+            restore_with_ssid = Mock(return_value=(False, "invalid_ssid"))
+            fake_client = SimpleNamespace(
+                restore_with_ssid=restore_with_ssid,
+                api=SimpleNamespace(close=Mock()),
+            )
+
+            with patch.object(bullex_main, "create_bullex_client", return_value=fake_client):
+                with self.assertRaises(bullex_main.ServiceError):
+                    manager.restore_on_demand("user-cooldown")
+                self.assertEqual(restore_with_ssid.call_count, 1)
+
+                # Poll seguinte: barrado pelo cooldown, sem tocar na corretora.
+                with self.assertRaises(bullex_main.ServiceError):
+                    manager.restore_on_demand("user-cooldown")
+                self.assertEqual(restore_with_ssid.call_count, 1)
+
+                # Reconexão explícita ignora o cooldown.
+                store.save_connected("user-cooldown", "user@example.com", "REAL", "ssid-novo")
+                with self.assertRaises(bullex_main.ServiceError):
+                    manager.restore_on_demand("user-cooldown", force=True)
+                self.assertEqual(restore_with_ssid.call_count, 2)
 
 
 class _FakeContext:

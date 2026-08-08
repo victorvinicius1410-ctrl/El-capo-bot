@@ -562,7 +562,13 @@ class PatternMemoryService:
 
         if self.use_global:
             with self._lock:
-                if GLOBAL_PATTERN_OWNER in self._hydrated_users and self._by_user.get(GLOBAL_PATTERN_OWNER):
+                # A flag sozinha é o marcador de "já tentei carregar" — igual ao
+                # caminho pessoal abaixo. Exigir bucket não-vazio anulava o cache
+                # enquanto não houvesse padrão nenhum: cada ciclo de cada usuário
+                # relia 30 dias de histórico no Supabase com cliente SÍNCRONO,
+                # congelando o event loop (queda de 08/08: 2904 leituras em 5min,
+                # loop parado por até 12s, pool do httpx em 100/100).
+                if GLOBAL_PATTERN_OWNER in self._hydrated_users:
                     return
             loaded = self._load_global_from_store()
             if loaded:
