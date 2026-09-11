@@ -105,6 +105,8 @@ TRADE_ANALYSIS_FIELDS = (
     # Filtro de pavio na análise e no disparo (11/09/2026).
     "wick_reason",
     "wick_entry_reason",
+    # Entrada a favor do nível (11/09/2026): é o que mede a estratégia depois.
+    "sr_level",
     "strategy_summary",
     "analysis_detail",
     "speech_preview",

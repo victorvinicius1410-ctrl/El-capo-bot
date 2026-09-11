@@ -432,24 +432,18 @@ export function getRobotStatusPresentation(
       direction: gale?.direction ?? null,
     };
   }
-  if (status === "SIGNAL_FOUND" || status === "WAITING_ENTRY_WINDOW") {
-    return {
-      ...presentation("entry", "Melhor ativo encontrado", null, countdown ? `Entrada em ${countdown}` : null),
-      signal,
-      direction: signal?.direction ?? null,
-    };
-  }
-  if (status === "WAITING_ENTRY" || status === "WAITING_NEXT_CANDLE_ENTRY") {
-    return {
-      ...presentation(
-        "entry",
-        "Melhor ativo encontrado",
-        null,
-        countdown ? `Entrada em ${countdown}` : "Aguardando abertura da vela...",
-      ),
-      signal,
-      direction: signal?.direction ?? null,
-    };
+  // 11/09/2026: o candidato NÃO é anunciado antes da conferência de suporte,
+  // resistência e pavio, que só acontece com a vela fechada, na virada. Antes
+  // disso o painel dizia "melhor ativo encontrado" com direção e contagem, e
+  // 65% dessas entradas eram canceladas — o cliente via "entrada rejeitada"
+  // sem nunca ter havido ordem. A entrada é anunciada quando a ordem sai.
+  if (
+    status === "SIGNAL_FOUND" ||
+    status === "WAITING_ENTRY_WINDOW" ||
+    status === "WAITING_ENTRY" ||
+    status === "WAITING_NEXT_CANDLE_ENTRY"
+  ) {
+    return presentation("analyzing", "El Capo está analisando o mercado", "Confirmando na virada da vela...");
   }
   if (status === "SIGNAL_EXPIRED") {
     return presentation("analyzing", "Entrada perdida por atraso. Aguardando novo sinal.");

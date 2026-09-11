@@ -41,6 +41,13 @@ from backend.sr_respect import (  # noqa: E402
 NIVEL_A_FRENTE = frozenset({RESPECT_CONFLICT, RESPECT_VISIBLE_AHEAD})
 
 from backend.wick_filter import WICK_FILTER_ENABLED, evaluate_wicks  # noqa: E402
+from backend.sr_level_trade import (  # noqa: E402
+    SR_LEVEL_TRADE_ENABLED,
+    STRATEGY_SR_LEVEL,
+    find_level_trade,
+    level_text,
+    level_wick_ok,
+)
 from backend.support_resistance_strategy import (  # noqa: E402
     SR_ENABLED,
     SR_MIN_CANDLES,
@@ -797,8 +804,97 @@ def analyze_signal(
     resultado = apply_revz_override(resultado, symbol, velas_revz)
     resultado = apply_sr_override(resultado, symbol, normalized)
     resultado = apply_vertex_override(resultado, symbol, velas_z)
+    # Depois de todas as estratégias: com o preço perto de um nível, quem manda
+    # é o nível (regra do dono, 11/09). Ver `apply_level_trade`.
+    resultado = apply_level_trade(resultado, symbol, normalized)
     # Por último de propósito: só age quando TODO o resto barrou.
     return apply_live_demo(resultado, symbol, live_enabled=live_demo)
+
+
+def apply_level_trade(
+    signal: dict[str, Any],
+    symbol: str,
+    normalized: list[dict[str, float]],
+) -> dict[str, Any]:
+    """Entrada a favor do nível: resistência vira venda, suporte vira compra.
+
+    Pedido do dono em 11/09/2026. O suporte e a resistência passaram a ter dois
+    papéis: filtro (nenhuma estratégia entra contra o nível, em `sr_respect`) e
+    SINAL. Com o preço perto de um nível a direção é a do nível, mesmo que o
+    motor clássico (ou a Vertex) estivesse apontando para o outro lado — era
+    exatamente esse caso que o filtro cancelava no disparo, 66 vezes em 5h.
+
+    Roda por último entre as estratégias, e não toca no mercado aberto: lá a
+    decisão é da REV-Z (mesma regra do `apply_vertex_override`).
+
+    O pavio aqui é direcional (`level_wick_ok`): o pavio de rejeição a favor da
+    entrada é confirmação; pavio contra, ou vela indecisa com pavio grande dos
+    dois lados, barra a entrada — e, como o nível manda na vela, barra a vela
+    inteira, sem devolver a palavra ao clássico (ele entraria contra o nível).
+
+    Args:
+        signal: Sinal já montado pelo clássico (e pelas outras estratégias).
+        symbol: Ativo analisado.
+        normalized: Velas normalizadas; a última está em formação.
+
+    Returns:
+        O sinal, decidido pelo nível quando há nível perto.
+    """
+    if not SR_LEVEL_TRADE_ENABLED or not normalized:
+        return signal
+    if isinstance(signal.get("revz"), dict):
+        return signal
+    veredito = find_level_trade(normalized)
+    signal["sr_level"] = veredito
+    if not veredito:
+        return signal
+
+    direcao = veredito["direction"]
+    bloqueados = [f for f in (signal.get("blocked_filters") or []) if not str(f).startswith("SR_NIVEL")]
+    sem_pavio, motivo_pavio = level_wick_ok(normalized, direcao)
+    signal["wick_reason"] = motivo_pavio
+    signal["strategy_name"] = "S/R entrada a favor do nível"
+    signal["strategy_key"] = STRATEGY_SR_LEVEL
+    signal["confidence_model_version"] = "sr-nivel-v1"
+    if not sem_pavio:
+        signal["signal"] = "WAIT"
+        signal["direction"] = "WAIT"
+        signal["trade_allowed"] = False
+        signal["confidence"] = 0
+        signal["score"] = 0
+        signal["strategy_score"] = 0
+        bloqueados = [f for f in bloqueados if f != "WICK_EXCESS"] + ["WICK_EXCESS"]
+        signal["blocked_filters"] = bloqueados
+        signal["block_reasons"] = list(bloqueados)
+        signal["quality_reason"] = motivo_pavio
+        return signal
+
+    conf = int(veredito["confidence"])
+    signal["signal"] = direcao
+    signal["direction"] = direcao
+    signal["analyzed_direction"] = direcao
+    signal["trade_allowed"] = True
+    signal["confidence"] = conf
+    signal["score"] = conf
+    signal["strategy_score"] = conf
+    signal["blocked_filters"] = []
+    signal["block_reasons"] = []
+    signal["quality_reason"] = "OK_SR_NIVEL"
+    texto = level_text(symbol, veredito)
+    for campo in ("reason", "entry_reason", "signal_explanation", "narrator_text", "analysis_detail"):
+        signal[campo] = texto
+    logger.info(
+        "[SR_LEVEL_SIGNAL] symbol=%s direction=%s lado=%s nivel=%.5f toques=%s fonte=%s dist_atr=%s conf=%s",
+        symbol,
+        direcao,
+        veredito["side"],
+        veredito["level"],
+        veredito["touches"],
+        veredito["source"],
+        veredito["distance_atr"],
+        conf,
+    )
+    return signal
 
 def apply_named_strategies(
     signal: dict[str, Any],

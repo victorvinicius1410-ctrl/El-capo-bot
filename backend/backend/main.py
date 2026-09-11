@@ -100,6 +100,17 @@ from backend.live_demo_mode import (
 from backend.support_resistance_strategy import SR_CONFIDENCE_MAX
 from backend.sr_respect import build_zone, evaluate_respect
 from backend.wick_filter import evaluate_wicks
+from backend.sr_level_trade import (
+    SR_LEVEL_MAX_PER_HOUR,
+    STRATEGY_SR_LEVEL,
+    entradas_de_nivel_na_hora,
+    find_level_trade,
+    is_level_candidate,
+    level_text,
+    level_wick_ok,
+    registrar_entrada_de_nivel,
+    teto_de_nivel_atingido,
+)
 from backend.vertex_strategy import vertex_min_confidence
 from backend.signal_engine import (
     ANALYSIS_TIMEFRAMES,
@@ -293,6 +304,42 @@ ROBOT_WORKER_STALE_SECONDS = 120
 ROBOT_CYCLE_TIMEOUT_SECONDS = 110.0
 RECOVERY_MIN_CONFIDENCE = 70
 NO_AVAILABLE_ASSET_ERROR = "Nenhum ativo disponível no momento da compra."
+# O que a entrada de nível NÃO dispensa. Os filtros de qualidade do motor
+# clássico ficam de fora de propósito: ele segue a vela e a entrada de nível é
+# reversão, então cada filtro dele é um veto à tese dela — mesma lição da REV-Z
+# (`REVZ_NON_WAIVABLE`).
+SR_LEVEL_NON_WAIVABLE = frozenset(
+    {
+        STATUS_ACCOUNT_DISCONNECTED,
+        "ACCOUNT_DISCONNECTED",
+        "STOP_WIN_HIT",
+        "STOP_LOSS_HIT",
+        "ACTIVE_CLOSED",
+        "ACTIVE_SUSPENDED",
+        "ACTIVE_COOLDOWN",
+        "ASSET_COOLDOWN",
+        "PAYOUT_UNAVAILABLE",
+        "OPERATION_IN_PROGRESS",
+        "CANDLES_UNAVAILABLE",
+        "STALE_MARKET_DATA",
+        "MIN_PAYOUT",
+        "MIN_CONFIDENCE",
+        "GLOBAL_LOSS_COOLDOWN",
+        "REPEAT_ENTRY",
+        # Pavio direcional no nível (`level_wick_ok`).
+        "WICK_EXCESS",
+        # Teto de 3 entradas de nível por hora, por conta.
+        "SR_LEVEL_HOURLY_LIMIT",
+    }
+)
+# Entrada cancelada pela reconferência do disparo (S/R e pavio). O painel não
+# anuncia a entrada antes dessa conferência (11/09/2026), então cancelar aqui é
+# silencioso: o ciclo segue como "sem oportunidade" em vez de virar "entrada
+# rejeitada" — antes disso eram 66 falsos "rejeitada" em 5 horas, com a
+# mensagem genérica de "nenhum ativo disponível".
+ENTRY_FILTER_CANCEL_REASONS = frozenset(
+    {"PAVIO_NA_ENTRADA", "SR_ZONE_NA_ENTRADA", "SR_ZONE_SEM_VERIFICACAO"}
+)
 CRITICAL_TRADE_BLOCKS = {
     STATUS_ACCOUNT_DISCONNECTED,
     "STOP_WIN_HIT",
@@ -381,6 +428,8 @@ ANALYSIS_DETAIL_FIELDS = (
     "sr_zone_source",
     "sr_respect_reason",
     "wick_reason",
+    # Veredito da entrada de nível (11/09): lado, nível, toques, distância.
+    "sr_level",
     "vertex",
     "zigzag_reversal",
     "reversal_against",
@@ -7306,6 +7355,90 @@ def apply_revz_guard(
     return False, selected, hard_blocks[0]
 
 
+def apply_level_guard(
+    user_id: str,
+    state: Any,
+    selected: dict[str, Any],
+    *,
+    blocked_filters: list[str],
+    approved_filters: list[str],
+    confidence: int,
+    direction: str,
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Portão de estratégia de um candidato de nível (S/R como sinal).
+
+    Mesmo desenho do ``apply_revz_guard``: mantém só o que impede a ordem ou
+    protege a banca — payout, piso de confiança, cooldowns de ativo e de perda,
+    entrada repetida. A confiança da entrada de nível está na escala 0–100 do
+    motor clássico de propósito (``SR_LEVEL_CONFIDENCE_BASE``), então aqui NÃO
+    há rescale de piso: é o mínimo do painel que vale, sem a armadilha das duas
+    escalas que já calou a REV-Z, a SR-R e a Vertex.
+
+    Args:
+        user_id: Dono do ciclo.
+        state: Estado do robô.
+        selected: Sinal já com payout e modo.
+        blocked_filters: Bloqueios acumulados até aqui.
+        approved_filters: Aprovações acumuladas até aqui.
+        confidence: Confiança do sinal.
+        direction: ``CALL``/``PUT``.
+
+    Returns:
+        O mesmo contrato de ``apply_strategy_guard``.
+    """
+    symbol = normalize_binary_active(str(selected.get("symbol") or ""))
+
+    def bloqueia(nome: str) -> None:
+        if nome not in blocked_filters:
+            blocked_filters.append(nome)
+
+    if confidence < int(state.min_confidence):
+        bloqueia("MIN_CONFIDENCE")
+    elif "MIN_CONFIDENCE" not in approved_filters:
+        approved_filters.append("MIN_CONFIDENCE")
+    if "DIRECTION_VALID" not in approved_filters:
+        approved_filters.append("DIRECTION_VALID")
+    cooldown = asset_cooldown_reason(user_id, symbol)
+    if cooldown is not None:
+        bloqueia(cooldown)
+    if REPEAT_ENTRY_HARD_BLOCK and user_id and repeat_entry_cooldown_remaining(user_id, symbol) is not None:
+        bloqueia("REPEAT_ENTRY")
+    loss_cooldown = global_loss_cooldown_reason(user_id)
+    if loss_cooldown is not None:
+        bloqueia(loss_cooldown)
+    if teto_de_nivel_atingido(user_id):
+        bloqueia("SR_LEVEL_HOURLY_LIMIT")
+
+    hard_blocks = [nome for nome in blocked_filters if nome in SR_LEVEL_NON_WAIVABLE]
+    trade_allowed = not hard_blocks
+    reason = str(selected.get("reason") or selected.get("signal_explanation") or "").strip()
+    selected["blocked_filters"] = blocked_filters
+    selected["approved_filters"] = approved_filters
+    selected["trade_allowed"] = trade_allowed
+    selected["direction"] = direction
+    selected["signal"] = direction
+    selected["strategy_score"] = confidence
+    selected["quality_score"] = confidence
+    selected["score"] = confidence
+    selected["block_reasons"] = list(blocked_filters)
+    selected["reason"] = reason
+    selected["entry_reason"] = selected.get("entry_reason") or reason
+    selected["quality_reason"] = "OK_SR_NIVEL" if trade_allowed else ",".join(hard_blocks)
+    selected["frequency_recovery"] = False
+    nivel = selected.get("sr_level") or {}
+    logger.info(
+        "[SR_LEVEL_GUARD_%s] user_id=%s symbol=%s direction=%s lado=%s dist_atr=%s bloqueios=%s",
+        "PASS" if trade_allowed else "BLOCK",
+        user_id,
+        symbol,
+        direction,
+        nivel.get("side"),
+        nivel.get("distance_atr"),
+        hard_blocks,
+    )
+    return (True, selected, None) if trade_allowed else (False, selected, hard_blocks[0])
+
+
 def apply_strategy_guard(
     user_id: str,
     state: Any,
@@ -7347,6 +7480,18 @@ def apply_strategy_guard(
     else:
         set_filter("PAYOUT_UNAVAILABLE", True)
         set_filter("MIN_PAYOUT", float(payout) >= state.min_payout)
+    if is_level_candidate(selected):
+        # Preço no nível: a entrada é a favor dele e os filtros do motor
+        # clássico (que segue a vela) são todos vetos à tese de reversão.
+        return apply_level_guard(
+            user_id,
+            state,
+            selected,
+            blocked_filters=blocked_filters,
+            approved_filters=approved_filters,
+            confidence=confidence,
+            direction=direction,
+        )
     if is_revz_candidate(selected):
         # Mercado aberto: a REV-Z tem portão próprio. Tudo abaixo daqui é
         # filtro do motor clássico, que segue tendência — EMA a favor, RSI
@@ -9835,6 +9980,7 @@ async def revalidate_level_before_entry(
         return sem_dado
     try:
         candles = candles_with_current_candle(candles, closed_candle_endtime(agora, timeframe))
+        veredito_nivel = find_level_trade(candles)
         zona = build_zone(candles)
         respeita, motivo = evaluate_respect(direction, zona, candles[-1])
     except Exception:
@@ -9847,6 +9993,69 @@ async def revalidate_level_before_entry(
         )
         candidate["sr_entry_recheck_reason"] = "SEM_VERIFICACAO_ERRO"
         return sem_dado
+    # Nível manda na vela (11/09): se o preço está perto de um nível, a entrada
+    # é a favor dele — TROCANDO a direção se a análise tinha apontado o outro
+    # lado. Antes daqui esse caso era cancelamento (66 em 5h) e o cliente ouvia
+    # "entrada rejeitada" sem nunca ter havido entrada.
+    if veredito_nivel and teto_de_nivel_atingido(user_id):
+        # O nível manda na vela, mas a conta já usou as 3 entradas de nível da
+        # hora: entrar do jeito que a análise queria seria entrar CONTRA o
+        # nível. Sem entrada nesta vela.
+        logger.info(
+            "[SR_LEVEL_HOURLY_LIMIT] user_id=%s symbol=%s entradas_na_hora=%s teto=%s",
+            user_id,
+            symbol,
+            entradas_de_nivel_na_hora(user_id),
+            SR_LEVEL_MAX_PER_HOUR,
+        )
+        candidate["sr_entry_recheck_reason"] = "TETO_DE_NIVEL_NA_HORA"
+        return "SR_ZONE_NA_ENTRADA"
+    if veredito_nivel:
+        direcao_nivel = str(veredito_nivel["direction"])
+        sem_pavio, motivo_pavio = level_wick_ok(candles, direcao_nivel, check_forming=False)
+        candidate["wick_entry_reason"] = motivo_pavio
+        candidate["sr_entry_recheck_reason"] = f"NIVEL_{veredito_nivel['side']}"
+        if not sem_pavio:
+            logger.warning(
+                "[SR_LEVEL_ENTRY_BLOCK] user_id=%s symbol=%s direction=%s lado=%s motivo=%s",
+                user_id,
+                symbol,
+                direcao_nivel,
+                veredito_nivel["side"],
+                motivo_pavio,
+            )
+            return "PAVIO_NA_ENTRADA"
+        if direcao_nivel != direction:
+            logger.warning(
+                "[SR_LEVEL_ENTRY_FLIP] user_id=%s symbol=%s analise=%s nivel=%s lado=%s dist_atr=%s",
+                user_id,
+                symbol,
+                direction,
+                direcao_nivel,
+                veredito_nivel["side"],
+                veredito_nivel["distance_atr"],
+            )
+        candidate["signal"] = direcao_nivel
+        candidate["direction"] = direcao_nivel
+        candidate["analyzed_direction"] = direcao_nivel
+        candidate["sr_level"] = veredito_nivel
+        candidate["strategy_key"] = STRATEGY_SR_LEVEL
+        candidate["strategy_name"] = "S/R entrada a favor do nível"
+        texto = level_text(symbol, veredito_nivel)
+        for campo in ("reason", "entry_reason", "signal_explanation", "narrator_text", "analysis_detail"):
+            candidate[campo] = texto
+        return None
+    if is_level_candidate(candidate):
+        # A análise viu nível perto e na virada da vela ele não está mais lá
+        # (preço andou, ou o nível foi rompido). Sem nível não há tese.
+        candidate["sr_entry_recheck_reason"] = "NIVEL_SUMIU_NA_ENTRADA"
+        logger.warning(
+            "[SR_LEVEL_ENTRY_GONE] user_id=%s symbol=%s direction=%s",
+            user_id,
+            symbol,
+            direction,
+        )
+        return "SR_ZONE_NA_ENTRADA"
     candidate["sr_entry_recheck_reason"] = motivo
     if not respeita:
         logger.warning(
@@ -11386,6 +11595,32 @@ def candidate_meets_cycle_threshold(
                 motivo,
             )
         return liberado
+    # Preço no nível: mesmo desenho do desvio acima, pelo mesmo motivo. Os
+    # testes abaixo recalculam os cortes do motor clássico (corpo, cores das
+    # últimas velas, memória de padrões por hora), todos calibrados para quem
+    # segue a vela — numa entrada de reversão no nível cada um é um veto à tese.
+    # Este é o SEGUNDO portão: faltar aqui deixa a estratégia muda, sem erro no
+    # log. Já custou a REV-Z, a SR-R, a Vertex e o modo LIVE.
+    if is_level_candidate(candidate):
+        simbolo = normalize_binary_active(str(candidate.get("symbol") or candidate.get("active") or ""))
+        motivo = None
+        if float(candidate.get("payout") or 0) < float(getattr(state, "min_payout", 0) or 0):
+            motivo = "PAYOUT_TOO_LOW"
+        elif int(candidate.get("confidence") or 0) < int(minimum_confidence):
+            motivo = "MIN_CONFIDENCE"
+        elif REPEAT_ENTRY_HARD_BLOCK and user_id and simbolo and repeat_entry_cooldown_remaining(user_id, simbolo) is not None:
+            motivo = "REPEAT_ENTRY"
+        elif user_id and teto_de_nivel_atingido(user_id):
+            motivo = "SR_LEVEL_HOURLY_LIMIT"
+        if motivo:
+            logger.info(
+                "[SR_LEVEL_GATE_BLOCK] user_id=%s symbol=%s motivo=%s",
+                user_id,
+                simbolo,
+                motivo,
+            )
+            return False
+        return True
     # Mercado aberto (REV-Z): mesmo desenho do desvio acima. Os testes que vêm
     # depois recalculam, por conta própria, os cortes do motor clássico a
     # partir do corpo e das cores das últimas velas (CALL_GRG, PUT_BODY...) e a
@@ -13308,6 +13543,10 @@ async def execute_robot_cycle(
             last_order_reason = "NO_AVAILABLE_ASSET"
             last_friendly_error = NO_AVAILABLE_ASSET_ERROR
             attempted_unavailable = False
+            # Cancelamentos do filtro de S/R/pavio no disparo: se só eles
+            # esvaziaram a lista, a mensagem ao cliente diz isso.
+            filter_cancels = 0
+            last_filter_cancel = None
             # Orçamento compartilhado da revalidação de canal: a janela de
             # compra é 0-3s (envio aceito até ENTRY_SEND_MAX_SECOND), então o
             # conjunto de candidatos não pode gastar mais que isso consultando
@@ -13413,6 +13652,9 @@ async def execute_robot_cycle(
                         )
                         return 200, build_robot_payload(state, user_id=user_id)
                     skipped_candidates += 1
+                    if validation_reason in ENTRY_FILTER_CANCEL_REASONS:
+                        filter_cancels += 1
+                        last_filter_cancel = validation_reason
                     logger.warning(
                         "[ORDER_FALLBACK_NEXT_CANDIDATE] user_id=%s skipped_active=%s reason=%s attempts=%s",
                         user_id,
@@ -13812,6 +14054,7 @@ async def execute_robot_cycle(
                     "sr_respect_reason": selected.get("sr_respect_reason"),
                     "sr_entry_recheck_reason": selected.get("sr_entry_recheck_reason"),
                     "wick_reason": selected.get("wick_reason"),
+                    "sr_level": dict(selected["sr_level"]) if isinstance(selected.get("sr_level"), dict) else None,
                     "wick_entry_reason": selected.get("wick_entry_reason"),
                     "strategy_summary": selected.get("strategy_summary"),
                     "analysis_detail": selected.get("analysis_detail")
@@ -13879,6 +14122,15 @@ async def execute_robot_cycle(
                         str(selected.get("symbol") or selected.get("active") or ""),
                         str(getattr(state, "timeframe", "M1") or "M1"),
                     )
+                    if is_level_candidate(selected):
+                        # Conta para o teto de 3 entradas de nível por hora.
+                        registrar_entrada_de_nivel(user_id)
+                        logger.info(
+                            "[SR_LEVEL_ENTRY_COUNT] user_id=%s entradas_na_hora=%s teto=%s",
+                            user_id,
+                            entradas_de_nivel_na_hora(user_id),
+                            SR_LEVEL_MAX_PER_HOUR,
+                        )
                 # Ordem aceita: o par voltou a funcionar, a escada de cooldown
                 # dele recomeça do primeiro degrau.
                 clear_unavailable_asset_strikes(symbol)
@@ -13939,6 +14191,23 @@ async def execute_robot_cycle(
                 return 200, build_robot_payload(state)
 
             final_error = NO_AVAILABLE_ASSET_ERROR if attempted_unavailable or skipped_candidates else last_friendly_error
+            if last_filter_cancel and filter_cancels == skipped_candidates and not attempted_unavailable:
+                # Cancelado só pelo filtro (S/R ou pavio) e nenhuma ordem foi
+                # tentada. Desde 11/09 o painel não anuncia a entrada antes da
+                # conferência, então aqui NÃO existe entrada para "rejeitar":
+                # seria assustar o cliente com um erro que não houve. O ciclo
+                # segue para a próxima vela como um ciclo sem oportunidade.
+                logger.info(
+                    "[ENTRY_CANCELLED_BY_FILTER] user_id=%s motivo=%s",
+                    user_id,
+                    last_filter_cancel,
+                )
+                state = auto_trader.schedule_next_analysis_session(
+                    user_id,
+                    analysis_result="NO_OPPORTUNITY_FOUND",
+                    last_rejection_reason=last_filter_cancel,
+                )
+                return 200, build_robot_payload(state)
             state = auto_trader.reject_order(
                 user_id,
                 last_order_reason,

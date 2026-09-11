@@ -1766,6 +1766,9 @@ class AutoTrader:
             "sr_entry_recheck_reason": signal.get("sr_entry_recheck_reason"),
             # Filtro de pavio (11/09/2026), na análise e no disparo.
             "wick_reason": signal.get("wick_reason"),
+            # Veredito do nível: sem ele aqui o candidato chega ao portão sem a
+            # marca de entrada de nível e cai nos filtros do motor clássico.
+            "sr_level": dict(signal["sr_level"]) if isinstance(signal.get("sr_level"), dict) else None,
             "wick_entry_reason": signal.get("wick_entry_reason"),
             "strategy_summary": signal.get("strategy_summary"),
             "analysis_detail": signal.get("analysis_detail")

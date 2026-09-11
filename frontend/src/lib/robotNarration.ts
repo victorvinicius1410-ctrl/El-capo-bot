@@ -137,22 +137,10 @@ export function buildRobotNarrationEvents(
   }
   // A fala não nomeia a estratégia: era sempre a mesma lista do motor. Leva
   // só os detalhes da análise (ver `analysisSpeech.ts`).
-  if (signal && (status === "SIGNAL_FOUND" || status === "WAITING_ENTRY_WINDOW")) {
-    events.push({
-      key: signalFoundKey(signal),
-      text: `Melhor ativo encontrado. Ativo: ${speakSymbol(signal.symbol)}. Direção: ${speakDirection(signal.direction)}. Confiança: ${speakPercent(signal.confidence)} por cento. Payout: ${speakPercent(signal.payout)} por cento. Valor da entrada: ${speakMoney(state.entry_value)}.${analysisSentence(signal)} Aguardando janela de entrada.`,
-    });
-  }
-  if (signal && (status === "WAITING_ENTRY" || status === "WAITING_NEXT_CANDLE_ENTRY")) {
-    if (ai?.voiceText) {
-      events.push({ key: aiVoiceKey(state, signal), text: sanitizeForSpeech(ai.voiceText) });
-    } else {
-      events.push({
-        key: statusKey(status, signal, state.cycle_id),
-        text: `Entrada preparada. Ativo: ${speakSymbol(signal.symbol)}. Direção: ${speakDirection(signal.direction)}.${analysisSentence(signal)} Entrada no início da próxima vela.`,
-      });
-    }
-  }
+  // 11/09/2026: nada de "melhor ativo encontrado" nem "entrada preparada". A
+  // conferência de S/R e pavio acontece na virada da vela e cancelava 65% do
+  // que era anunciado. A fala da entrada foi para o momento em que a ordem
+  // sai, logo abaixo (`PENDING_RESULT`), e continua levando a análise.
   if (status === "ANALYZING" && !operating && analysisSequence > suppressAnalysisUntil) {
     events.push({
       key: `ANALYSIS_STARTED|${analysisSequence}|el-capo`,
@@ -215,9 +203,18 @@ export function buildRobotNarrationEvents(
     const active = trade?.active;
     if (active) {
       const directionPart = trade?.direction ? ` Direção: ${speakDirection(trade.direction)}.` : "";
+      // A análise entra AQUI desde 11/09: é o primeiro momento em que existe
+      // entrada de verdade, e é onde o cliente ouve por que ela foi feita.
+      // A voz da IA, quando existe, é a explicação preferida — era ela que
+      // falava na espera pela entrada antes de 11/09.
+      const analise = ai?.voiceText
+        ? ` ${sanitizeForSpeech(ai.voiceText)}`
+        : signal
+          ? analysisSentence(signal)
+          : "";
       events.push({
         key: eventKey("PENDING_RESULT", orderId, signalCreatedAt, signal),
-        text: `Operação aberta em ${speakSymbol(active)}.${directionPart} Aguardando resultado.`,
+        text: `Operação aberta em ${speakSymbol(active)}.${directionPart}${analise} Aguardando resultado.`,
       });
     }
   }
@@ -298,13 +295,7 @@ function statusKey(status: string, signal: RobotSignal | null, cycleId?: string 
   return [status, signal?.symbol ?? "-", signal?.direction ?? "-", cycleId ?? "-", extra].join("|");
 }
 
-function signalFoundKey(signal: RobotSignal): string {
-  return ["SIGNAL_FOUND", signal.symbol, signal.direction, signal.created_at ?? "-"].join("|");
-}
 
-function aiVoiceKey(state: RobotState, signal: RobotSignal): string {
-  return ["AI_VOICE", state.cycle_id ?? "-", signal.symbol, signal.direction, signal.created_at ?? "-"].join("|");
-}
 
 /**
  * Chave estável de um resultado já narrado.
@@ -490,10 +481,6 @@ function speakDirection(direction?: string | null): string {
   return normalized || "não definida";
 }
 
-function speakPercent(value?: number | null): string {
-  if (value == null || !Number.isFinite(value)) return "0";
-  return Number.isInteger(value) ? String(value) : value.toFixed(0);
-}
 
 /**
  * Frase " Análise: ..." da entrada, ou vazio quando nenhum texto tem medida.

@@ -5,6 +5,7 @@ from backend.auto_trader import AutoTrader
 from backend.signal_engine import analyze_signal
 
 _VERTEX_ORIGINAL = signal_engine.VERTEX_ENABLED
+_NIVEL_ORIGINAL = signal_engine.SR_LEVEL_TRADE_ENABLED
 
 
 def setUpModule() -> None:
@@ -15,10 +16,15 @@ def setUpModule() -> None:
     setup clássico falharia por um motivo que não é o dele.
     """
     signal_engine.VERTEX_ENABLED = False
+    # Mesmo motivo, para a entrada de nível (11/09/2026): com o preço perto de
+    # um topo ou fundo ela decide a vela e dispensa os filtros de qualidade do
+    # clássico — inclusive os de pavio e corpo que ESTES testes medem.
+    signal_engine.SR_LEVEL_TRADE_ENABLED = False
 
 
 def tearDownModule() -> None:
     signal_engine.VERTEX_ENABLED = _VERTEX_ORIGINAL
+    signal_engine.SR_LEVEL_TRADE_ENABLED = _NIVEL_ORIGINAL
 
 
 def make_candles(count: int = 40) -> list[dict[str, float]]:
