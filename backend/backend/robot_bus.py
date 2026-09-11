@@ -3,7 +3,7 @@
 Canais (DB 1 do mesmo Redis do Celery, prefixo ``robot:``):
 - Pub/sub ``robot:cmd`` — start/stop/ensure do robô (gateway → runtime)
 - Pub/sub ``robot:state`` — snapshot JSON (runtime → gateway)
-- Key ``robot:snapshot:{user_id}`` — último snapshot (TTL 120s)
+- Key ``robot:snapshot:{user_id}`` — último snapshot (TTL 600s)
 
 Ver docs/PERFORMANCE_SISTEMA.md (Fase 4) e DEPLOY_VPS.md.
 """
@@ -20,7 +20,11 @@ from typing import Any
 logger = logging.getLogger("backend-gateway")
 
 ROBOT_REDIS_DB = 1
-SNAPSHOT_TTL_SECONDS = 120
+SNAPSHOT_TTL_SECONDS = 600
+# Placar autoritativo após uma baixa intencional (exclusão marketing /
+# gerar placar do Shift+O). TTL curto: só precisa cobrir a janela em que
+# Redis/Supabase ainda têm o placar anterior. Ver docs/PLACAR_OVERLAY.md.
+SCORE_AUTHORITY_TTL_SECONDS = 120
 CMD_CHANNEL = "robot:cmd"
 STATE_CHANNEL = "robot:state"
 
@@ -80,11 +84,12 @@ class RobotBus:
 
     def publish_command(self, user_id: str, action: str, **extra: Any) -> None:
         """
-        Publica comando start/stop/ensure para o runtime.
+        Publica comando start/stop/ensure/reset_score para o runtime.
 
         Args:
             user_id: Alvo do comando.
-            action: ``start`` | ``stop`` | ``ensure``.
+            action: ``start`` | ``stop`` | ``ensure`` | ``reset_score`` |
+                ``apply_score`` | ``disconnect`` | ``reconnected``.
             **extra: Metadados opcionais.
         """
         if not self.enabled:
@@ -129,6 +134,119 @@ class RobotBus:
         except Exception:
             logger.warning(
                 "[ROBOT_BUS_SNAPSHOT_READ_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+            return None
+
+    def set_score_authority(
+        self,
+        user_id: str,
+        wins: int,
+        losses: int,
+        profit: float,
+    ) -> None:
+        """Publica o placar autoritativo da sessão (baixa intencional).
+
+        Gateway e ``robot-runtime`` são processos separados e o placar vive
+        em três fontes (memória, ``robot:snapshot`` e ``robot_states``). O
+        reconcile "nunca rebaixa" restaurava o placar antigo enquanto a
+        escrita no Supabase (assíncrona) não tinha chegado. Esta chave diz a
+        todos os processos qual é o placar correto agora.
+
+        Args:
+            user_id: Dono da sessão.
+            wins: WIN da sessão após a baixa.
+            losses: LOSS da sessão após a baixa.
+            profit: Lucro da sessão após a baixa.
+        """
+        if not self.enabled:
+            return
+        try:
+            self._get_client().setex(
+                f"robot:score_authority:{user_id}",
+                SCORE_AUTHORITY_TTL_SECONDS,
+                json.dumps(
+                    {
+                        "wins": int(wins),
+                        "losses": int(losses),
+                        "profit": round(float(profit), 2),
+                    }
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_SCORE_AUTHORITY_WRITE_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+
+    def get_score_authority(self, user_id: str) -> dict[str, Any] | None:
+        """Lê o placar autoritativo, ou None se expirou/não existe."""
+        if not self.enabled:
+            return None
+        try:
+            raw = self._get_client().get(f"robot:score_authority:{user_id}")
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_SCORE_AUTHORITY_READ_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+            return None
+
+    def clear_score_authority(self, user_id: str) -> None:
+        """Descarta o placar autoritativo (resultado novo ou reinício)."""
+        if not self.enabled:
+            return
+        try:
+            self._get_client().delete(f"robot:score_authority:{user_id}")
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_SCORE_AUTHORITY_CLEAR_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+
+    def set_manual_disconnect(self, user_id: str, active: bool) -> None:
+        """Grava a decisão de "Desconectar Bullex" de forma durável.
+
+        Sem TTL de propósito: é decisão explícita do cliente e só o
+        connect/reconnect dele encerra. Antes isso vivia num ``set`` em memória
+        do gateway — sumia em todo restart, e no poll seguinte o
+        ``try_auto_reconnect_with_saved_credentials`` reconectava com a senha
+        salva. Era por isso que o cliente deslogava, entrava de novo e a conta
+        aparecia conectada sozinha.
+        """
+        if not self.enabled:
+            return
+        try:
+            client = self._get_client()
+            key = f"bullex:manual_disconnect:{user_id}"
+            if active:
+                client.set(key, "1")
+            else:
+                client.delete(key)
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_MANUAL_DISCONNECT_WRITE_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+
+    def is_manual_disconnect(self, user_id: str) -> bool | None:
+        """``None`` quando o Redis não respondeu — o chamador usa o espelho local."""
+        if not self.enabled:
+            return None
+        try:
+            return self._get_client().get(f"bullex:manual_disconnect:{user_id}") is not None
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_MANUAL_DISCONNECT_READ_FAILED] user_id=%s",
                 user_id,
                 exc_info=True,
             )

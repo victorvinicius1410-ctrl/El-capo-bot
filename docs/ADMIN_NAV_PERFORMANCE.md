@@ -1,7 +1,7 @@
 # Performance da navegação admin
 
 Como a troca de abas no painel `/admin/*` era lenta e o que foi otimizado.
-Atualizado em **2026-08-07**.
+Atualizado em **2026-08-17**.
 
 ## Sintoma
 
@@ -53,7 +53,8 @@ competindo por rede/CPU a cada 1–10s.
 | Soft reset no primeiro bind (`cancelInFlightQueries: false`) | `authUserBoundary.ts`, `__root.tsx` | Evita `CancelledError` no error boundary ao abrir `/admin` (ver `CHROME_REMOVECHILD_LOGIN.md`) |
 | Chave canônica `["me", "access"]` + `staleTime` 60s | `meAccessQuery.ts`, AppShell, páginas | Um único cache compartilhado |
 | Cache em memória de `/auth/session` (TTL 30s) | `sessionIdentityCache.ts`, `api.ts` | Corta ~50% dos round-trips em navegação e polling |
-| `showRobot = … && !pathname.startsWith("/admin")` | `AppShell.tsx` | Sem polling robô/BullEx no admin |
+| `showRobot` / `shouldShowRobotOverlay` | `AppShell.tsx`, `adminPresentation.ts` | Sem overlay do robô no admin |
+| `shouldMountLiveTradingProvider` | `adminPresentation.ts`, `AppShell.tsx` | Provider desligado **só** em `/admin/*`; fora disso **sempre** monta (dashboard/config/histórico chamam o hook mesmo com lead inativo ou `/me/access` em erro) |
 | Defaults RQ: `staleTime: 30s`, `refetchOnWindowFocus: false` | `router.tsx` | Remount de aba não refetcha tudo |
 | `defaultPreloadDelay: 80` | `router.tsx` | Hover acidental na sidebar não dispara rede |
 | Lazy fetch por seção | `admin.webhooks-api.tsx`, `admin.emails.tsx` | Só busca o que a seção precisa |

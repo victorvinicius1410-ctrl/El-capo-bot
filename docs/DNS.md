@@ -109,3 +109,11 @@ curl -sI http://127.0.0.1/ -H 'Host: app.elcapobot.online' | head -5
 - `@` / `www` apontam para host externo da LP (AWS) — esperado
 - Painel: https://app.elcapobot.online
 - API: https://api.elcapobot.online/health
+
+## Ambiente de teste (domínio separado)
+
+Staging idêntico ao prod, em outro domínio — **não** altere os registros acima:
+
+- Domínio: `elcapo2.shop` → `app.elcapo2.shop` + `api.elcapo2.shop`
+- Docs: [`DNS_ELCAPO2.md`](./DNS_ELCAPO2.md) e [`STAGING_ELCAPO2.md`](./STAGING_ELCAPO2.md)
+- Código/stack: `/opt/elcapo2` (projeto Docker `elcapo2staging`, porta `8081`)

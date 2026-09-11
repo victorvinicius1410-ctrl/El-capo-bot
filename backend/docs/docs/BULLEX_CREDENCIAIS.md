@@ -4,7 +4,7 @@ Documento da persistência criptografada de email/senha da corretora Bullex,
 para o cliente não precisar reconectar a cada queda de sessão e para o robô
 operar com a tela fechada.
 
-Atualizado em **2026-08-07**.
+Atualizado em **2026-08-12**.
 
 ## Objetivo
 
@@ -70,10 +70,10 @@ Quando a sessão cai (SSID inválido / restart do bullex-service):
 | Método | Rota | Comportamento |
 |---|---|---|
 | POST | `/bullex/connect` | Conecta e **salva** credenciais criptografadas |
-| POST | `/bullex/disconnect` | Derruba sessão; **mantém** credenciais salvas |
-| POST | `/bullex/reconnect` | Tenta SSID; se não conectar, usa credenciais salvas |
-| GET | `/bullex/status` | Se desconectado + login salvo → auto-reconnect |
-| GET | `/bullex/account` | Se desconectado + login salvo → auto-reconnect |
+| POST | `/bullex/disconnect` | Derruba sessão; **apaga** credenciais criptografadas; marca desconexão manual (Redis); sobrescreve snapshot do robô no Redis como desconectado |
+| POST | `/bullex/reconnect` | Tenta SSID; se não conectar, usa credenciais salvas. **Recusado** se houver desconexão manual (`[BULLEX_RECONNECT_BLOCKED]`) — só `POST /bullex/connect` libera |
+| GET | `/bullex/status` | Se desconexão manual → sempre `connected:false`. Senão, se desconectado + login salvo + **robô ligado** → auto-reconnect |
+| GET | `/bullex/account` | Idem status (early-return em desconexão manual) |
 | GET | `/bullex/credentials` | `{ credentials_saved, email }` — sem senha |
 | DELETE | `/bullex/credentials` | Esquece credenciais (ação explícita do cliente) |
 
@@ -190,8 +190,190 @@ Logs úteis: `[BULLEX_SSID_RECONNECT_START]`, `[BULLEX_AUTO_RECONNECT_OK] via=ss
 
 Testes: `tests/test_bullex_soft_reconnect.py`, `tests/test_bullex_connect_reuse.py`.
 
+## Anti-flap do painel (email/saldo)
+
+Quando o probe da corretora falha de forma transitória:
+
+1. **bullex-service** agenda backoff **sem** gravar `connected:false` por cima
+   do último `/account` e `/sessions/status` bons (`last_*_cache`).
+2. Em backoff/offline, se o TTL do response cache expirou, devolve o
+   `last_*_cache` (stale) em vez de desconectado vazio.
+3. **Gateway** (`resolve_backoff_panel_payload`): se ainda assim receber
+   `status=backoff`, preenche com memória/grace antes de responder ao
+   frontend — logs `[ACCOUNT_BACKOFF_PANEL_RECOVERED]` /
+   `[STATUS_BACKOFF_PANEL_RECOVERED]`.
+4. **Frontend** (`preferStableBullExAccount`): não troca snapshot com email/
+   saldo por um desconectado vazio; status `BACKOFF` não abre o banner
+   "Conta Bullex desconectada".
+
+Isso evita o flicker ao entrar/sair de Configurações enquanto o robô opera.
+
+## Incidente: email/saldo `—` com pill "Conectado" (2026-08-07)
+
+### Sintoma
+
+- Pill **Conectado** (ou grace) nas Configurações.
+- Métricas **EMAIL** e **SALDO** em `—`.
+- Console: `[AUTH_VISIBILITY_REFRESH_ERROR]` / falha em `/auth/refresh`
+  (Safari: “access control checks”) — em geral **efeito colateral** de
+  restart do gateway (502 sem CORS), não lista de origins errada.
+
+### Causa raiz (email/saldo)
+
+1. Deploy recria `bullex-service` → sessões em memória/SSID caem
+   (`SESSION_NOT_FOUND`, `USER_OFFLINE_SKIPPED`).
+2. Poll de `/bullex/account` sob backoff devolvia `email: null` /
+   `balance: null` com `connected` stale/grace.
+3. `build_connection_payload` + upsert Supabase **gravavam `bullex_email=null`**,
+   apagando o email salvo. A senha criptografada ficava órfã.
+4. `BullexCredentialsService.load()` exige email+senha → auto-reconnect
+   impossível; `GET /bullex/credentials` sem email; UI mostra `—`.
+
+Auditoria (2026-08-07): **34/62** contas com `encrypted_password` e
+`bullex_email` vazio.
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| `build_connection_payload` | Não inclui `bullex_email` / `last_balance` / `currency` se vazios |
+| `connection_upsert_diagnostic` | Remove `bullex_email` null do body do merge |
+| `has_saved` | Só `true` com email **e** senha; log `[BULLEX_CREDENTIALS_INCOMPLETE]` |
+| Testes | `tests/test_bullex_email_preserve.py` |
+
+### O que o cliente afetado precisa fazer
+
+Contas já órfãs **não** recuperam o email sozinhas (não está no blob da
+senha). Em Configurações → Conta: **Desconectar Bullex** → informar de novo
+email/senha (“Conectar e salvar”). Depois do connect, email e saldo voltam.
+
+## Incidente: Desconectar “só carrega” (2026-08-07)
+
+### Sintoma
+
+Clique em **Desconectar Bullex** → spinner → pill continua **Conectado**
+(com email/saldo `—`). Formulário de login não aparece.
+
+### Causas
+
+1. **Backend:** `mark_session_failure(force_offline=True)` no disconnect
+   **preservava** o último `/account` REAL. O poll seguinte (grace/backoff)
+   devolvia `connected:true` de novo.
+2. **Frontend:** `preferStableBullExAccount` mascarava desconectado vazio;
+   `useEnsureBullexSession` auto-reconectava se havia login salvo;
+   estado `syncing` com `BACKOFF` escondia o formulário.
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| Gateway | `apply_manual_disconnect_session_state` — zera grace/cache sem preservar REAL |
+| FE painel | UI otimista no disconnect + toast; hint de sessão incompleta |
+| FE | `markManualBullexDisconnect()` — marca sem TTL (só limpa no connect) |
+| FE | `syncing` só com `connected && metricsMissing` (BACKOFF sozinho não trava login) |
+| Testes | `test_manual_disconnect_cache.py`, testes FE de suppress manual |
+
+## Incidente: Desconectar volta a “Conectado” (2026-08-12)
+
+### Sintoma
+
+Clientes clicam **Desconectar Bullex** dezenas de vezes. Backend responde
+`[BULLEX_DISCONNECT] upstream_ok=True credentials_kept=False`, mas o pill
+volta para **Conectado** em segundos. Logs mostram a marca Redis ativa
+(`[BACKOFF_CACHE_SKIPPED] reason=manual_disconnect`), mas a UI mente.
+
+### Causa raiz
+
+Em `ROBOT_RUNTIME_MODE=external`, `GET /robot/state` e o WS preferem o
+snapshot Redis (`robot:snapshot:{user_id}`, TTL **600s**). No disconnect o
+runtime cancela o worker e para de republicar — o snapshot antigo fica com
+`connected=true`. O refetch/WS após o clique traz esse stale e o painel
+“desfaz” a desconexão. Também: `isBullExConnected` não respeitava a marca
+manual; status/account podiam cair em `memory_*_fallback`.
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| Gateway `bullex_disconnect` | `publish_manual_disconnect_robot_snapshot` sobrescreve o Redis |
+| Gateway `/robot/state` + snapshot WS | Se `is_manual_disconnect`, ignora snapshot Redis stale |
+| Gateway status/account | Early-return `connected:false` (`source=manual_disconnect`) |
+| `memory_account_fallback` | Retorna `None` sob desconexão manual |
+| `robot-runtime` | Após cmd `disconnect`, publica snapshot desconectado |
+| FE | Marca manual vence grace/`CONNECTED`; marca **antes** do POST |
+| FE `useLiveTradingData` | WS/poll não aplicam `connected=true` com marca ativa |
+| Testes | `test_manual_disconnect_cache.py` (+3), `bullexConnection.test.ts` |
+
+Para voltar a conectar: o cliente informa email/senha de novo (credenciais
+são apagadas no disconnect).
+
+## Incidente: sessão cai sozinha e `/robot/start` devolve 409 (2026-08-08)
+
+### Sintoma
+
+- Cliente conecta normalmente; **depois de um tempo** o painel mostra
+  “Conta Bullex desconectada ou sessão expirada. Reconecte em Configurações →
+  Conta Corretora”. Repete várias vezes ao longo do dia.
+- `POST /robot/start` → **409** (`BULLEX_NOT_CONNECTED`).
+- Às vezes o painel fica **Conectado** com **E-mail `—`**, **Saldo `—`** e
+  “Nenhum login salvo ainda” → “Sessão incompleta (sem email/saldo)”.
+- Console do browser: `WebSocket … /ws/robot-state … is closed before the
+  connection is established` (2×).
+
+### Causas
+
+| # | Causa | Efeito |
+|---|-------|--------|
+| 1 | `run_forever` sem `ping_interval` (`bullexapi/api.py`) | WS ocioso com a corretora morre no NAT/proxy residencial; só se descobre na próxima operação → `[SESSION-DEAD]` → 409 |
+| 2 | `load_connected_user` exigia `connected = 1` | Toda queda transitória chama `mark_disconnected` (connected=0) e **inutilizava o SSID salvo**; restore virava `SESSION_NOT_FOUND` e caía no login por senha, barrado pelo rate limit |
+| 3 | `_populate_ready_state` retornava cedo quando `force_real_mode` falhava | Sessão “meio pronta”: `connected=true`, sem `get_balance`/`get_currency` e sem SSID persistido → painel com `—` e “Nenhum login salvo ainda” |
+
+O WS `/ws/robot-state` **não** é causa: `closed before the connection is
+established` é o browser avisando que o **cliente** fechou o socket durante o
+handshake (cleanup do effect em `useLiveTradingData`, ex.: troca de aba). Falha
+real de servidor aparece como 404 / `bad response` / 502 — ver tabela de
+troubleshooting em [`ROBOT_STATE_WEBSOCKET.md`](./ROBOT_STATE_WEBSOCKET.md).
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| `bullexapi/api.py` | `_websocket_keepalive_kwargs`: `ping_interval=20s`, `ping_timeout=10s` no `run_forever` (env `BULLEX_WS_PING_INTERVAL_SECONDS` / `BULLEX_WS_PING_TIMEOUT_SECONDS`; `0` desliga) |
+| `bullex_service/session_store.py` | `load_connected_user` não exige `connected = 1` — só token presente. Quem desconecta de propósito usa `revoke_token=True` e continua bloqueado |
+| `SessionManager.restore_on_demand` | Revoga o SSID só quando a corretora **rejeitou** (`invalid_ssid`/`restore_rejected`); timeout/rate limit preservam o token. Cooldown de 30s (`SESSION_RESTORE_COOLDOWN_SECONDS`) para o poll não virar loop de login; `force=True` em reconexão explícita |
+| `SessionManager._populate_ready_state` | Modo REAL não confirmado **propaga** `BULLEX_ACTIVE_MODE_NOT_REAL` em vez de devolver sessão zumbi (saldo PRACTICE continua não sendo carregado) |
+| `SessionManager.connect` | Fecha o websocket órfão no `except` antes do `remove` (a thread seguia viva escrevendo em `global_value`) |
+
+Testes: `tests/test_persistence_restore.py::SessionKeepAliveAndRestoreTests` e
+`::SessionPersistenceTests::test_ready_state_raises_on_unconfirmed_real_mode_without_loading_practice_balance`.
+
+### Pendente (causa estrutural)
+
+`bullexapi` guarda conexão em **estado global de módulo**
+(`bullexapi/global_value.py`): `check_connect()` lê
+`global_value.check_websocket_if_connect`, e a thread WS de **cada** usuário
+escreve nele (`ws/client.py` on_open/on_close/on_error), além de
+`start_websocket()` zerar a flag globalmente a cada login. O `_activate`/
+`_capture` do `SessionManager` (o `MVP_SAFE_MODE` do log) só protege a chamada
+em primeiro plano — as threads de callback continuam contaminando as outras
+sessões. Sintoma: usuário B cai porque o socket do usuário A fechou.
+
+Correção definitiva = uma sessão Bullex por processo (worker por usuário ou
+pool com afinidade por `user_id`), ou mover o estado do `ws/client.py` para um
+objeto por sessão. Os fixes acima reduzem a frequência, **não** eliminam.
+
 ## Histórico
 
+- **2026-08-12** — Snapshot Redis stale após Desconectar fazia o painel voltar
+  a "Conectado"; ver seção incidente acima.
+- **2026-08-08** — Keepalive do WS da corretora, SSID salvo sobrevivendo a
+  queda transitória e fim da sessão “meio pronta”; ver seção incidente acima.
+- **2026-08-07 (noite — disconnect stuck)** — Desconectar não “pegava” por
+  cache REAL + auto-reconnect; ver seção incidente acima.
+- **2026-08-07 (noite — wipe bullex_email)** — Sync de account com
+  `email:null` apagava login salvo; ver seção incidente acima.
+- **2026-08-07 (noite — flap visual Configurações)** — Anti-flap acima;
+  ver também `CONFIGURACOES.md` e `ROBO_E_SUPORTE.md` §4.
 - **2026-08-07 (noite — start não derruba Bullex)** — Soft reconnect SSID
   antes da senha; reuse de sessão viva no connect; start não marca
   `ACCOUNT_DISCONNECTED` em falha de saldo/contrato. Ver seção acima.

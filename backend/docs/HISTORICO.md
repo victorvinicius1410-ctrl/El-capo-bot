@@ -9,13 +9,16 @@ para cliente, trial e marketing.
 
 ## Filtros de período
 
-| Botão | `days` | Escopo |
-|-------|--------|--------|
-| Hoje | 1 | Dia corrente |
-| 7 dias | 7 | Última semana |
-| 30 dias | 30 | Último mês |
+Seletor no estilo do Gerenciador de Anúncios da Meta (`DashboardDateFilter`):
+presets + calendário de dois meses + **Atualizar**.
 
-Dados via `GET /robot/history?days=` e `GET /robot/stats?days=` (refresh 30s).
+O `days` enviado a `GET /robot/history` é o recuo em **dias civis de Brasília**
+até hoje (máx. 90), começando na meia-noite do primeiro dia. A tabela e os
+cards filtram no cliente o intervalo escolhido (hoje, ontem, mês passado,
+personalizado). Datas na coluna **Data** aparecem em horário de Brasília.
+
+Detalhes: [`FILTRO_DATAS.md`](./FILTRO_DATAS.md) e
+[`DATAS_BRASILIA.md`](./DATAS_BRASILIA.md).
 
 ## Cards de resumo
 
@@ -29,7 +32,12 @@ Colunas: Data, Ativo, Direção, **Estratégia**, **Análise**, Valor, Resultado
 Lucro/Prejuízo, Gale, Gale Step, Conta.
 
 - **Estratégia:** `strategy_name` / `strategy_key` vindos de `analysis_json`
-  (ex.: “Retração em Zonas de Suporte e Resistência”).
+  (ex.: “Retração em Zonas de Suporte e Resistência”). Contas **marketing**
+  com operações geradas no Shift+O recebem estratégia **simulada**
+  determinística (mesmo id → mesmo rótulo) sincronizada em
+  `robot_trade_history`. Operações **ao vivo** mantêm a estratégia real; o
+  espelho Shift+O não sobrescreve campos de análise quando há
+  `broker_order_id`.
 - **Análise:** botão “Ver análise” abre modal com `strategy_summary`,
   `speech_preview` e `analysis_detail` (explicação completa da entrada).
 
@@ -39,6 +47,27 @@ denormalizadas: `backend/migration_named_strategies_analysis.sql`.
 
 Ver também: [`ESTRATEGIAS_NOMEADAS.md`](./ESTRATEGIAS_NOMEADAS.md).
 
+## Gale (martingale): cada entrada é uma linha própria
+
+Quando o Gale está ativo (`martingale_steps > 1`) e a primeira entrada perde,
+o robô lança uma nova ordem (valor multiplicado) na mesma direção. As **duas**
+entradas ficam registradas como linhas **separadas** no histórico, cada uma
+com o `Resultado` real dela — a primeira sempre `LOSS`, a segunda o resultado
+real da corretora (`WIN`/`LOSS`/`DRAW`).
+
+**Importante:** o *badge* de resultado do overlay/placar ao vivo (Visão geral)
+reflete só o resultado da **última** entrada do ciclo (`cycle_result`), não o
+lucro líquido do ciclo. Ou seja: 1ª entrada `LOSS` + Gale `WIN` mostra "WIN" no
+overlay mesmo que o multiplicador do Gale não cubra 100% da perda anterior
+(depende do payout do ativo no momento). Para conferir o resultado líquido
+real de uma sequência de Gale, some a coluna **Lucro/Prejuízo** das duas
+linhas na tabela — não olhe só o rótulo **Resultado** da última.
+
+Isso já gerou relatos de lead ("a operação foi loss e apareceu win") quando na
+verdade era uma sequência Gale sendo lida como uma operação só. Ver também a
+investigação de isolamento de sessão no resultado da ordem em
+[`ROBO_E_SUPORTE.md`](./ROBO_E_SUPORTE.md) §9 (2026-08-07).
+
 ## Conta marketing + Shift+O
 
 Quando a conta é `marketing` em simulação **e** o painel Shift+O está aberto:
@@ -46,10 +75,15 @@ Quando a conta é `marketing` em simulação **e** o painel Shift+O está aberto
 1. Aparece a coluna **Ações** (sticky à esquerda) com botão de excluir — em
    telas estreitas a lixeira permanece visível sem rolar a tabela até o fim.
 2. A exclusão chama `DELETE /marketing-simulation/trades/{id}` e invalida
-   histórico/placar do robô e do painel.
+   histórico/placar do robô e do painel. O overlay subtrai WIN/LOSS/lucro na
+   hora (`subtract: true`); o backend limpa UUID e `broker_order_id` e chama
+   `apply_marketing_score_removal` uma vez. O publish do placar usa
+   `trust_local_score=True` para o reconcile “nunca rebaixa” não readotar
+   o Redis antigo e desfazer a exclusão no overlay.
 3. Texto de ajuda no lead: “Shift+O ativo: você pode excluir operações abaixo.”
-4. No painel Shift+O, use a aba **Histórico** (ou o atalho “Ver histórico”
-   nas abas Manual/Placar) para editar/excluir sem depender de scroll longo.
+4. No painel Shift+O, use a aba **↓ Histórico** (ou o atalho com seta
+   “Ir para histórico — editar / excluir” nas abas Manual/Placar) para
+   editar/excluir sem depender de scroll longo.
 
 O `{id}` pode ser:
 
@@ -81,9 +115,10 @@ próximo carregamento da tela (F5) ou depois de um restart:
 Regra: **toda** exclusão ou sincronização de histórico precisa alinhar as três.
 
 - `delete_marketing_robot_history_item` remove a operação nas três.
-- `sync_marketing_display_to_robot` reescreve `robot_trade_history`, limpa o
-  espelho de restauração e substitui a memória (`auto_trader.replace_history`)
-  pela lista sincronizada.
+- `sync_marketing_display_to_robot` faz **upsert** das operações simuladas
+  em `robot_trade_history` e **mescla** a memória do `auto_trader`. Não chama
+  mais `clear_trade_history` / `clear_finished_trades` — o histórico antigo
+  permanece. O overlay recebe o placar do lote (gerar) ou soma (criar).
 
 ## Operação ao vivo espelhada no Shift+O
 
@@ -120,6 +155,30 @@ Para limpar histórico junto com o ciclo, use o fluxo de
 
 ## Histórico
 
+- **2026-08-27 (seta ↓ no Shift+O)** — Abas Manual / Placar / ↓ Histórico
+  restauradas no painel lateral; exclusão sem scroll pelos formulários.
+  Ver `MARKETING_SIMULATION.md`.
+- **2026-08-26 (exclusão × reconcile)** — Excluir operação marketing baixava
+  memória e depois `publish_robot_control_snapshot` readotava o Redis antigo
+  via reconcile “nunca rebaixa”, e o placar do overlay não mudava. Agora
+  `trust_local_score=True` no publish pós-exclusão/`apply_score`, com persist
+  antes do Redis. Ver `PLACAR_OVERLAY.md`.
+- **2026-08-21 (placar na exclusão + start)** — Excluir operação marketing
+  passa a baixar o placar do El Capo; start/stop não republicam 0-0 do
+  gateway. Ver `PLACAR_OVERLAY.md` e `MARKETING_SIMULATION.md`.
+- **2026-08-18 (dia civil em Brasília)** — Filtro “Hoje”, agrupamento da
+  tabela e `?days=` passam a usar meia-noite a meia-noite de Brasília. Ver
+  [`DATAS_BRASILIA.md`](./DATAS_BRASILIA.md).
+- **2026-08-16 (simular sem apagar histórico)** — Generate/create de marketing
+  deixam de zerar `robot_trade_history`. Ver `MARKETING_SIMULATION.md`.
+- **2026-08-07 (revisão visual WIN/LOSS + isolamento de sessão)** — Leads
+  relataram operação perdida aparecendo como WIN. Auditoria de 500 operações
+  reais não achou `result`/`profit` inconsistentes, mas achou e corrigiu uma
+  falha de desenho real (`socket_option_closed`/`order_binary` globais entre
+  sessões no `bullex-service` — ver `ROBO_E_SUPORTE.md` §9 e
+  `PERFORMANCE_SISTEMA.md`). Documentado também que o badge do overlay em
+  sequências de Gale reflete só a última entrada, não o líquido do ciclo
+  (ver seção "Gale" acima).
 - **2026-08-03 (lixeira em tela pequena)** — Shift+O ganhou abas Manual /
   Placar / Histórico; coluna Ações sticky à esquerda em `/history`. Ver
   `MARKETING_SIMULATION.md`.

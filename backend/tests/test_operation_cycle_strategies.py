@@ -4,7 +4,18 @@ from __future__ import annotations
 
 import unittest
 
-from backend import main
+from backend import main, signal_engine
+
+_VERTEX_ORIGINAL = signal_engine.VERTEX_ENABLED
+
+
+def setUpModule() -> None:
+    """Desliga a Vertex: aqui se testa o motor clássico. Ver test_named_strategies."""
+    signal_engine.VERTEX_ENABLED = False
+
+
+def tearDownModule() -> None:
+    signal_engine.VERTEX_ENABLED = _VERTEX_ORIGINAL
 from backend.signal_engine import (
     analyze_signal,
     cycle_minutes_for_timeframe,

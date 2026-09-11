@@ -21,7 +21,7 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   adminApproveClient,
@@ -51,6 +51,11 @@ import {
   validateAdminPassword,
 } from "@/lib/adminPresentation";
 import { normalizeListPayload } from "@/lib/financePresentation";
+import { formatBrasiliaDate, formatBrasiliaDateTime } from "@/lib/brasiliaTime";
+import {
+  remainingDaysFromExpiresAt,
+  trialDaysFromExpiresAt,
+} from "@/lib/trial";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
 import { AdminAccessTabs } from "@/components/AdminAccessTabs";
 import {
@@ -334,6 +339,18 @@ function ClientCard({
             <ClientMeta label="ID Trader" value={client.trader_id || "Não informado"} />
             <ClientMeta label="Criação" value={formatDate(client.created_at)} />
             <ClientMeta label="Plano" value={client.plan_name || "A definir"} />
+            {client.account_type === "trial" && client.expires_at ? (
+              <>
+                <ClientMeta
+                  label="Dias restantes"
+                  value={`${remainingDaysFromExpiresAt(client.expires_at)} dia(s)`}
+                />
+                <ClientMeta
+                  label="Expira em"
+                  value={formatBrasiliaDateTime(client.expires_at)}
+                />
+              </>
+            ) : null}
           </dl>
         </div>
       </div>
@@ -488,18 +505,28 @@ function ClientDialog({
   onSaved: () => void;
 }) {
   const editing = client != null;
-  const [form, setForm] = useState({
-    name: client?.name ?? "",
-    email: client?.email ?? "",
-    phone: client?.phone ?? "",
-    traderId: client?.trader_id ?? "",
-    password: "",
-    accountType: client?.account_type ?? ("trial" as AccountType),
-    trialDays: "7",
-    paymentStatus: client?.payment_status ?? ("not_required" as PaymentStatus),
-    planId: client?.plan_id ?? "",
-    marketingWinRate: String(client?.marketing_win_rate ?? 80),
-  });
+  const initialForm = useMemo(
+    () => ({
+      name: client?.name ?? "",
+      email: client?.email ?? "",
+      phone: client?.phone ?? "",
+      traderId: client?.trader_id ?? "",
+      password: "",
+      accountType: client?.account_type ?? ("trial" as AccountType),
+      trialDays: trialDaysFromExpiresAt(client?.expires_at),
+      paymentStatus: client?.payment_status ?? ("not_required" as PaymentStatus),
+      planId: client?.plan_id ?? "",
+      marketingWinRate: String(client?.marketing_win_rate ?? 80),
+    }),
+    [client],
+  );
+  const [form, setForm] = useState(initialForm);
+  const initialTrialDaysRef = useRef(initialForm.trialDays);
+
+  useEffect(() => {
+    setForm(initialForm);
+    initialTrialDaysRef.current = initialForm.trialDays;
+  }, [initialForm]);
   const plans = useQuery({
     queryKey: ["billing", "plans"],
     queryFn: async () => {
@@ -514,6 +541,7 @@ function ClientDialog({
         const passwordError = validateAdminPassword(form.password);
         if (passwordError) throw new Error(passwordError);
       }
+      const trialDaysChanged = form.trialDays !== initialTrialDaysRef.current;
       const payload: AdminClientPayload = {
         name: form.name.trim(),
         email: form.email.trim(),
@@ -521,7 +549,6 @@ function ClientDialog({
         trader_id: form.traderId.trim(),
         password: form.password,
         account_type: form.accountType,
-        trial_days: form.accountType === "trial" ? Number(form.trialDays) : null,
         payment_status:
           form.accountType === "trial" || form.accountType === "marketing"
             ? "not_required"
@@ -530,6 +557,13 @@ function ClientDialog({
         marketing_mode: form.accountType === "marketing" ? "simulation" : null,
         marketing_win_rate: form.accountType === "marketing" ? Number(form.marketingWinRate) : null,
       };
+      if (form.accountType === "trial") {
+        if (!editing || trialDaysChanged) {
+          payload.trial_days = Number(form.trialDays);
+        }
+      } else {
+        payload.trial_days = null;
+      }
       const response = editing
         ? await adminUpdateClient(client.id, {
             ...payload,
@@ -914,11 +948,7 @@ function ErrorNotice({ error }: { error: unknown }) {
 function formatDate(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("pt-BR", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  }).format(date);
+  return formatBrasiliaDate(date);
 }
 
 function formatPlanPrice(value: number, currency: string) {

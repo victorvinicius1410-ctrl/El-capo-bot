@@ -13,6 +13,7 @@ describe("shouldAutoReconnectBullex", () => {
   const base = {
     connected: false,
     credentialsSaved: true,
+    robotEnabled: true,
     alreadyAttempted: false,
     pendingConnect: false,
     stillLoading: false,
@@ -44,7 +45,15 @@ describe("shouldAutoReconnectBullex", () => {
     assert.equal(shouldAutoReconnectBullex({ ...base, pendingConnect: true }), false);
   });
 
-  it("não dispara após Desconectar Bullex manual (60s)", () => {
+  it("não dispara com o robô desligado, mesmo com login salvo", () => {
+    // Relato do dono (09/08 e 10/08): "entro em configurações, não clico em
+    // nada e depois de uns segundos a Bullex conecta sozinha". Abrir a página
+    // não é intenção de conectar — só o robô ligado justifica reconexão.
+    resetManualBullexDisconnectForTests();
+    assert.equal(shouldAutoReconnectBullex({ ...base, robotEnabled: false }), false);
+  });
+
+  it("não dispara após Desconectar Bullex manual (a marca não expira)", () => {
     resetManualBullexDisconnectForTests();
     markManualBullexDisconnect();
     assert.equal(shouldAutoReconnectBullex(base), false);

@@ -120,7 +120,56 @@ class MarketingSimulationManagementApiTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 204)
         history = self.client.get("/marketing-simulation/history")
         self.assertEqual(history.json()["data"], [])
-        self.assertGreaterEqual(len(self.sync_calls), 2)
+        self.assertGreaterEqual(len(self.sync_calls), 1)
+
+    def test_historico_do_painel_nao_pode_ser_truncado(self) -> None:
+        """Regressão: o painel Shift+O perdia as operações NOVAS.
+
+        ``/marketing-simulation/history`` era o único dos cinco chamadores de
+        ``list_simulated_trades`` que não passava ``limit``, caindo no default
+        100 do repositório. No Supabase a ordem é ``synthetic_sequence.asc``,
+        então o corte ficava com as 100 mais ANTIGAS: em 01/09 a conta
+        `81c49f33` tinha 525 sintéticas e o painel mostrava só as de 26/07 a
+        30/07, sumindo com 425.
+
+        Nenhum teste pegou porque o dublê em memória faz ``[-limit:]`` — corta
+        pela outra ponta e devolve as mais novas. Este teste falha nos dois
+        repositórios: só passa quando nada é truncado.
+        """
+        total = 150
+        for index in range(total):
+            self._seed(
+                trade={
+                    **self.trade,
+                    "id": f"trade-{index}",
+                    "created_at": f"2026-07-21T12:{index % 60:02d}:00+00:00",
+                }
+            )
+
+        history = self.client.get("/marketing-simulation/history")
+
+        self.assertEqual(history.status_code, 200)
+        devolvidos = history.json()["data"]
+        self.assertEqual(len(devolvidos), total)
+        ids = {item["id"] for item in devolvidos}
+        self.assertIn("trade-0", ids)
+        self.assertIn(f"trade-{total - 1}", ids)
+
+    def test_listar_historico_nao_corrompe_o_placar(self) -> None:
+        """O ``replace_history`` do endpoint recalculava o placar na fatia cortada.
+
+        Abrir a aba Histórico reescrevia o estado do simulador com o que a
+        listagem devolvesse. Truncada, o placar exibido encolhia junto.
+        """
+        total = 150
+        for index in range(total):
+            self._seed(trade={**self.trade, "id": f"trade-{index}"})
+
+        self.client.get("/marketing-simulation/history")
+        stats = self.client.get("/marketing-simulation/stats")
+
+        self.assertEqual(stats.status_code, 200)
+        self.assertEqual(stats.json()["data"]["total_trades"], total)
 
     def test_non_marketing_account_cannot_list_edit_or_delete(self) -> None:
         self._seed()
@@ -374,8 +423,8 @@ class MarketingSimulationManagementApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
 
-    def test_generate_history_from_score_replaces_and_syncs(self) -> None:
-        """Placar desejado gera o histórico completo automaticamente."""
+    def test_generate_history_from_score_appends_and_syncs_new_scoreboard(self) -> None:
+        """Gera o placar novo e preserva operações sintéticas já existentes."""
         self._seed()
 
         generated = self.client.post(
@@ -392,7 +441,6 @@ class MarketingSimulationManagementApiTests(unittest.TestCase):
         self.assertEqual(generated.status_code, 201)
         data = generated.json()["data"]
         self.assertEqual(len(data), 4)
-        self.assertEqual(sum(1 for item in data if item["result"] == "WIN"), 3)
         self.assertEqual(sum(1 for item in data if item["result"] == "LOSS"), 1)
         created_ats = [item["created_at"] for item in data]
         self.assertEqual(created_ats, sorted(created_ats))
@@ -405,15 +453,18 @@ class MarketingSimulationManagementApiTests(unittest.TestCase):
             else:
                 self.assertEqual(item["profit"], -10)
 
-        self.assertGreaterEqual(len(self.payout_calls), 1)
-        stats = self.client.get("/marketing-simulation/stats")
-        self.assertEqual(stats.json()["data"]["wins"], 3)
-        self.assertEqual(stats.json()["data"]["losses"], 1)
-        self.assertEqual(stats.json()["data"]["profit"], round(3 * 8.7 - 10, 2))
-        self.assertGreaterEqual(len(self.sync_calls), 1)
-
         history = self.client.get("/marketing-simulation/history")
-        self.assertEqual(len(history.json()["data"]), 4)
+        self.assertEqual(len(history.json()["data"]), 5)
+        stats = self.client.get("/marketing-simulation/stats")
+        self.assertEqual(stats.json()["data"]["wins"], 4)
+        self.assertEqual(stats.json()["data"]["losses"], 1)
+        self.assertGreaterEqual(len(self.sync_calls), 1)
+        synced_history = self.sync_calls[-1][1]
+        synced_stats = self.sync_calls[-1][2]
+        self.assertEqual(len(synced_history), 4)
+        self.assertEqual(synced_stats["wins"], 3)
+        self.assertEqual(synced_stats["losses"], 1)
+        self.assertNotEqual(synced_stats.get("accumulate"), True)
 
     def test_generate_history_rejects_empty_or_oversized_score(self) -> None:
         for payload in (
@@ -511,11 +562,75 @@ class MarketingSimulationManagementApiTests(unittest.TestCase):
         parsed = [datetime.fromisoformat(item) for item in stamps]
         self.assertEqual(parsed, sorted(parsed))
         self.assertLessEqual(parsed[-1], now)
-        # Cadência = duração da vela M5 (300s); 3 intervalos ±20% de jitter.
         cadence = MarketingSimulationService.PERIOD_SECONDS["M5"]
+        min_gap, max_gap = MarketingSimulationService.GAP_MULTIPLIER_RANGE["M5"]
+        gaps = [
+            (parsed[index + 1] - parsed[index]).total_seconds()
+            for index in range(len(parsed) - 1)
+        ]
+        for gap in gaps:
+            self.assertGreater(gap, cadence * min_gap * 0.85)
+            self.assertLess(gap, cadence * max_gap * 1.25 + 200)
         span_seconds = (parsed[-1] - parsed[0]).total_seconds()
-        self.assertLess(span_seconds, cadence * 4)
-        self.assertGreater(span_seconds, cadence * 1.5)
+        self.assertGreater(span_seconds, cadence * min_gap)
+
+    def test_next_trade_includes_simulated_strategy(self) -> None:
+        from backend.marketing_simulation_service import MarketingSimulationService
+
+        service = MarketingSimulationService(seed="strategy", target_win_rate=80)
+        trade = service.next_trade(
+            amount=10,
+            payout=85,
+            asset="EURUSD-OTC",
+            direction="CALL",
+            result="WIN",
+            period="M5",
+        )
+        self.assertTrue(str(trade.get("strategy_name") or "").strip())
+        self.assertTrue(str(trade.get("strategy_summary") or "").strip())
+        self.assertEqual(trade.get("timeframe"), "M5")
+        self.assertIn(trade.get("strategy_key"), {
+            "RETRACEMENT_SR",
+            "EXHAUSTION_REVERSAL",
+            "CANDLE_FLOW",
+            "CONTINUATION",
+        })
+
+    def test_enrich_trade_with_strategy_is_deterministic(self) -> None:
+        from backend.marketing_simulation_service import MarketingSimulationService
+
+        trade = {
+            "id": "11111111-2222-4333-8444-555555555555",
+            "result": "WIN",
+            "asset": "EURUSD-OTC",
+            "direction": "PUT",
+            "amount": 10.0,
+            "payout": 85,
+            "profit": 8.5,
+            "created_at": "2026-07-21T12:00:00+00:00",
+        }
+        first = MarketingSimulationService.enrich_trade_with_strategy(trade, period="M5")
+        second = MarketingSimulationService.enrich_trade_with_strategy(trade, period="M5")
+        self.assertEqual(first["strategy_name"], second["strategy_name"])
+        self.assertEqual(first["strategy_key"], second["strategy_key"])
+        self.assertEqual(first["timeframe"], "M5")
+
+    def test_create_trade_response_includes_strategy(self) -> None:
+        created = self.client.post(
+            "/marketing-simulation/trades",
+            json={
+                "amount": 10,
+                "payout": 85,
+                "asset": "EURUSD-OTC",
+                "direction": "CALL",
+                "result": "WIN",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        data = created.json()["data"]
+        self.assertTrue(str(data.get("strategy_name") or "").strip())
+        self.assertTrue(str(data.get("strategy_summary") or "").strip())
+        self.assertEqual(data.get("timeframe"), "M5")
 
 
 class SupabaseMarketingSimulationRepositoryTests(unittest.IsolatedAsyncioTestCase):

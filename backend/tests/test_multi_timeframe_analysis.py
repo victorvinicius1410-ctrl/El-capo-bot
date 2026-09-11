@@ -1,7 +1,18 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from backend import main
+from backend import main, signal_engine
+
+_VERTEX_ORIGINAL = signal_engine.VERTEX_ENABLED
+
+
+def setUpModule() -> None:
+    """Desliga a Vertex: aqui se testa o motor clássico. Ver test_named_strategies."""
+    signal_engine.VERTEX_ENABLED = False
+
+
+def tearDownModule() -> None:
+    signal_engine.VERTEX_ENABLED = _VERTEX_ORIGINAL
 from backend.signal_engine import (
     ANALYSIS_TIMEFRAMES,
     MIN_MTF_CONFLUENCE,
@@ -226,7 +237,14 @@ class TestClassicStrategyOperationalRanking(unittest.IsolatedAsyncioTestCase):
             main.candidate_rank(weaker),
         )
 
-    def test_resolve_cycle_entry_allows_fallback_at_seventy(self) -> None:
+    def test_resolve_cycle_entry_fallback_respeita_o_piso_do_usuario(self) -> None:
+        """Política revogada em 10/09: o fallback NÃO tem mais piso 70 fixo.
+
+        Com o painel em 80, um candidato de 72 executava ordem por este ramo —
+        aconteceu em produção com R$ 200 numa conta configurada para 80. O piso
+        agora é o do usuário; só a entrada de demonstração desce para 60, via
+        `live_min_confidence`.
+        """
         state = main.auto_trader.start("user-classic-fallback")
         state.min_confidence = 80
         state.min_payout = 80
@@ -249,12 +267,26 @@ class TestClassicStrategyOperationalRanking(unittest.IsolatedAsyncioTestCase):
             "blocked_filters": [],
         }
 
-        selected = main.resolve_cycle_entry_candidate(state)
+        # 72 < 80: nenhum dos dois ramos pode liberar.
+        self.assertIsNone(main.resolve_cycle_entry_candidate(state))
 
+        # Sem candidato estrito, o fallback passa a valer — e com o painel em
+        # 70 o candidato de 72 é liberado por ele.
+        state.cycle_best_trade_candidate = None
+        state.min_confidence = 70
+        selected = main.resolve_cycle_entry_candidate(state)
         self.assertIsNotNone(selected)
         assert selected is not None
         self.assertEqual(selected["symbol"], "GBPUSD-OTC")
         self.assertTrue(selected.get("fallback_candidate_used"))
+
+        # Modo LIVE continua com o piso próprio de 60, mesmo com o painel em 80.
+        state.min_confidence = 80
+        state.cycle_best_candidate = dict(
+            state.cycle_best_candidate, confidence=62, strategy_score=62, live_demo=True
+        )
+        vivo = main.resolve_cycle_entry_candidate(state)
+        self.assertIsNotNone(vivo)
 
     async def test_ranked_confirmation_skips_mtf_gate_for_classic_strategy(self) -> None:
         candidates = [

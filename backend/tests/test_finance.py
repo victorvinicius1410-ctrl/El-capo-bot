@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -18,6 +18,7 @@ from backend.finance_models import BillingPlanCreate, BillingPlanUpdate
 from backend.finance_repository import InMemoryFinanceRepository
 from backend.finance_router import create_finance_router
 from backend.finance_service import FinanceService, FinanceValidationError
+from backend.webhook_models import DomainEventType
 
 
 COMPANY_ID = "00000000-0000-0000-0000-000000000001"
@@ -163,6 +164,135 @@ class FinanceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
         self.assertEqual(self.repository.events[0].user_id, "buyer-new")
 
+    async def test_purchase_grants_access_before_ledger_when_append_fails(self) -> None:
+        """Regressão: compra aprovada libera acesso mesmo se o ledger falhar depois."""
+        links = AsyncMock()
+        links.create_purchase_account = AsyncMock(
+            return_value=AccountLink(
+                user_id="buyer-ledger-fail",
+                company_id=COMPANY_ID,
+                action_link="https://app.example.com/reset-password?token=one-time",
+            )
+        )
+        repository = InMemoryFinanceRepository()
+        repository.append_event = AsyncMock(side_effect=RuntimeError("ledger unavailable"))
+        service = FinanceService(repository, account_links=links)
+        await service.create_plan(self.owner, plan_payload())
+        payload = cakto_payload("purchase_approved")
+        payload["data"] = {
+            **payload["data"],  # type: ignore[arg-type]
+            "id": "payment-ledger-fail",
+            "customer": {"email": "ledgerfail@example.com", "name": "Ledger Fail"},
+        }
+
+        with self.assertRaises(RuntimeError):
+            await service.process_cakto_event(payload)
+
+        customer = repository.customers[(COMPANY_ID, "buyer-ledger-fail")]
+        self.assertTrue(customer["grant_access"])
+        self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
+
+    async def test_duplicate_purchase_approved_heals_inactive_customer(self) -> None:
+        """Reprocessamento idempotente reativa cliente deixado pendente na 1ª tentativa."""
+        links = AsyncMock()
+        links.create_purchase_account = AsyncMock(
+            return_value=AccountLink(
+                user_id="buyer-heal",
+                company_id=COMPANY_ID,
+                action_link="https://app.example.com/reset-password?token=heal",
+            )
+        )
+        repository = InMemoryFinanceRepository()
+        service = FinanceService(repository, account_links=links)
+        await service.create_plan(self.owner, plan_payload())
+        payload = cakto_payload("purchase_approved")
+        payload["data"] = {
+            **payload["data"],  # type: ignore[arg-type]
+            "id": "payment-heal",
+            "customer": {"email": "heal@example.com", "name": "Heal Me"},
+        }
+
+        await service.process_cakto_event(payload)
+        repository.customers[(COMPANY_ID, "buyer-heal")]["grant_access"] = False
+        repository.customers[(COMPANY_ID, "buyer-heal")]["payment_status"] = (
+            PaymentStatus.PENDING
+        )
+
+        second = await service.process_cakto_event(payload)
+
+        self.assertFalse(second.processed)
+        self.assertTrue(second.duplicate)
+        customer = repository.customers[(COMPANY_ID, "buyer-heal")]
+        self.assertTrue(customer["grant_access"])
+        self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
+
+    async def test_existing_account_purchase_emits_existing_account_email_event(self) -> None:
+        """Quem já tem perfil recebe o evento de compra com conta existente, sem link de senha."""
+        webhooks = AsyncMock()
+        webhooks.enqueue_event = AsyncMock(return_value=AsyncMock(id="evt-existing"))
+        webhooks.queue_event_deliveries = AsyncMock()
+        service = FinanceService(self.repository, webhooks=webhooks)
+
+        await service.process_cakto_event(cakto_payload("purchase_approved"))
+
+        kwargs = webhooks.enqueue_event.await_args.kwargs
+        self.assertEqual(
+            kwargs["event_type"],
+            DomainEventType.PURCHASE_EXISTING_ACCOUNT,
+        )
+        self.assertNotIn("first_access_url", kwargs["data"])
+
+    async def test_new_buyer_emits_purchase_completed_email_event(self) -> None:
+        """Primeira compra cria conta e dispara o e-mail de boas-vindas com first_access_url."""
+        links = AsyncMock()
+        links.create_purchase_account = AsyncMock(
+            return_value=AccountLink(
+                user_id="buyer-welcome",
+                company_id=COMPANY_ID,
+                action_link="https://app.example.com/reset-password?token=one-time",
+            )
+        )
+        webhooks = AsyncMock()
+        webhooks.enqueue_event = AsyncMock(return_value=AsyncMock(id="evt-new"))
+        webhooks.queue_event_deliveries = AsyncMock()
+        service = FinanceService(
+            self.repository,
+            webhooks=webhooks,
+            account_links=links,
+        )
+        payload = cakto_payload("purchase_approved")
+        payload["data"] = {
+            **payload["data"],  # type: ignore[arg-type]
+            "id": "payment-welcome-buyer",
+            "customer": {"email": "welcome@example.com", "name": "Novo"},
+        }
+
+        await service.process_cakto_event(payload)
+
+        kwargs = webhooks.enqueue_event.await_args.kwargs
+        self.assertEqual(kwargs["event_type"], DomainEventType.PURCHASE_COMPLETED)
+        self.assertEqual(
+            kwargs["data"]["first_access_url"],
+            "https://app.example.com/reset-password?token=one-time",
+        )
+
+    async def test_subscription_renewed_emits_renewed_email_event(self) -> None:
+        """Renovação Cakto dispara o evento de assinatura renovada."""
+        webhooks = AsyncMock()
+        webhooks.enqueue_event = AsyncMock(return_value=AsyncMock(id="evt-renew"))
+        webhooks.queue_event_deliveries = AsyncMock()
+        service = FinanceService(self.repository, webhooks=webhooks)
+        payload = cakto_payload("subscription_renewed")
+        payload["data"] = {
+            **payload["data"],  # type: ignore[arg-type]
+            "id": "payment-renew-1",
+        }
+
+        await service.process_cakto_event(payload)
+
+        kwargs = webhooks.enqueue_event.await_args.kwargs
+        self.assertEqual(kwargs["event_type"], DomainEventType.SUBSCRIPTION_RENEWED)
+
     async def test_access_is_revoked_for_negative_events(self) -> None:
         """Reembolso, chargeback, cancelamento e recusa nunca mantêm acesso."""
         expected = {
@@ -222,6 +352,66 @@ class FinanceServiceTests(unittest.IsolatedAsyncioTestCase):
         customer = self.repository.customers[(COMPANY_ID, "client-a")]
         self.assertEqual(customer["payment_status"], PaymentStatus.PENDING)
         self.assertFalse(customer["grant_access"])
+
+    async def test_subscription_created_after_purchase_keeps_paid(self) -> None:
+        """Regressão: subscription_created pós-venda não rebaixa para 'Ainda não pagou'."""
+        await self.service.process_cakto_event(cakto_payload("purchase_approved"))
+        customer = self.repository.customers[(COMPANY_ID, "client-a")]
+        self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
+        self.assertTrue(customer["grant_access"])
+
+        created = cakto_payload("subscription_created")
+        created["data"] = {
+            **created["data"],  # type: ignore[arg-type]
+            "id": "payment-purchase_approved",
+            "subscription": {"id": "subscription-after-sale"},
+            "createdAt": "2026-07-18T10:00:01Z",
+        }
+        await self.service.process_cakto_event(created)
+
+        customer = self.repository.customers[(COMPANY_ID, "client-a")]
+        self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
+        self.assertTrue(customer["grant_access"])
+
+    async def test_pix_gerado_after_purchase_does_not_downgrade_paid(self) -> None:
+        """Novo PIX gerado não pode apagar status pago de compra já aprovada."""
+        await self.service.process_cakto_event(cakto_payload("purchase_approved"))
+        pix = cakto_payload("pix_gerado")
+        pix["data"] = {
+            **pix["data"],  # type: ignore[arg-type]
+            "id": "pix-after-paid",
+            "createdAt": "2026-07-18T10:05:00Z",
+        }
+        await self.service.process_cakto_event(pix)
+
+        customer = self.repository.customers[(COMPANY_ID, "client-a")]
+        self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
+        self.assertTrue(customer["grant_access"])
+
+    async def test_subscription_created_before_purchase_then_paid(self) -> None:
+        """Ordem Cakto inversa: created primeiro, approved depois → termina pago."""
+        created = cakto_payload("subscription_created")
+        created["data"] = {
+            **created["data"],  # type: ignore[arg-type]
+            "id": "order-race-1",
+            "subscription": {"id": "sub-race-1"},
+        }
+        await self.service.process_cakto_event(created)
+        customer = self.repository.customers[(COMPANY_ID, "client-a")]
+        self.assertEqual(customer["payment_status"], PaymentStatus.PENDING)
+        self.assertFalse(customer["grant_access"])
+
+        approved = cakto_payload("purchase_approved")
+        approved["data"] = {
+            **approved["data"],  # type: ignore[arg-type]
+            "id": "order-race-1",
+            "subscription": {"id": "sub-race-1"},
+            "createdAt": "2026-07-18T10:00:02Z",
+        }
+        await self.service.process_cakto_event(approved)
+        customer = self.repository.customers[(COMPANY_ID, "client-a")]
+        self.assertEqual(customer["payment_status"], PaymentStatus.PAID)
+        self.assertTrue(customer["grant_access"])
 
     async def test_marketing_or_not_required_account_is_not_changed(self) -> None:
         """Webhook financeiro não altera perfis especiais."""
@@ -375,13 +565,16 @@ class FinanceServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_metrics_are_tenant_scoped_and_use_financial_ledger(self) -> None:
         """Métricas não misturam tenants nem resultados do robô."""
-        await self.service.process_cakto_event(cakto_payload("purchase_approved"))
+        recent = datetime.now(timezone.utc) - timedelta(days=2)
+        payload = cakto_payload("purchase_approved")
+        payload["data"]["createdAt"] = recent.isoformat()  # type: ignore[index]
+        await self.service.process_cakto_event(payload)
         refund_payload = cakto_payload("refund")
         refund_payload["data"] = {
             **refund_payload["data"],  # type: ignore[arg-type]
             "id": "refund-1",
             "amount": 20,
-            "refundedAt": "2026-07-18T10:01:00Z",
+            "refundedAt": (recent + timedelta(minutes=1)).isoformat(),
         }
         await self.service.process_cakto_event(refund_payload)
         metrics = await self.service.get_metrics(self.owner, days=30)

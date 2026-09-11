@@ -4,8 +4,10 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  ROBOT_AVATAR_ALPHA_STACK_SRC,
   ROBOT_AVATAR_COLOR_FILTER,
   ROBOT_AVATAR_CSS_FILTER,
+  ROBOT_AVATAR_STILL_SRC,
   ROBOT_AVATAR_WEBM_SRC,
   isRobotAvatarVideoFilterUnreliable,
   resolveRobotAvatarPipeline,
@@ -19,6 +21,11 @@ describe("robotAvatarVisual — constantes oficiais", () => {
     assert.match(ROBOT_AVATAR_COLOR_FILTER, /hue-rotate\(175deg\)/);
     assert.match(ROBOT_AVATAR_COLOR_FILTER, /saturate\(1\.35\)/);
     assert.match(ROBOT_AVATAR_CSS_FILTER, /37,\s*219,\s*224/);
+  });
+
+  it("expõe o vídeo empilhado e o frame estático usados no WebKit", () => {
+    assert.equal(ROBOT_AVATAR_ALPHA_STACK_SRC, "/robo-wink-alpha-stack.webm");
+    assert.equal(ROBOT_AVATAR_STILL_SRC, "/robo-wink-still.png");
   });
 
   it("detecta Safari/iOS como motor sem filtro confiável em <video>", () => {
@@ -81,6 +88,13 @@ describe("visual do overlay do robô (cross-platform)", () => {
     assert.match(avatar, /drawImage/);
     assert.match(avatar, /robot-avatar-video/);
     assert.doesNotMatch(avatar, /robo-wink-classic/);
+
+    // Safari descarta o alfa do WebM: o canvas remonta a transparência a
+    // partir da máscara empilhada, senão volta o quadrado atrás do robô.
+    assert.match(avatar, /ROBOT_AVATAR_ALPHA_STACK_SRC/);
+    assert.match(avatar, /getImageData/);
+    assert.match(avatar, /putImageData/);
+    assert.match(avatar, /ROBOT_AVATAR_STILL_SRC/);
 
     assert.match(styles, /\.robot-avatar-video/);
     assert.match(styles, /\.robot-avatar-source/);

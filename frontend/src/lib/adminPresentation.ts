@@ -49,6 +49,58 @@ export function canUseRobotControls(supportSession: boolean): boolean {
   return !supportSession;
 }
 
+export interface LiveTradingShellFlags {
+  impersonating: boolean;
+  isAdminRoute: boolean;
+  accessReady: boolean;
+  hasOperationalAccess: boolean;
+}
+
+/**
+ * Decide se o `LiveTradingDataProvider` deve envolver o AppShell.
+ *
+ * Dashboard, Configurações e Histórico chamam `useLiveTradingData()` sempre que
+ * a rota autenticada renderiza o `<Outlet />`. Sem o provider a página explode
+ * com “precisa ser usado dentro de LiveTradingDataProvider” — inclusive quando
+ * `/me/access` falha, o lead está inativo/pendente ou o admin está em sessão de
+ * suporte (overlay oculto, mas o hook do dashboard continua montado).
+ *
+ * Por isso, fora de `/admin/*`, o provider **sempre** monta. Overlay e controles
+ * do robô continuam gated por `shouldShowRobotOverlay` / `hasOperationalAccess`.
+ *
+ * Em `/admin/*` o provider permanece desligado (performance da navegação).
+ */
+export function shouldMountLiveTradingProvider(input: LiveTradingShellFlags): boolean {
+  if (input.isAdminRoute) return false;
+  return true;
+}
+
+/**
+ * Overlay flutuante do robô: só com acesso operacional confirmado, fora de
+ * `/admin/*` e fora da sessão de suporte (controles bloqueados).
+ */
+export function shouldShowRobotOverlay(input: {
+  impersonating: boolean;
+  isAdminRoute: boolean;
+  hasOperationalAccess: boolean;
+}): boolean {
+  return input.hasOperationalAccess && !input.impersonating && !input.isAdminRoute;
+}
+
+/**
+ * Overlay “assinatura inativa / aguardando aprovação”. Sessão de suporte
+ * nunca entra aqui — o admin precisa ver o dashboard do lead mesmo sem
+ * `grant_access`.
+ */
+export function shouldTreatSessionAsInactive(input: {
+  impersonating: boolean;
+  accessReady: boolean;
+  hasOperationalAccess: boolean;
+}): boolean {
+  if (input.impersonating) return false;
+  return input.accessReady && !input.hasOperationalAccess;
+}
+
 /**
  * Lista rotas visitáveis durante um acesso temporário de suporte
  * (impersonation). Fora do modo restrito, todas as rotas são permitidas.

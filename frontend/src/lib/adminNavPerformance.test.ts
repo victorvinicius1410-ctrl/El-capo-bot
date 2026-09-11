@@ -22,11 +22,14 @@ describe("admin nav performance contracts", () => {
     assert.match(cancellation, /export function isQueryCancellationError/);
   });
 
-  it("AppShell desliga robô em rotas /admin", () => {
+  it("AppShell desliga robô em rotas /admin e monta provider na sessão de suporte", () => {
     const shell = readFileSync(join(here, "../components/AppShell.tsx"), "utf8");
     assert.match(shell, /pathname\.startsWith\("\/admin"\)/);
-    assert.match(shell, /!isAdminRoute/);
+    assert.match(shell, /shouldMountLiveTradingProvider/);
+    assert.match(shell, /shouldShowRobotOverlay/);
+    assert.match(shell, /shouldTreatSessionAsInactive/);
     assert.match(shell, /meAccessQueryOptions\(\)/);
+    assert.doesNotMatch(shell, /mountLiveTrading = !impersonating/);
   });
 
   it("QueryClient tem staleTime default e preload delay", () => {

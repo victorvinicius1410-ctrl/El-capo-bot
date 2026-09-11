@@ -34,6 +34,10 @@ export function meAccessQueryOptions() {
     queryKey: ME_ACCESS_QUERY_KEY,
     queryFn: async (): Promise<MyAccessData> => {
       const response = await getMyAccess();
+      // Guardado antes dos guards: depois deles o tipo estreita para `never` e
+      // `response.status` deixa de existir, embora o payload vazio ainda possa
+      // chegar em tempo de execucao.
+      const httpStatus = response.status;
       if (!response.ok) {
         throw new ApiError(
           response.error || "Falha ao carregar perfil de acesso",
@@ -42,7 +46,7 @@ export function meAccessQueryOptions() {
         );
       }
       if (!response.data) {
-        throw new ApiError("Perfil de acesso vazio", "ME_ACCESS_EMPTY", response.status);
+        throw new ApiError("Perfil de acesso vazio", "ME_ACCESS_EMPTY", httpStatus);
       }
       return response.data;
     },

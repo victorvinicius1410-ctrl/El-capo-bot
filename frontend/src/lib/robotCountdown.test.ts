@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getStoppedRobotState, liveDisplayCountdownSeconds, type RobotState } from "./robotState.ts";
+import {
+  getStoppedRobotState,
+  isRobotOperationRunning,
+  liveDisplayCountdownSeconds,
+  type RobotState,
+} from "./robotState.ts";
 
 function withCountdown(
   overrides: Partial<RobotState> & {
@@ -17,6 +22,15 @@ function withCountdown(
     ...overrides,
   };
 }
+
+describe("isRobotOperationRunning", () => {
+  it("usa só enabled — worker_running sozinho não mantém Parar", () => {
+    assert.equal(isRobotOperationRunning({ enabled: true, worker_running: false }), true);
+    assert.equal(isRobotOperationRunning({ enabled: false, worker_running: true }), false);
+    assert.equal(isRobotOperationRunning({ enabled: false, worker_running: false }), false);
+    assert.equal(isRobotOperationRunning(null), false);
+  });
+});
 
 describe("liveDisplayCountdownSeconds", () => {
   it("decai a cada segundo com base em fetched_at quando não há next_cycle_at", () => {

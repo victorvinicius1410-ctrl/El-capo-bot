@@ -1,13 +1,8 @@
 # Memória de padrões — El Capo
 
-Documento criado em **2026-07-31**. Atualizado em **2026-08-04** (anti-loss
-estrutural complementar). Complementa a estratégia clássica com um portão
-estatístico que aprende quais contextos geram mais WIN ou LOSS.
-
-Desde 2026-08-04, alguns padrões tóxicos (ex.: CONTINUATION+PUT em EURUSD/
-AUDUSD/USDCAD/USDCHF, CONTINUATION contra as 3 velas) também são **hard blocks
-estruturais** em `signal_engine` / `CRITICAL_TRADE_BLOCKS` — independentes da
-amostra da memória. Ver [`ESTRATEGIA.md`](./ESTRATEGIA.md) §"Política anti-loss".
+Documento criado em **2026-07-31**. Atualizado em **2026-08-03** (caderno
+global unificado). Complementa a estratégia clássica com um portão estatístico
+que aprende quais contextos geram mais WIN ou LOSS.
 
 ## 1. Objetivo
 

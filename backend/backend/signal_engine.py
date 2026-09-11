@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -10,6 +11,50 @@ StrategyMode = Literal["aggressive", "balanced", "conservative"]
 OperationTimeframe = Literal["M1", "M5", "M15"]
 
 logger = logging.getLogger("backend-gateway")
+
+from backend.reversion_strategy import (  # noqa: E402
+    REVZ_ENABLED,
+    REVZ_NOMINATE_THRESHOLD,
+    REVZ_THRESHOLD,
+    STRATEGY_REVZ,
+    is_otc_symbol,
+    revz_confidence,
+    revz_evaluate,
+)
+from backend.vertex_strategy import (  # noqa: E402
+    VERTEX_ENABLED,
+    VERTEX_PARALLEL,
+    vertex_confidence,
+    vertex_evaluate,
+)
+from backend.sr_respect import (  # noqa: E402
+    RESPECT_CONFLICT,
+    RESPECT_SEM_DIRECAO,
+    RESPECT_VISIBLE_AHEAD,
+    build_zone,
+    evaluate_respect,
+)
+
+# O que REV-Z e Vertex recusam: entrada contra o nível e nível visível colado à
+# frente (topo/fundo de 1 toque, máxima/mínima recente). A região a favor sem
+# rejeição continua liberada para elas — o extremo do indicador é a tese.
+NIVEL_A_FRENTE = frozenset({RESPECT_CONFLICT, RESPECT_VISIBLE_AHEAD})
+
+from backend.wick_filter import WICK_FILTER_ENABLED, evaluate_wicks  # noqa: E402
+from backend.support_resistance_strategy import (  # noqa: E402
+    SR_ENABLED,
+    SR_MIN_CANDLES,
+    sr_confidence,
+    sr_evaluate,
+)
+from backend.live_demo_mode import apply_live_demo  # noqa: E402
+from backend.narrativa_analise import monta_narrativa  # noqa: E402
+from backend.named_strategies import (  # noqa: E402
+    STRATEGY_LABELS,
+    STRATEGY_RETRACEMENT_SR,
+    detect_named_strategies,
+    pick_primary_strategy,
+)
 
 STRATEGY_PRICE_ACTION = "Price Action"
 STRATEGY_CANDLE_PSYCHOLOGY = "Psicologia de velas"
@@ -59,11 +104,65 @@ SR_ZONE_HARD_BLOCK = True
 LAST_3_ALIGNMENT_HARD_BLOCK = True
 CONTINUATION_DEAD_RSI_HARD_BLOCK = True
 WEAK_CONTINUATION_PUT_HARD_BLOCK = True
+# Cortes de 15/08 (WEAK PUT, vela 45%, DOJI, PUT chase, CALL chase, REPEAT)
+# desligados em 16/08: no sábado/domingo o WR caiu (32–45%) vs ~50–51% da
+# substitution 13–14/08. Flags False = estratégia anterior (backup 14/08 20:39).
+WEAK_PUT_HARD_BLOCK = False
+CANDLE_WEAK_HARD_BLOCK = False
+CANDLE_MIN_BODY_RATIO = 0.45
+DOJI_HARD_BLOCK = False
+DOJI_MAX_BODY_RATIO = 0.10
+# Staging 22/08 (sistema 02): PUT corpo <45% (auditoria 16–22/08, WR 26,1%).
+# Limiar era 0.60 nos cortes 15/08 (off); aqui só o pedaço comprovadamente tóxico.
+# Confirmado em 2026-09-03: PUT com corpo <45% deu 47,68% no treino e 41,35%
+# no teste (n=711/133). Amostra de teste pequena, mas o efeito é grande. Fica.
+PUT_BODY_HARD_BLOCK = True
+PUT_MIN_BODY_RATIO = 0.45
+PUT_CHASE_HARD_BLOCK = False
+PUT_WICK_HARD_BLOCK = False
+PUT_MAX_LOWER_WICK_RATIO = 0.15
+CALL_CHASE_HARD_BLOCK = False
+# Staging 22/08: CALL + GREEN-RED-GREEN (WR 40,1%, maior P&L negativo do recorte).
+# Diferente de CALL_CHASE (GGG em CONTINUATION), que permanece off.
+# Confirmado em 2026-09-03: 45,21% no treino e 43,46% no teste (n=626/451).
+# Replica nas duas metades — fica.
+CALL_GRG_HARD_BLOCK = True
+REPEAT_ENTRY_HARD_BLOCK = False
 TREND_CLEAR_HARD_BLOCK = True
+# Staging 22/08: horas ruins BRT — WR 35–39% no recorte 16–22/08.
+# DESLIGADO na reauditoria de 2026-09-03: contra as 10.730 ops M1 limpas, as
+# horas {2,3,17,19} BRT deram 46,33% no treino e **50,40% no teste** — as piores
+# de um período são as melhores do seguinte, que é a assinatura de ruído
+# memorizado. Blacklist de horário já tinha sido reprovada uma vez em 30/08.
+TOXIC_HOUR_HARD_BLOCK = False
+TOXIC_HOURS_BRT = frozenset({2, 3, 17, 19})
+# Staging 22/08: ban USDCHF (WR ~45% no recorte).
+# DESLIGADO em 2026-09-03: 46,36% no treino e **50,00% no teste**. Não replica.
+ASSET_BAN_HARD_BLOCK = False
+BANNED_ASSETS = frozenset(
+    {
+        "USDCHF-OTC",
+        "USDCHF",
+    }
+)
+# Staging 22/08: WEAK em pares tóxicos (EURGBP CALL ~39%, AUDUSD PUT ~39%).
+# Confirmado em 2026-09-03: 44,07% no treino e 47,20% no teste. Fica.
+TOXIC_WEAK_PAIR_HARD_BLOCK = True
+# Staging 30/08 (sistema 02): autópsia EC02 22–24/08 — GGG WR 31,6% (n=19),
+# GRR WR 33,3% (n=12), WEAK 47,2% (n=53). Horas tóxicas S02 permanecem iguais.
+# DESLIGADOS em 2026-09-03. Foram calibrados em n=19 (GGG) e n=12 (GRR) — na
+# base limpa de 10.730 ops: GGG 50,73%/49,82%, GRR 48,51%/48,84%, WEAK
+# 47,99%/49,62%. Nenhum dos três fica abaixo da média nas duas metades, e o
+# WEAK_SETUP sozinho custava 65% do volume. O que de fato separa as entradas
+# ruins é o recovery estrito (`RECOVERY_STRICT`), medido em +2,2 pp.
+SEQ_GGG_HARD_BLOCK = False
+SEQ_GRR_HARD_BLOCK = False
+WEAK_SETUP_HARD_BLOCK = False
 # RSI "meio morto" em CONTINUATION (amostra 7d: WR 28,6%).
 CONTINUATION_DEAD_RSI_MIN = 50.0
 CONTINUATION_DEAD_RSI_MAX = 60.0
 # CONTINUATION+PUT com WR agregado < 43% no caderno global / histórico.
+# 2026-08-13: EURGBP/AUDJPY incluídos (WR PUT ~29–35% na auditoria do dia).
 WEAK_CONTINUATION_PUT_ASSETS = frozenset(
     {
         "EURUSD-OTC",
@@ -74,8 +173,325 @@ WEAK_CONTINUATION_PUT_ASSETS = frozenset(
         "USDCAD",
         "USDCHF-OTC",
         "USDCHF",
+        "EURGBP-OTC",
+        "EURGBP",
+        "AUDJPY-OTC",
+        "AUDJPY",
     }
 )
+
+# Ativos com WR estruturalmente fraco no dia — só demote no ranking (não hard block),
+# para o ciclo preferir outro par sem zerar a frequência.
+RANK_DEMOTION_ASSETS = frozenset(
+    {
+        "AUDUSD-OTC",
+        "AUDUSD",
+    }
+)
+
+
+def is_doji_body(body_ratio: float | None) -> bool:
+    """Indica DOJI / corpo miúdo (abertura ≈ fechamento).
+
+    Args:
+        body_ratio: Corpo da vela em fração do range (0–1).
+
+    Returns:
+        True quando o corpo é ≤ ``DOJI_MAX_BODY_RATIO``.
+    """
+    try:
+        return float(body_ratio or 0) <= DOJI_MAX_BODY_RATIO
+    except (TypeError, ValueError):
+        return False
+
+
+def is_weak_candle_body(body_ratio: float | None) -> bool:
+    """Indica vela fraca ou sem força (corpo < 45%).
+
+    Args:
+        body_ratio: Corpo da vela em fração do range (0–1).
+
+    Returns:
+        True quando o corpo é < ``CANDLE_MIN_BODY_RATIO``.
+    """
+    try:
+        return float(body_ratio or 0) < CANDLE_MIN_BODY_RATIO
+    except (TypeError, ValueError):
+        return False
+
+
+def is_put_thin_body(body_ratio: float | None, direction: str | None) -> bool:
+    """Indica PUT com corpo abaixo do mínimo de venda (staging: 45%).
+
+    Auditoria sistema 01 (16–22/08): PUT com corpo <45% fez WR **26,1%**
+    (n=88). CALL com corpo <45% ficou em 54,8% — por isso o corte é só PUT.
+    (O corte 15/08 usava 60% e foi desligado; staging reativa só o limiar 45%.)
+
+    Args:
+        body_ratio: Corpo da vela em fração do range (0–1).
+        direction: ``CALL`` ou ``PUT``.
+
+    Returns:
+        True quando a direção é PUT e o corpo é < ``PUT_MIN_BODY_RATIO``.
+    """
+    if str(direction or "").strip().upper() != "PUT":
+        return False
+    try:
+        return float(body_ratio or 0) < PUT_MIN_BODY_RATIO
+    except (TypeError, ValueError):
+        return True
+
+
+def is_call_green_red_green(
+    direction: str | None,
+    last_3_colors: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """Indica CALL no padrão GREEN-RED-GREEN (alternância disfarçada de compra).
+
+    Auditoria sistema 01 (16–22/08): 277 ops, WR **40,1%**, P&L ≈ −998.
+    Aplica a **qualquer setup** (WEAK e CONTINUATION), não só CONTINUATION.
+
+    Args:
+        direction: ``CALL`` ou ``PUT``.
+        last_3_colors: Cores das 3 velas, mais antiga primeiro.
+
+    Returns:
+        True quando é CALL com sequência GREEN-RED-GREEN.
+    """
+    if str(direction or "").strip().upper() != "CALL":
+        return False
+    colors = tuple(str(item).strip().upper() for item in (last_3_colors or []))
+    return colors == ("GREEN", "RED", "GREEN")
+
+
+def is_seq_green_green_green(
+    last_3_colors: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """Indica sequência GREEN-GREEN-GREEN (qualquer setup/direção).
+
+    Autópsia EC02 (22–24/08): 19 ops, WR **31,6%**, P&L −779. Diferente de
+    ``CALL_CHASE`` (só CONTINUATION+CALL); aqui bloqueia WEAK também.
+
+    Args:
+        last_3_colors: Cores das 3 velas, mais antiga primeiro.
+
+    Returns:
+        True quando as 3 últimas cores são GREEN-GREEN-GREEN.
+    """
+    colors = tuple(str(item).strip().upper() for item in (last_3_colors or []))
+    return colors == ("GREEN", "GREEN", "GREEN")
+
+
+def is_seq_green_red_red(
+    last_3_colors: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """Indica sequência GREEN-RED-RED (qualquer setup/direção).
+
+    Autópsia EC02 (22–24/08): 12 ops, WR **33,3%**, P&L −455.
+
+    Args:
+        last_3_colors: Cores das 3 velas, mais antiga primeiro.
+
+    Returns:
+        True quando as 3 últimas cores são GREEN-RED-RED.
+    """
+    colors = tuple(str(item).strip().upper() for item in (last_3_colors or []))
+    return colors == ("GREEN", "RED", "RED")
+
+
+def is_weak_setup(setup: str | None) -> bool:
+    """Indica setup de price action WEAK (fallback de frequência).
+
+    Args:
+        setup: Price action (``WEAK``, ``CONTINUATION``, …).
+
+    Returns:
+        True quando o setup é WEAK.
+    """
+    return str(setup or "").strip().upper() == "WEAK"
+
+
+def is_toxic_hour_brt(now: datetime | None = None) -> bool:
+    """Indica se o instante cai em hora tóxica de Brasília (02/03/17/19).
+
+    Args:
+        now: Instante de referência (UTC ou aware). Padrão: agora UTC.
+
+    Returns:
+        True quando a hora civil em ``America/Sao_Paulo`` está em
+        ``TOXIC_HOURS_BRT``.
+    """
+    from backend.brasilia_time import BRASILIA_TZ
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(BRASILIA_TZ).hour in TOXIC_HOURS_BRT
+
+
+def is_banned_asset(symbol: str | None) -> bool:
+    """Indica se o ativo está na lista de ban hard (staging: USDCHF).
+
+    Args:
+        symbol: Código do ativo (ex.: ``USDCHF-OTC``).
+
+    Returns:
+        True quando o par não deve operar.
+    """
+    normalized = str(symbol or "").strip().upper()
+    return normalized in BANNED_ASSETS
+
+
+def is_toxic_weak_pair(
+    setup: str | None,
+    direction: str | None,
+    symbol: str | None,
+) -> bool:
+    """Indica WEAK em par/direção tóxicos (EURGBP CALL, AUDUSD PUT).
+
+    Args:
+        setup: Price action (``WEAK``, ``CONTINUATION``, …).
+        direction: ``CALL`` ou ``PUT``.
+        symbol: Código do ativo.
+
+    Returns:
+        True quando o combo setup+direção+par deve ser bloqueado.
+    """
+    if str(setup or "").strip().upper() != "WEAK":
+        return False
+    direction_u = str(direction or "").strip().upper()
+    base = str(symbol or "").strip().upper().replace("-OTC", "")
+    if direction_u == "CALL" and base == "EURGBP":
+        return True
+    if direction_u == "PUT" and base == "AUDUSD":
+        return True
+    return False
+
+
+def is_put_against_wick(lower_wick_ratio: float | None, direction: str | None) -> bool:
+    """Indica PUT com pavio de baixo (contra a venda) longo demais.
+
+    Args:
+        lower_wick_ratio: Pavio inferior em fração do range (0–1).
+        direction: ``CALL`` ou ``PUT``.
+
+    Returns:
+        True quando PUT e pavio de baixo > ``PUT_MAX_LOWER_WICK_RATIO``.
+    """
+    if str(direction or "").strip().upper() != "PUT":
+        return False
+    try:
+        return float(lower_wick_ratio or 0) > PUT_MAX_LOWER_WICK_RATIO
+    except (TypeError, ValueError):
+        return False
+
+
+def extract_last_3_colors(
+    signal: dict[str, Any] | None,
+    candles: list[dict[str, float]] | None = None,
+) -> list[str]:
+    """Cores das últimas 3 velas (mais antiga → atual).
+
+    Args:
+        signal: Sinal ou candidato com ``last_3_colors`` / metrics.
+        candles: Velas fechadas (fallback se o sinal não trouxer cores).
+
+    Returns:
+        Lista de ``GREEN``/``RED``/``DOJI`` (pode ser vazia).
+    """
+    if isinstance(signal, dict):
+        raw = signal.get("last_3_colors")
+        if not raw and isinstance(signal.get("metrics"), dict):
+            raw = signal["metrics"].get("last_3_colors")
+        if isinstance(raw, (list, tuple)) and raw:
+            return [str(item).strip().upper() for item in raw]
+    if candles and len(candles) >= 3:
+        return _candle_colors(candles[-3:])
+    return []
+
+
+def is_chasing_continuation(
+    setup: str | None,
+    direction: str | None,
+    last_3_colors: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """CONTINUATION perseguindo 3 velas iguais (CALL verdes ou PUT vermelhas).
+
+    Args:
+        setup: Price action.
+        direction: ``CALL`` ou ``PUT``.
+        last_3_colors: Cores das 3 velas, mais antiga primeiro.
+
+    Returns:
+        True quando a continuação está atrasada no movimento.
+    """
+    return is_chasing_continuation_put(
+        setup, direction, last_3_colors
+    ) or is_chasing_continuation_call(setup, direction, last_3_colors)
+
+
+def is_chasing_continuation_call(
+    setup: str | None,
+    direction: str | None,
+    last_3_colors: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """CONTINUATION CALL nas 3 verdes seguidas (perseguir a alta).
+
+    Auditoria 15/08 pós-deploy: 43 ops, WR ~30%. Espelho do PUT chase.
+
+    Args:
+        setup: Price action.
+        direction: ``CALL`` ou ``PUT``.
+        last_3_colors: Cores das 3 velas, mais antiga primeiro.
+
+    Returns:
+        True quando é compra de continuação em GREEN-GREEN-GREEN.
+    """
+    if str(setup or "").strip().upper() != "CONTINUATION":
+        return False
+    if str(direction or "").strip().upper() != "CALL":
+        return False
+    colors = tuple(str(item).strip().upper() for item in (last_3_colors or []))
+    return colors == ("GREEN", "GREEN", "GREEN")
+
+
+def is_chasing_continuation_put(
+    setup: str | None,
+    direction: str | None,
+    last_3_colors: list[str] | tuple[str, ...] | None,
+) -> bool:
+    """CONTINUATION PUT nas 3 vermelhas seguidas (perseguir a queda).
+
+    No recorte não-WEAK esse padrão fez 45,8% (abaixo do empate). GREEN-RED-RED
+    fez 70,6% e permanece permitido.
+
+    Args:
+        setup: Price action.
+        direction: ``CALL`` ou ``PUT``.
+        last_3_colors: Cores das 3 velas, mais antiga primeiro.
+
+    Returns:
+        True quando é venda de continuação em RED-RED-RED.
+    """
+    if str(setup or "").strip().upper() != "CONTINUATION":
+        return False
+    if str(direction or "").strip().upper() != "PUT":
+        return False
+    colors = tuple(str(item).strip().upper() for item in (last_3_colors or []))
+    return colors == ("RED", "RED", "RED")
+
+
+def is_weak_put_setup(setup: str | None, direction: str | None) -> bool:
+    """Indica se o contexto é WEAK + PUT (venda em setup fraco).
+
+    Args:
+        setup: Price action (ex.: ``WEAK``, ``CONTINUATION``).
+        direction: ``CALL`` ou ``PUT``.
+
+    Returns:
+        True quando o setup é WEAK e a direção é PUT.
+    """
+    return str(setup or "").strip().upper() == "WEAK" and str(direction or "").strip().upper() == "PUT"
 
 
 def is_weak_continuation_put_asset(symbol: str | None) -> bool:
@@ -90,6 +506,20 @@ def is_weak_continuation_put_asset(symbol: str | None) -> bool:
     """
     normalized = str(symbol or "").strip().upper()
     return normalized in WEAK_CONTINUATION_PUT_ASSETS
+
+
+def is_rank_demotion_asset(symbol: str | None) -> bool:
+    """
+    Indica se o ativo deve perder prioridade no ranking (sem hard block).
+
+    Args:
+        symbol: Código do ativo (ex.: ``AUDUSD-OTC``).
+
+    Returns:
+        True quando outro candidato estruturado deve ganhar o slot.
+    """
+    normalized = str(symbol or "").strip().upper()
+    return normalized in RANK_DEMOTION_ASSETS
 
 
 def cycle_minutes_for_timeframe(timeframe: str | None) -> int:
@@ -154,13 +584,82 @@ def minimum_operations_per_hour(timeframe: str | None) -> int:
 # Após N ciclos sem entrada, libera filtros de "seca" (não os anti-loss tóxicos).
 FREQUENCY_RECOVERY_AFTER_CYCLES = 2
 FREQUENCY_RECOVERY_MIN_SCORE = 70
-FREQUENCY_RECOVERY_SOFT_BLOCKS = frozenset(
+# Reauditoria 2026-09-03 (11.628 ops reais, contas de marketing excluídas): o
+# recovery de frequência estava ligado em 95% das varreduras e, ao dispensar os
+# hard blocks abaixo, respondia por **64,4% de todas as ordens executadas**.
+# Essas ordens acertam 48,38% contra 50,60% das demais, e a diferença é o único
+# efeito de todo o levantamento que sobreviveu ao holdout (50,74% no treino /
+# 50,38% no teste). Com o recovery estrito o retorno por entrada sai de −9,65%
+# para −0,85%; o custo é 64% menos volume (mediana 8 -> 3 ops por conta-dia).
+#
+# `RECOVERY_STRICT=false` restaura o comportamento antigo para comparação A/B.
+# Estratégias nomeadas do sistema 01 (`named_strategies.py`), fora do pipeline
+# desde 26/07/2026. Reativadas no sistema 02 em 2026-09-04 como **fontes de
+# sinal adicionais**, não como substitutas do motor clássico: cada uma pode
+# liberar uma entrada que o portão clássico barraria, e o `strategy_key` vai
+# para o histórico para o resultado ser atribuível estratégia por estratégia.
+#
+# É a alavanca de VOLUME. Medido nas 281.910 velas OTC de 03/09, por ativo-dia:
+#   SR-R (pivôs)          131,6 sinais   acerto 50,23% ± 0,61
+#   RETRACEMENT_SR        74,7 sinais    acerto 49,89% ± 0,80
+#   CANDLE_FLOW           59,1 sinais    acerto 49,54% ± 0,90
+#   EXHAUSTION_REVERSAL   40,9 sinais    acerto 50,41% ± 1,09
+# Sinal sobra; nenhuma delas bate o empate de 53,48% no OTC. Ligar isto compra
+# frequência, não vantagem — a atribuição por `strategy_key` existe justamente
+# para que algumas semanas de dados digam se alguma se sustenta.
+NAMED_STRATEGIES_ENABLED = os.getenv("NAMED_STRATEGIES", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+# Cortes que NENHUMA estratégia nomeada dispensa: são os três que replicaram nas
+# duas metades do histórico limpo (reauditoria de 03/09).
+NAMED_STRATEGY_NON_WAIVABLE = frozenset(
     {
+        "CALL_GRG",
+        "PUT_BODY",
+        "TOXIC_WEAK_PAIR",
+        "ACCOUNT_DISCONNECTED",
+        "STOP_WIN_HIT",
+        "STOP_LOSS_HIT",
+        "ACTIVE_CLOSED",
+        "ACTIVE_SUSPENDED",
+        "PAYOUT_UNAVAILABLE",
+        "OPERATION_IN_PROGRESS",
+        "CANDLES_UNAVAILABLE",
+        "MIN_PAYOUT",
+        # Pavio excessivo (11/09): regra do dono, vale para toda estratégia.
+        "WICK_EXCESS",
+    }
+)
+
+# Chave da SR-R quando ela entra como estratégia nomeada (e não como override).
+STRATEGY_SUPPORT_RESISTANCE_PIVOT = "SUPPORT_RESISTANCE_PIVOT"
+# Chave da Vertex no histórico. Marcada de propósito: estratégia nova sem
+# medição não pode se misturar com o resto na apuração de acerto.
+STRATEGY_VERTEX = "VERTEX"
+
+RECOVERY_STRICT = os.getenv("RECOVERY_STRICT", "true").strip().lower() in {"1", "true", "yes"}
+
+# Bloqueios que o recovery de frequência dispensa. Em modo estrito ele só
+# dispensa `TREND_CLEAR` — os dois que definem a qualidade da entrada
+# (`PRICE_ACTION_SETUP` e `LEVEL_REJECTION`) continuam valendo.
+FREQUENCY_RECOVERY_SOFT_BLOCKS = frozenset(
+    {"TREND_CLEAR"}
+    if RECOVERY_STRICT
+    else {
         "TREND_CLEAR",
-        "CANDLE_STRENGTH",
-        "DOJI_FILTER",
         "PRICE_ACTION_SETUP",
         "LEVEL_REJECTION",
+    }
+)
+# Soft block libera trade_allowed, mas estes NÃO perdem a penalidade no score —
+# senão WEAK compete em igualdade com CONTINUATION e ganha o slot (auditoria
+# 2026-08-13: 64/100 losses eram WEAK liberados no recovery).
+FREQUENCY_RECOVERY_KEEP_SCORE_PENALTIES = frozenset(
+    {
+        "PRICE_ACTION_SETUP",
     }
 )
 
@@ -188,6 +687,8 @@ def analyze_signal(
     strategy_mode: StrategyMode = "conservative",
     payout: float | None = None,
     frequency_recovery: bool = False,
+    m1_candles: list[dict[str, Any]] | None = None,
+    live_demo: bool = False,
 ) -> dict[str, Any]:
     """Analisa velas e aplica o portão de qualidade.
 
@@ -198,6 +699,15 @@ def analyze_signal(
         strategy_mode: Perfil aggressive/balanced/conservative.
         payout: Payout do ativo, se conhecido.
         frequency_recovery: Se True, suaviza filtros de seca (não anti-loss).
+        m1_candles: Velas M1 do mesmo ativo, quando a operação é M5/M15. A
+            REV-Z precisa delas: medido em 05/09, o z calculado nas velas do
+            próprio timeframe dá 49,59% em M5 e 41,67% em M15, contra 60,56%
+            em M1 — o efeito é de curto prazo e some numa janela de 10h/30h.
+            A EXPIRAÇÃO maior continua valendo a pena (M5 mede 67,31%); é só o
+            SINAL que tem de vir do M1.
+        live_demo: Modo de transmissão ao vivo. Afrouxa o portão em OTC para dar
+            cadência à live. Piora o resultado (mais volume em série aleatória);
+            existe só para ritmo de demonstração. Ver `live_demo_mode.py`.
     """
     normalized = [_normalize_candle(candle) for candle in candles]
     normalized = [candle for candle in normalized if candle is not None]
@@ -268,9 +778,502 @@ def analyze_signal(
     signal["extreme_candle"] = extreme_candle
     signal["raw_direction_score"] = max(0, int(round(confidence)))
     signal["confidence_model_version"] = CONFIDENCE_MODEL_VERSION
-    return _apply_quality_filters(
+    resultado = _apply_quality_filters(
         signal, normalized, strategy_mode, payout, frequency_recovery=frequency_recovery
     )
+    resultado = apply_named_strategies(resultado, symbol, normalized, timeframe)
+    velas_z = normalized
+    velas_m1: list[dict[str, float]] = []
+    if m1_candles:
+        convertidas = [_normalize_candle(c) for c in m1_candles]
+        convertidas = [c for c in convertidas if c is not None]
+        if convertidas:
+            velas_z = convertidas
+            velas_m1 = convertidas
+    # A REV-Z só vale com o z das velas M1. Em M5/M15 sem as M1, cair para as
+    # velas do próprio timeframe mediria outra coisa (49,59% em M5 e 41,67% em
+    # M15, medido em 05/09) — melhor não operar a vela.
+    velas_revz = normalized if str(timeframe).upper() == "M1" else velas_m1
+    resultado = apply_revz_override(resultado, symbol, velas_revz)
+    resultado = apply_sr_override(resultado, symbol, normalized)
+    resultado = apply_vertex_override(resultado, symbol, velas_z)
+    # Por último de propósito: só age quando TODO o resto barrou.
+    return apply_live_demo(resultado, symbol, live_enabled=live_demo)
+
+def apply_named_strategies(
+    signal: dict[str, Any],
+    symbol: str,
+    normalized: list[dict[str, float]],
+    timeframe: str,
+) -> dict[str, Any]:
+    """Roda as estratégias nomeadas como fontes de sinal adicionais.
+
+    O motor clássico decide primeiro. Aqui, se alguma estratégia nomeada
+    reconhece o setup, a entrada é liberada mesmo que o portão clássico a
+    tenha barrado — exceto pelos cortes de ``NAMED_STRATEGY_NON_WAIVABLE``,
+    que continuam valendo para todas.
+
+    Inclui a SR-R (``support_resistance_strategy``) como estratégia nomeada
+    ``SUPPORT_RESISTANCE_PIVOT``, ao lado da ``RETRACEMENT_SR`` que já existia
+    no sistema 01. São duas leituras diferentes de suporte e resistência: a
+    primeira monta o nível por pivôs e contagem de toques, a segunda exige
+    retração recente e rejeição colada no nível.
+
+    Com ``NAMED_STRATEGIES_ENABLED`` desligado (padrão) só anota os matches no
+    sinal, sem mudar nenhuma decisão — assim dá para medir a frequência antes
+    de ligar.
+
+    Args:
+        signal: Sinal já filtrado pelo motor clássico.
+        symbol: Ativo analisado.
+        normalized: Velas normalizadas em ordem cronológica.
+        timeframe: Timeframe da operação.
+
+    Returns:
+        O sinal com ``strategy_key``, ``named_strategies`` e, quando ligado e
+        houver match, ``trade_allowed`` liberado.
+    """
+    direction = str(signal.get("signal") or signal.get("direction") or "").upper()
+    if len(normalized) < 6:
+        return signal
+
+    # A SR-R é reversão e o motor clássico segue a última vela em ~89% das
+    # ordens: por construção os dois quase nunca apontam para o mesmo lado.
+    # Por isso ela entra como fonte independente — só quando o clássico não
+    # tem direção — e não como confirmação da direção dele.
+    # Sem `allow_otc`: quem decide é `SR_ALLOW_OTC`. Forçar True aqui fazia a
+    # SR-R liberar entradas em ativo sintético mesmo com a variável desligada,
+    # que é o padrão justamente porque ela mediu 49,85% no holdout OTC.
+    veredito_pivo = sr_evaluate(symbol, normalized[-(SR_MIN_CANDLES + 5):])
+    # O motor clássico SEMPRE devolve uma direção (escolhe o maior entre
+    # call_score e put_score); quem barra é o portão. Então a SR-R entra
+    # quando o clássico foi BARRADO — aí a direção passa a ser a dela.
+    classico_barrado = not signal.get("trade_allowed")
+    if classico_barrado and veredito_pivo["direction"]:
+        direction = str(veredito_pivo["direction"])
+        signal["sr_pivot_direction"] = direction
+
+    if direction not in {"CALL", "PUT"}:
+        return signal
+
+    # Os detectores do sistema 01 esperam velas com max/min.
+    janela = [
+        {
+            "open": c["open"],
+            "close": c["close"],
+            "max": c.get("high", c.get("max")),
+            "min": c.get("low", c.get("min")),
+        }
+        for c in normalized[-30:]
+    ]
+    matches = detect_named_strategies(
+        direction,
+        janela,
+        timeframe=timeframe,
+        rsi=float(signal.get("rsi") or 50.0),
+        near_support=bool(signal.get("near_support")),
+        near_resistance=bool(signal.get("near_resistance")),
+    )
+
+    veredito_sr = veredito_pivo
+    if veredito_sr["direction"] == direction:
+        matches.append(
+            {
+                "key": STRATEGY_SUPPORT_RESISTANCE_PIVOT,
+                "label": "Suporte/Resistência por pivôs",
+                "setup": STRATEGY_SUPPORT_RESISTANCE_PIVOT,
+                "summary": (
+                    f"Rejeição em nível de {veredito_sr['level']:.5f} "
+                    f"com {veredito_sr['touches']} toques."
+                ),
+                "speech_preview": f"Vou de {direction} por rejeição no nível.",
+                "detail": (
+                    f"Nível montado por pivôs com {veredito_sr['touches']} toques; "
+                    f"pavio de rejeição {veredito_sr['wick_ratio'] * 100:.0f}% do range."
+                ),
+                "sr_zone_exempt": True,
+            }
+        )
+
+    signal["named_strategies"] = [m["key"] for m in matches]
+    signal["named_strategy_keys"] = [m["key"] for m in matches]
+    signal["matched_strategies"] = [m["key"] for m in matches]
+
+    # Prioridade própria: `pick_primary_strategy` só conhece as três chaves do
+    # sistema 01 e devolveria None sempre que o único match fosse a SR-R.
+    # A ordem coloca as duas leituras de suporte/resistência antes das de
+    # continuação, que é o que o dono pediu — e é por isso que o acerto de cada
+    # uma vai para o histórico separado: RETRACEMENT_SR mediu 46,38% no
+    # backtest de 04/09, o pior das quatro, e precisa ser vigiado.
+    ordem = (
+        STRATEGY_RETRACEMENT_SR,
+        STRATEGY_SUPPORT_RESISTANCE_PIVOT,
+    )
+    primaria = next(
+        (m for chave in ordem for m in matches if m["key"] == chave),
+        None,
+    ) or pick_primary_strategy(matches)
+    if primaria is None and matches:
+        primaria = matches[0]
+    if primaria is not None:
+        signal["strategy_key"] = primaria["key"]
+        signal["strategy_summary"] = primaria["summary"]
+        signal["analysis_detail"] = primaria["detail"]
+        signal["speech_preview"] = primaria["speech_preview"]
+
+    if not NAMED_STRATEGIES_ENABLED or primaria is None:
+        return signal
+    if signal.get("trade_allowed"):
+        return signal
+
+    bloqueados = list(signal.get("blocked_filters") or [])
+    # `SR_ZONE` só cai para as estratégias que existem para operar NO nível —
+    # é o que `sr_zone_exempt` marca em cada detector. CANDLE_FLOW é
+    # continuação cega e continua barrada colada no suporte/resistência, que
+    # era a razão de o bloqueio ter virado incondicional em 29/07.
+    nao_dispensaveis = set(NAMED_STRATEGY_NON_WAIVABLE)
+    if not primaria.get("sr_zone_exempt"):
+        nao_dispensaveis.add("SR_ZONE")
+    impeditivos = [b for b in bloqueados if b in nao_dispensaveis]
+    if impeditivos:
+        signal["quality_reason"] = ",".join(impeditivos)
+        return signal
+
+    signal["trade_allowed"] = True
+    if signal.get("sr_pivot_direction"):
+        signal["signal"] = direction
+        signal["direction"] = direction
+        signal["analyzed_direction"] = direction
+    signal["quality_reason"] = f"OK_{primaria['key']}"
+    signal["strategy_name"] = primaria["label"]
+    signal["entry_reason"] = primaria["detail"]
+    signal["signal_explanation"] = primaria["detail"]
+    signal["narrator_text"] = primaria["detail"]
+    logger.info(
+        "[NAMED_STRATEGY_RELEASE] symbol=%s direction=%s strategy=%s barrados=%s",
+        symbol,
+        direction,
+        primaria["key"],
+        ",".join(bloqueados) if bloqueados else "-",
+    )
+    return signal
+
+
+def apply_sr_override(
+    signal: dict[str, Any],
+    symbol: str,
+    normalized: list[dict[str, float]],
+) -> dict[str, Any]:
+    """Sobrepõe a decisão pela estratégia de suporte e resistência (SR-R).
+
+    Segue o mesmo desenho de ``apply_revz_override``: roda DEPOIS do pipeline
+    clássico, então o sinal já chega com o contrato completo (métricas,
+    filtros, score) e aqui só a direção e o operar/não-operar são trocados.
+
+    Roda também DEPOIS da REV-Z, e sai na frente se a REV-Z já decidiu operar —
+    duas estratégias de reversão disputando a mesma vela seria dobrar a aposta
+    no mesmo palpite, não confluência. Com ``SR_ENABLED`` desligado (padrão) o
+    sinal volta intacto.
+
+    Args:
+        signal: Sinal já montado pelo motor clássico (e pela REV-Z, se ligada).
+        symbol: Ativo analisado.
+        normalized: Velas normalizadas, em ordem cronológica.
+
+    Returns:
+        O sinal, sobreposto quando a SR-R está ligada e tem veredito.
+    """
+    if not SR_ENABLED:
+        return signal
+    if isinstance(signal.get("revz"), dict):
+        # A REV-Z avaliou este ativo (mercado aberto): a decisão é dela, tenha
+        # ou não disparado.
+        return signal
+
+    veredito = sr_evaluate(symbol, normalized[-(SR_MIN_CANDLES + 5):])
+    bloqueados = [f for f in (signal.get("blocked_filters") or []) if not str(f).startswith("SR_")]
+    signal["sr"] = veredito
+    signal["strategy_name"] = "SR-R rejeição em suporte/resistência"
+    signal["confidence_model_version"] = "sr-v1"
+
+    if veredito["direction"] is None:
+        signal["signal"] = "WAIT"
+        signal["direction"] = "WAIT"
+        signal["trade_allowed"] = False
+        signal["confidence"] = 0
+        signal["score"] = 0
+        signal["strategy_score"] = 0
+        bloqueados.append(str(veredito["blocked"]))
+        signal["blocked_filters"] = bloqueados
+        signal["block_reasons"] = list(bloqueados)
+        signal["quality_reason"] = str(veredito["blocked"])
+        return signal
+
+    conf = sr_confidence(veredito)
+    signal["signal"] = veredito["direction"]
+    signal["direction"] = veredito["direction"]
+    signal["analyzed_direction"] = veredito["direction"]
+    signal["trade_allowed"] = True
+    signal["confidence"] = conf
+    signal["score"] = conf
+    # Mesma razão da REV-Z: não há score aditivo aqui. Quem decide é a rejeição
+    # no nível, e a confiança é só o reflexo da força dela.
+    signal["strategy_score"] = conf
+    signal["blocked_filters"] = []
+    signal["block_reasons"] = []
+    signal["quality_reason"] = "OK"
+    lado = "suporte" if veredito["direction"] == "CALL" else "resistência"
+    texto = (
+        f"{symbol}: rejeição em {lado} de {veredito['level']:.5f} "
+        f"({veredito['touches']} toques), pavio de {veredito['wick_ratio'] * 100:.0f}% "
+        f"do range. Entrada {veredito['direction']}."
+    )
+    signal["reason"] = texto
+    signal["entry_reason"] = texto
+    signal["signal_explanation"] = texto
+    signal["narrator_text"] = texto
+    logger.info(
+        "[SR_SIGNAL] symbol=%s direction=%s level=%.5f touches=%s wick=%.2f confidence=%s",
+        symbol,
+        veredito["direction"],
+        veredito["level"],
+        veredito["touches"],
+        veredito["wick_ratio"],
+        conf,
+    )
+    return signal
+
+
+def apply_revz_override(
+    signal: dict[str, Any],
+    symbol: str,
+    normalized: list[dict[str, float]],
+) -> dict[str, Any]:
+    """Sobrepõe a decisão do motor clássico pela estratégia REV-Z.
+
+    Roda DEPOIS do pipeline clássico de propósito: o sinal já vem com o
+    contrato completo (métricas, filtros, score), e aqui só a decisão de
+    direção e de operar/não operar é trocada. Assim nenhum consumidor a jusante
+    precisa saber que a estratégia mudou.
+
+    Quando ``REVZ_ENABLED`` é False (padrão) devolve o sinal intacto.
+
+    Desde 10/09/2026 a REV-Z é o motor do MERCADO ABERTO e só dele: em ativo
+    ``-OTC`` o sinal do motor clássico volta intacto (o OTC segue com clássico e
+    Vertex). No aberto ela decide sozinha — quando não há extremo a vela fica
+    sem entrada, em vez de devolver a palavra ao clássico, que no aberto mediu
+    49,1% em 53 operações (08–10/09).
+
+    Aqui o limiar é o de INDICAÇÃO (``REVZ_NOMINATE_THRESHOLD``): a análise roda
+    com a vela ainda em formação. Quem decide a ordem é a confirmação no
+    disparo, com a vela fechada e ``REVZ_THRESHOLD`` — ver
+    ``revz_confirm_at_entry``.
+
+    Args:
+        signal: Sinal já montado pelo motor clássico.
+        symbol: Ativo analisado.
+        normalized: Velas M1 normalizadas, em ordem cronológica. Vazio quando
+            a operação é M5/M15 e as M1 não vieram — aí a vela fica sem entrada.
+
+    Returns:
+        O sinal, sobreposto quando a REV-Z está ligada e o ativo é de mercado aberto.
+    """
+    if not REVZ_ENABLED or is_otc_symbol(symbol):
+        return signal
+
+    veredito = revz_evaluate(
+        symbol,
+        [c["close"] for c in normalized],
+        threshold=REVZ_NOMINATE_THRESHOLD,
+    )
+    veredito["confirm_threshold"] = REVZ_THRESHOLD
+    direcao = veredito["direction"]
+    if direcao is not None and normalized:
+        # "Nunca contra o nível" vale para toda estratégia (regra do dono,
+        # 09/09). Mesma leitura da Vertex: só o conflito recusa — CALL colado
+        # na resistência, PUT colado no suporte. Dentro da região a favor a
+        # REV-Z não pede rejeição confirmada: o extremo do z é a tese dela.
+        respeita, motivo = evaluate_respect(direcao, _support_resistance_context(normalized), normalized[-1])
+        if not respeita and motivo in NIVEL_A_FRENTE:
+            veredito = dict(veredito, direction=None, blocked="REVZ_CONTRA_O_NIVEL")
+    bloqueados = [f for f in (signal.get("blocked_filters") or []) if not str(f).startswith("REVZ_")]
+    signal["revz"] = veredito
+    signal["strategy_name"] = "REV-Z reversão em desvio extremo"
+    signal["strategy_key"] = STRATEGY_REVZ
+    signal["confidence_model_version"] = "revz-v1"
+
+    if veredito["direction"] is None:
+        signal["signal"] = "WAIT"
+        signal["direction"] = "WAIT"
+        signal["trade_allowed"] = False
+        signal["confidence"] = 0
+        signal["score"] = 0
+        signal["strategy_score"] = 0
+        bloqueados.append(str(veredito["blocked"]))
+        signal["blocked_filters"] = bloqueados
+        signal["block_reasons"] = list(bloqueados)
+        signal["quality_reason"] = str(veredito["blocked"])
+        # A leitura do motor clássico ("Vou de PUT — o desenho está claro")
+        # não pode ficar na tela de uma vela em que o aberto não opera.
+        if veredito.get("z") is not None:
+            texto = (
+                f"{symbol}: preço a {abs(veredito['z']):.1f} desvios da média das últimas "
+                f"{veredito['lookback']} velas. Sem esticão suficiente para a reversão — "
+                "aguardando."
+            )
+        else:
+            texto = f"{symbol}: sem dados suficientes para medir o desvio da média — aguardando."
+        for campo in ("reason", "signal_explanation", "narrator_text", "analysis_detail", "candle_reading"):
+            signal[campo] = texto
+        return signal
+
+    conf = revz_confidence(veredito["z"])
+    signal["signal"] = veredito["direction"]
+    signal["direction"] = veredito["direction"]
+    signal["analyzed_direction"] = veredito["direction"]
+    signal["trade_allowed"] = True
+    signal["confidence"] = conf
+    signal["score"] = conf
+    # O portão do ciclo compara `strategy_score` com o mínimo do usuário. A
+    # REV-Z não tem score aditivo: quem decide é o |z|, e a confiança já é o
+    # reflexo dele.
+    signal["strategy_score"] = conf
+    signal["blocked_filters"] = []
+    signal["block_reasons"] = []
+    signal["quality_reason"] = "OK"
+    z = veredito["z"]
+    lado = "abaixo" if veredito["direction"] == "CALL" else "acima"
+    # Sem "a tendência é voltar" (convicção) nem "se o fechamento confirmar"
+    # (soa como dúvida na voz): o texto só diz o que foi medido. A confirmação
+    # no fechamento continua acontecendo em `revz_confirm_at_entry`.
+    texto = (
+        f"{symbol}: preço {abs(z):.1f} desvios {lado} da média das últimas "
+        f"{veredito['lookback']} velas. Entrada de {veredito['direction']}."
+    )
+    # `candle_reading` também: é o texto que o cliente lê, e o do motor
+    # clássico descreve a entrada A FAVOR da vela — o oposto desta.
+    for campo in (
+        "reason",
+        "entry_reason",
+        "signal_explanation",
+        "narrator_text",
+        "analysis_detail",
+        "candle_reading",
+    ):
+        signal[campo] = texto
+    return signal
+
+
+def apply_vertex_override(
+    signal: dict[str, Any],
+    symbol: str,
+    normalized: list[dict[str, float]],
+) -> dict[str, Any]:
+    """Sobrepõe a decisão do motor clássico pela estratégia Vertex.
+
+    Mesmo desenho do ``apply_revz_override``: roda depois do pipeline clássico,
+    quando o sinal já tem o contrato completo, e troca só a direção e o
+    operar/não operar. Nenhum consumidor a jusante precisa saber que a
+    estratégia mudou.
+
+    A região de suporte e resistência continua valendo aqui. A Vertex é
+    reversão e pode apontar CALL com o preço colado na resistência; nesse caso a
+    entrada é recusada, porque "nunca contra o nível" vale para todas as
+    estratégias, não só para o motor clássico. Dentro da região a favor a Vertex
+    não precisa de rejeição confirmada — o extremo do indicador é a tese dela.
+
+    Quando ``VERTEX_ENABLED`` é False (padrão) devolve o sinal intacto.
+
+    Args:
+        signal: Sinal já montado pelo motor clássico.
+        symbol: Ativo analisado.
+        normalized: Velas normalizadas, em ordem cronológica.
+
+    Returns:
+        O sinal, sobreposto quando a Vertex está ligada.
+    """
+    if not VERTEX_ENABLED:
+        return signal
+    if isinstance(signal.get("revz"), dict):
+        # Mercado aberto é da REV-Z (10/09/2026). A Vertex continua valendo no
+        # OTC; aqui ela sobrescreveria a vela com uma tese que o backtest de
+        # 09/09 mediu nula no aberto (52,55%, abaixo do empate de 54,05%).
+        return signal
+
+    veredito = vertex_evaluate(symbol, normalized)
+    bloqueados = [f for f in (signal.get("blocked_filters") or []) if not str(f).startswith("VERTEX_")]
+    signal["vertex"] = veredito
+
+    direcao = veredito["direction"]
+    if direcao is not None and normalized:
+        respeita, motivo = evaluate_respect(direcao, _support_resistance_context(normalized), normalized[-1])
+        if not respeita and motivo in NIVEL_A_FRENTE:
+            veredito = dict(veredito, direction=None, blocked="VERTEX_CONTRA_O_NIVEL")
+            signal["vertex"] = veredito
+            direcao = None
+
+    if direcao is None:
+        # PARALELO (10/09): a Vertex não tem tese nesta vela, e isso não é
+        # motivo para calar o motor clássico. Até 09/09 este ramo sobrescrevia
+        # o parecer dele com WAIT/confiança 0 — como o |vertex| só passa do
+        # extremo em ~4% das velas, 96% das análises viravam "nada aqui" e as
+        # contas pararam de operar sem erro nenhum no log. Medido em velas
+        # reais: 21 análises com direção contra 480 com a flag desligada.
+        #
+        # Agora as duas estratégias correm lado a lado: a Vertex decide quando
+        # dispara (piso próprio, `vertex_min_confidence`), e quando não dispara
+        # quem decide é o clássico, com as regras e o piso dele. O nome
+        # `VERTEX_FORA_DO_EXTREMO` fica registrado só para leitura — não
+        # penaliza score e não é bloqueio crítico.
+        if VERTEX_PARALLEL:
+            bloqueados.append(str(veredito["blocked"]))
+            signal["blocked_filters"] = bloqueados
+            signal["block_reasons"] = list(bloqueados)
+            return signal
+        signal["strategy_name"] = "Vertex reversão em desvio extremo"
+        signal["strategy_key"] = STRATEGY_VERTEX
+        signal["confidence_model_version"] = "vertex-v1"
+        signal["signal"] = "WAIT"
+        signal["direction"] = "WAIT"
+        signal["trade_allowed"] = False
+        signal["confidence"] = 0
+        signal["score"] = 0
+        signal["strategy_score"] = 0
+        bloqueados.append(str(veredito["blocked"]))
+        signal["blocked_filters"] = bloqueados
+        signal["block_reasons"] = list(bloqueados)
+        signal["quality_reason"] = str(veredito["blocked"])
+        return signal
+
+    # A Vertex disparou: a partir daqui o sinal é dela, e só dela.
+    signal["strategy_name"] = "Vertex reversão em desvio extremo"
+    signal["strategy_key"] = STRATEGY_VERTEX
+    signal["confidence_model_version"] = "vertex-v1"
+    conf = vertex_confidence(veredito["vertex"])
+    signal["signal"] = direcao
+    signal["direction"] = direcao
+    signal["analyzed_direction"] = direcao
+    signal["trade_allowed"] = True
+    signal["confidence"] = conf
+    signal["score"] = conf
+    # Escala própria e curta: quem decide operar é o |vertex| passar do nível
+    # extremo, e a confiança só reflete o quanto passou. O portão do ciclo
+    # precisa do rescale correspondente — ver `VERTEX_CONFIDENCE_MAX`.
+    signal["strategy_score"] = conf
+    signal["blocked_filters"] = []
+    signal["block_reasons"] = []
+    signal["quality_reason"] = "OK_VERTEX"
+    valor = veredito["vertex"]
+    limite = veredito["ext_top"] if direcao == "PUT" else veredito["ext_bot"]
+    lado = "esticado para cima" if direcao == "PUT" else "esticado para baixo"
+    texto = (
+        f"{symbol}: Vertex em {valor:+.1f}, {lado} além do nível extremo de "
+        f"{limite:+.0f}. Reversão esperada — entrada {direcao}."
+    )
+    for campo in ("reason", "entry_reason", "signal_explanation", "narrator_text", "analysis_detail"):
+        signal[campo] = texto
+    return signal
+
 
 def _build_signal(
     *,
@@ -541,6 +1544,7 @@ def _apply_quality_filters(
     payout: float | None,
     *,
     frequency_recovery: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     mode = strategy_mode if strategy_mode in STRATEGY_PROFILES else "conservative"
     profile = STRATEGY_PROFILES[mode]
@@ -566,9 +1570,22 @@ def _apply_quality_filters(
         "LEVEL_CONFLICT": 18,
         "LEVEL_REJECTION": 12,
         "SR_ZONE": 20,
+        "WICK_EXCESS": 20,
         "LAST_3_ALIGNMENT": 20,
         "CONTINUATION_DEAD_RSI": 18,
         "WEAK_CONTINUATION_PUT": 20,
+        "WEAK_PUT": 20,
+        "PUT_CHASE": 20,
+        "CALL_CHASE": 20,
+        "CALL_GRG": 20,
+        "SEQ_GGG": 20,
+        "SEQ_GRR": 20,
+        "WEAK_SETUP": 20,
+        "PUT_BODY": 18,
+        "PUT_WICK": 12,
+        "TOXIC_HOUR": 20,
+        "ASSET_BAN": 20,
+        "TOXIC_WEAK_PAIR": 20,
     }
 
     def check(name: str, passed: bool) -> None:
@@ -614,6 +1631,23 @@ def _apply_quality_filters(
         and direction == "PUT"
         and is_weak_continuation_put_asset(str(signal.get("symbol") or ""))
     )
+    weak_put = is_weak_put_setup(price_action_setup, direction)
+    last_3_colors = extract_last_3_colors(signal, candles)
+    chasing_put = is_chasing_continuation_put(price_action_setup, direction, last_3_colors)
+    chasing_call = is_chasing_continuation_call(price_action_setup, direction, last_3_colors)
+    call_grg = is_call_green_red_green(direction, last_3_colors)
+    seq_ggg = is_seq_green_green_green(last_3_colors)
+    seq_grr = is_seq_green_red_red(last_3_colors)
+    weak_setup = is_weak_setup(price_action_setup)
+    put_thin = is_put_thin_body(float(signal.get("body_ratio") or 0), direction)
+    put_wick = is_put_against_wick(signal.get("lower_wick_ratio"), direction)
+    toxic_hour = is_toxic_hour_brt(now)
+    banned_asset = is_banned_asset(str(signal.get("symbol") or ""))
+    toxic_weak_pair = is_toxic_weak_pair(
+        price_action_setup,
+        direction,
+        str(signal.get("symbol") or ""),
+    )
     check(
         "TREND_CLEAR",
         has_reversal_setup or signal.get("trend") != "SIDEWAYS",
@@ -635,8 +1669,14 @@ def _apply_quality_filters(
         check("WICK_REJECTION", float(signal.get("lower_wick_ratio") or 1) <= 0.45)
 
     body_ratio = float(signal.get("body_ratio") or 0)
-    check("CANDLE_STRENGTH", body_ratio >= profile["body_ratio"])
-    check("DOJI_FILTER", body_ratio >= profile["body_ratio"])
+    min_body = CANDLE_MIN_BODY_RATIO if CANDLE_WEAK_HARD_BLOCK else float(profile["body_ratio"])
+    if PUT_BODY_HARD_BLOCK and direction == "PUT":
+        min_body = max(min_body, PUT_MIN_BODY_RATIO)
+    check("CANDLE_STRENGTH", body_ratio >= min_body)
+    check(
+        "DOJI_FILTER",
+        (not is_doji_body(body_ratio)) if DOJI_HARD_BLOCK else body_ratio >= float(profile["body_ratio"]),
+    )
     check("VOLATILITY", float(signal.get("atr_pct") or 0) >= 0.0001)
     check("LAST_5_CONFIRMATION", int(signal.get("directional_candles_5") or 0) >= 3 or has_reversal_setup)
     check("NO_ALTERNATING_LAST_3", not bool(signal.get("alternating_last_3")))
@@ -644,7 +1684,28 @@ def _apply_quality_filters(
     check("SUPPORT_RESISTANCE", bool(signal.get("near_support_resistance")) or price_action_setup == "CONTINUATION")
     check("LEVEL_CONFLICT", not level_conflict)
     check("LEVEL_REJECTION", not needs_level_rejection or level_rejection_confirmed)
-    check("SR_ZONE", not (SR_ZONE_HARD_BLOCK and in_support_resistance_zone))
+    # A regra inteira de respeito à região vive em `sr_respect`: contra o nível
+    # nunca; dentro dela, só na rejeição confirmada e com espaço até o nível
+    # oposto; fora dela, livre. Antes daqui `SR_ZONE` era veto cego e barrava
+    # 383 de 383 setups `SUPPORT_RESISTANCE` — o motor somava os 15 pontos do
+    # setup e matava a entrada na mesma passagem.
+    # Sem direção não há o que respeitar: sinal WAIT já é barrado por
+    # CANDLES_UNAVAILABLE, e marcar SR_ZONE aqui inventaria uma violação de
+    # nível que não existe e sujaria o diagnóstico de quem lê o log.
+    if direction in {"CALL", "PUT"} and candles:
+        respeita_regiao, motivo_regiao = evaluate_respect(direction, level_context, candles[-1])
+    else:
+        respeita_regiao, motivo_regiao = True, RESPECT_SEM_DIRECAO
+    signal["sr_zone_source"] = level_context.get("source")
+    signal["sr_respect_reason"] = motivo_regiao
+    check("SR_ZONE", (not SR_ZONE_HARD_BLOCK) or respeita_regiao)
+    # Pavio (11/09): as velas fechadas antes da entrada e a vela em formação.
+    # `WICK_REJECTION` acima olha só `candles[-1]` — na análise, a vela com 5-20s
+    # de vida — e só tira pontos. Este é bloqueio; a mesma regra é reconferida
+    # no disparo com a vela recém-fechada (`revalidate_level_before_entry`).
+    sem_pavio, motivo_pavio, _ = evaluate_wicks(candles) if candles else (True, "PAVIO_SEM_DADOS", {})
+    signal["wick_reason"] = motivo_pavio
+    check("WICK_EXCESS", sem_pavio)
     check("REVERSAL_AGAINST", not bool(signal.get("reversal_against")))
     check(
         "LAST_3_ALIGNMENT",
@@ -658,13 +1719,63 @@ def _apply_quality_filters(
         "WEAK_CONTINUATION_PUT",
         (not WEAK_CONTINUATION_PUT_HARD_BLOCK) or (not weak_continuation_put),
     )
+    check(
+        "WEAK_PUT",
+        (not WEAK_PUT_HARD_BLOCK) or (not weak_put),
+    )
+    check(
+        "PUT_CHASE",
+        (not PUT_CHASE_HARD_BLOCK) or (not chasing_put),
+    )
+    check(
+        "CALL_CHASE",
+        (not CALL_CHASE_HARD_BLOCK) or (not chasing_call),
+    )
+    check(
+        "CALL_GRG",
+        (not CALL_GRG_HARD_BLOCK) or (not call_grg),
+    )
+    check(
+        "SEQ_GGG",
+        (not SEQ_GGG_HARD_BLOCK) or (not seq_ggg),
+    )
+    check(
+        "SEQ_GRR",
+        (not SEQ_GRR_HARD_BLOCK) or (not seq_grr),
+    )
+    check(
+        "WEAK_SETUP",
+        (not WEAK_SETUP_HARD_BLOCK) or (not weak_setup),
+    )
+    check(
+        "PUT_BODY",
+        (not PUT_BODY_HARD_BLOCK) or (not put_thin),
+    )
+    check(
+        "PUT_WICK",
+        (not PUT_WICK_HARD_BLOCK) or (not put_wick),
+    )
+    check(
+        "TOXIC_HOUR",
+        (not TOXIC_HOUR_HARD_BLOCK) or (not toxic_hour),
+    )
+    check(
+        "ASSET_BAN",
+        (not ASSET_BAN_HARD_BLOCK) or (not banned_asset),
+    )
+    check(
+        "TOXIC_WEAK_PAIR",
+        (not TOXIC_WEAK_PAIR_HARD_BLOCK) or (not toxic_weak_pair),
+    )
 
     confidence = int(signal.get("confidence") or 0)
     score_blocked = list(blocked)
     if frequency_recovery:
-        # Em recovery os soft-blocks não derrubam o score abaixo do portão —
-        # senão allowed=True no scan e NO_OPPORTUNITY no ciclo (score < 70).
-        score_blocked = [name for name in blocked if name not in FREQUENCY_RECOVERY_SOFT_BLOCKS]
+        # Em recovery a maioria dos soft-blocks não derruba o score abaixo do
+        # portão — senão allowed=True no scan e NO_OPPORTUNITY no ciclo.
+        # PRICE_ACTION_SETUP continua penalizando (KEEP_SCORE_PENALTIES).
+        waived = FREQUENCY_RECOVERY_SOFT_BLOCKS - FREQUENCY_RECOVERY_KEEP_SCORE_PENALTIES
+        score_blocked = [name for name in blocked if name not in waived]
     strategy_score = max(0, confidence - sum(penalties.get(name, 0) for name in score_blocked))
     hard_block_names = {
         "ACCOUNT_DISCONNECTED",
@@ -675,19 +1786,48 @@ def _apply_quality_filters(
         "PAYOUT_UNAVAILABLE",
         "OPERATION_IN_PROGRESS",
         "CANDLES_UNAVAILABLE",
-        # CANDLE_STRENGTH / DOJI: soft permanente (corpo alto era raro demais no M1 OTC).
         "PRICE_ACTION_SETUP",
         "REVERSAL_AGAINST",
         "LEVEL_CONFLICT",
         "LEVEL_REJECTION",
         "SR_ZONE",
     }
+    if WICK_FILTER_ENABLED:
+        hard_block_names.add("WICK_EXCESS")
     if TREND_CLEAR_HARD_BLOCK:
         hard_block_names.add("TREND_CLEAR")
     if LAST_3_ALIGNMENT_HARD_BLOCK:
         hard_block_names.add("LAST_3_ALIGNMENT")
     if WEAK_CONTINUATION_PUT_HARD_BLOCK:
         hard_block_names.add("WEAK_CONTINUATION_PUT")
+    if WEAK_PUT_HARD_BLOCK:
+        hard_block_names.add("WEAK_PUT")
+    if PUT_CHASE_HARD_BLOCK:
+        hard_block_names.add("PUT_CHASE")
+    if CALL_CHASE_HARD_BLOCK:
+        hard_block_names.add("CALL_CHASE")
+    if CALL_GRG_HARD_BLOCK:
+        hard_block_names.add("CALL_GRG")
+    if SEQ_GGG_HARD_BLOCK:
+        hard_block_names.add("SEQ_GGG")
+    if SEQ_GRR_HARD_BLOCK:
+        hard_block_names.add("SEQ_GRR")
+    if WEAK_SETUP_HARD_BLOCK:
+        hard_block_names.add("WEAK_SETUP")
+    if PUT_BODY_HARD_BLOCK:
+        hard_block_names.add("PUT_BODY")
+    if PUT_WICK_HARD_BLOCK:
+        hard_block_names.add("PUT_WICK")
+    if TOXIC_HOUR_HARD_BLOCK:
+        hard_block_names.add("TOXIC_HOUR")
+    if ASSET_BAN_HARD_BLOCK:
+        hard_block_names.add("ASSET_BAN")
+    if TOXIC_WEAK_PAIR_HARD_BLOCK:
+        hard_block_names.add("TOXIC_WEAK_PAIR")
+    if CANDLE_WEAK_HARD_BLOCK:
+        hard_block_names.add("CANDLE_STRENGTH")
+    if DOJI_HARD_BLOCK:
+        hard_block_names.add("DOJI_FILTER")
     if frequency_recovery:
         hard_block_names -= FREQUENCY_RECOVERY_SOFT_BLOCKS
         signal["frequency_recovery"] = True
@@ -712,10 +1852,16 @@ def _apply_quality_filters(
         }
     )
     if trade_allowed:
+        # O nome interno do filtro (MIN_CONFIDENCE, PRICE_ACTION_SETUP...) não
+        # diz nada para quem lê e fazia toda entrada parecer a mesma análise.
+        # Ele continua em `blocked_filters` para diagnóstico; o cliente recebe
+        # a narrativa montada a partir das MESMAS métricas.
         penalties_text = ", ".join(blocked)
-        signal["signal_explanation"] = signal.get("reason") or "Sinal aprovado."
-        if penalties_text:
-            signal["signal_explanation"] += f" Penalizacoes no score: {penalties_text}."
+        signal["technical_explanation"] = (signal.get("reason") or "Sinal aprovado.") + (
+            f" Penalizacoes no score: {penalties_text}." if penalties_text else ""
+        )
+        narrativa = str(signal.get("candle_reading") or "").strip()
+        signal["signal_explanation"] = narrativa or signal["technical_explanation"]
     else:
         filters = ", ".join(hard_blocks) if hard_blocks else "sem direção válida"
         signal["signal_explanation"] = f"Sinal sem entrada: {filters}."
@@ -978,41 +2124,21 @@ def _near_support_resistance(direction: str, candles: list[dict[str, float]]) ->
 
 
 def _support_resistance_context(candles: list[dict[str, float]]) -> dict[str, Any]:
-    if len(candles) < 12:
-        return {
-            "support": None,
-            "resistance": None,
-            "tolerance": 0.0,
-            "near_support": False,
-            "near_resistance": False,
-        }
-    recent = candles[-24:]
-    previous = recent[:-1]
-    last = recent[-1]
-    recent_range = max(candle["max"] for candle in recent) - min(candle["min"] for candle in recent)
-    avg_range = _average_range(recent)
-    tolerance = max(recent_range * 0.12, avg_range * 0.65)
-    if tolerance <= 0:
-        return {
-            "support": None,
-            "resistance": None,
-            "tolerance": 0.0,
-            "near_support": False,
-            "near_resistance": False,
-        }
-    support = min(candle["min"] for candle in previous)
-    resistance = max(candle["max"] for candle in previous)
-    support_distance = min(abs(last["min"] - support), abs(last["close"] - support))
-    resistance_distance = min(abs(last["max"] - resistance), abs(last["close"] - resistance))
-    return {
-        "support": support,
-        "resistance": resistance,
-        "tolerance": tolerance,
-        "near_support": support_distance <= tolerance,
-        "near_resistance": resistance_distance <= tolerance,
-        "support_distance": support_distance,
-        "resistance_distance": resistance_distance,
-    }
+    """Região de suporte e resistência da série.
+
+    Delega para ``sr_respect.build_zone``, que monta o nível por pivôs com
+    contagem de toques. A construção antiga — extremo da janela de 23 velas —
+    virou o fallback de lá, usado só quando não há velas ou pivôs suficientes.
+    O contrato devolvido é o mesmo de antes, mais ``source`` e a contagem de
+    toques de cada lado.
+
+    Args:
+        candles: Velas normalizadas em ordem cronológica.
+
+    Returns:
+        O dicionário da região; ver ``sr_respect.build_zone``.
+    """
+    return build_zone(candles)
 
 
 def _has_level_conflict(direction: str, context: dict[str, Any]) -> bool:
@@ -1246,17 +2372,33 @@ def _attach_candle_analysis(
     signal["metrics"] = metrics
     signal["price_action_setup"] = price_action_setup
     signal["last_3_direction"] = metrics["last_3_direction"]
+    signal["last_3_colors"] = list(metrics["last_3_colors"])
     signal["last_5_direction"] = metrics["last_5_direction"]
     signal["level_conflict"] = metrics["level_conflict"]
     signal["reversal_against"] = metrics["reversal_against"]
     signal["sideways"] = metrics["sideways"]
     signal["volatility"] = metrics["volatility"]
     signal["used_strategies"] = list(ACTIVE_ENTRY_STRATEGIES)
-    signal["candle_reading"] = (
+    # Leitura técnica preservada para log e diagnóstico: o que o cliente vê é a
+    # narrativa, mas quando algo dá errado é este texto que diz o que o motor
+    # realmente mediu.
+    signal["technical_reading"] = (
         f"{symbol} {timeframe}: price action {price_action_setup.lower()}, "
         f"candle atual {current_direction.lower()} com corpo de {body_ratio:.0%}, "
         f"últimas 3 velas {_direction_label(last_3).lower()}."
     )
+    direcao_lida = str(signal.get("signal") or signal.get("direction") or "").upper()
+    if direcao_lida in {"CALL", "PUT"}:
+        # `_normalize_candle` não preserva o `from`, então semear pelo timestamp
+        # deixava a abertura sempre igual. O fechamento da última vela muda a
+        # cada vela e está sempre presente — serve de semente estável.
+        ultimo = candles[-1] if candles and isinstance(candles[-1], dict) else {}
+        marcador = ultimo.get("from") or f"{ultimo.get('close', timeframe)}:{len(candles)}"
+        signal["candle_reading"] = monta_narrativa(
+            symbol, direcao_lida, metrics, marcador=marcador
+        )
+    else:
+        signal["candle_reading"] = signal["technical_reading"]
     signal["entry_reason"] = signal.get("reason")
 
 

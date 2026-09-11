@@ -63,15 +63,9 @@ respeitava `sr_zone_exempt`. No estado atual esses caminhos não executam.
 Usado quando não há match nomeado mas o setup clássico de continuação
 passou. Continua sujeito a `SR_ZONE` (não opera colado no nível).
 
-## Política `SR_ZONE` (histórica desta doc)
+## Política `SR_ZONE` (atualizada)
 
-A tabela abaixo descreve a política de 2026-07-26, quando este módulo estava no
-pipeline. **Não vale mais:** desde 2026-07-29 o `SR_ZONE` bloqueia qualquer
-entrada na zona de nível, sem isenção — as isenções `sr_zone_exempt` só
-voltariam a ter efeito se as estratégias nomeadas fossem reativadas *e* a
-política de isenção fosse reintroduzida. Ver `ESTRATEGIA.md`.
-
-| Situação | Resultado (política de 26/07) |
+| Situação | Resultado |
 |---|---|
 | Continuação / fluxo cego em S/R | Bloqueio crítico `SR_ZONE` |
 | `RETRACEMENT_SR` / `EXHAUSTION_REVERSAL` confirmados | Isentos de `SR_ZONE` |
@@ -108,8 +102,6 @@ SQL opcional (colunas denormalizadas):
 
 ## Histórico
 
-- **2026-07-29** — `SR_ZONE` passa a bloquear a zona de nível sem isenções; a
-  política descrita aqui fica como referência histórica.
 - **2026-07-26 (restauração clássica)** — Pipeline volta a `backup-classic`;
   este módulo deixa de alimentar entradas. Documentação mantida.
 - **2026-07-26** — Criação das 3 estratégias + narrativa + histórico detalhado + balão/popup.

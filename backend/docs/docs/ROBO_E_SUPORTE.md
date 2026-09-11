@@ -1,7 +1,7 @@
 # Robô El Capo — Operação contínua, cadência e sessão de suporte
 
 Documento de referência das regras de operação do robô e do modo suporte
-(admin acessando conta de outro usuário). Atualizado em **2026-08-07**.
+(admin acessando conta de outro usuário). Atualizado em **2026-08-17**.
 
 ## 1. Cadência de análise contínua por timeframe
 
@@ -179,6 +179,48 @@ Logs úteis (isolamento multi-sessão): `[ACTIVE_MODE_RECOVERED]`, `[ACTIVE_MODE
 
 Testes: `tests/test_real_balance_isolation.py` +
 `tests.test_persistence_restore.SessionPersistenceTests`.
+
+### Overlay “analisando” sem comprar — ANALYSIS_TIMEOUT + pool httpx (2026-08-11)
+
+Sintoma: **vários** clientes com robô ligado, pill Conectado / REAL, overlay
+em “El Capo está analisando o mercado” / “Buscando melhor oportunidade”,
+mas **quase nenhuma ordem**. Snapshots Redis (33 robôs `enabled=True`):
+maioria com `last_analysis_result=ANALYSIS_TIMEOUT`, o resto
+`NO_OPPORTUNITY_FOUND`; `last_entry` de dias atrás.
+
+Logs do `robot-runtime` no mesmo segundo:
+
+```
+[BULLEX_POOL_STATS] path=/candles kind=PoolTimeout total=100 ativas=100 ociosas=0
+[UPSTREAM_ERROR_HANDLED] path=/candles reason=timeout
+```
+
+O `bullex-service` respondia `/health` e `/account` (CPU ~1%). As requests
+de candle **não saíam** do runtime — o pool httpx do processo único estava
+cheio. Causa: cache de `/candles`/`/payouts` era **por usuário**; 33 robôs
+M1 no fechamento da vela + `schedule_background_refresh` por hit × usuário
+disparavam centenas de GETs contra `max_connections=100`. O scan sequencial
+estourava o orçamento e `complete_cycle_without_trade(..., ANALYSIS_TIMEOUT)`.
+
+Correção (2026-08-11) em `backend/main.py` (processo do `robot-runtime`):
+
+1. Cache de mercado **do processo** (`_shared_market_cache`) — 1 fetch de
+   EURUSD-OTC serve os 33 robôs.
+2. Lock por `cache_key` (single-flight) no fechamento da vela.
+3. Refresh de fundo **uma vez por ativo**, só com TTL restante ≤ 20s.
+4. Semáforo `BULLEX_HTTP_MAX_INFLIGHT=40` no hop runtime→bullex-service.
+5. Timeout de candle passa a reutilizar o cache compartilhado.
+
+O cache compartilhado que já existia no `bullex-service` (08/08) continua
+válido — ele só não era atingido quando o pool do runtime saturava.
+Detalhe e validação: `PERFORMANCE_SISTEMA.md` (“Cache compartilhado no
+robot-runtime”). Testes: `tests/test_runtime_shared_market_cache.py`.
+
+Deploy: **só** `robot-runtime` com `--no-deps` (não derrubar
+`bullex-service`). Restart do runtime não religa worker sozinho; publicar
+`start` no Redis para quem estava `enabled=True`, ou o cliente clica
+Iniciar. Trava de manutenção (`paused_by_maintenance`) permanece para
+restart sem lista de recuperação.
 
 ### Overlay “analisando” sem comprar — WAITING_RECOVERY sob carga (2026-08-07 tarde)
 
@@ -497,7 +539,8 @@ visual da sessão (`wins` / `losses` / `profit` + histórico em memória).
 Para zerar placar **e** histórico (ciclo novo), use
 `POST /robot/reset-cycle` com `reset_score: true`.
 
-Ver `HISTORICO.md`.
+Ver `HISTORICO.md` e `REINICIAR_PLACAR.md` (correção 2026-08-13: Redis +
+cmd ao runtime + cache do painel).
 
 ## 4. Estabilidade da conexão com a corretora (anti-flap)
 
@@ -533,6 +576,34 @@ Regra atual (`mark_session_failure` em `backend/main.py`):
 - Desconexão explícita (`POST /bullex/disconnect`) usa `force_offline=True`
   e derruba o estado imediatamente, como antes. Credenciais criptografadas
   **permanecem** salvas (usar `DELETE /bullex/credentials` para esquecer).
+
+### Flicker "Desconectado" ao entrar/sair de Configurações (2026-08-07)
+
+Sintoma: pill/banner vermelho **só na UI**, sem email/saldo; robô segue
+comprando. Dispara ao navegar para `/configuracoes` e voltar.
+
+Cadeia:
+
+1. Poll bate em backoff/offline do bullex-service.
+2. Resposta `connected:false` **vazia** (sem email/saldo) substituía o cache
+   bom no React Query.
+3. `BullexConnectionPanel` lia `!connected` → "Desconectado".
+
+Correção: anti-flap no bullex-service + `resolve_backoff_panel_payload` no
+gateway + `preferStableBullExAccount` / status `BACKOFF` no frontend.
+Detalhe em `CONFIGURACOES.md` e `BULLEX_CREDENCIAIS.md`.
+
+### "Operação aberta" infinita sem comprar (2026-08-07)
+
+Sintoma: overlay em **Operação aberta / Aguardando resultado** para sempre;
+robô não analisa nem compra (ex.: conta marketing `victorvinicius@gmail.com`).
+
+Causa: `waiting_result_stale` retornava `False` sempre que
+`operation_in_progress=True`, então o worker nunca dava `reset_cycle_after_result`.
+
+Correção: stale por TTL (vela + margem) **mesmo com** `operation_in_progress`,
+ou imediatamente se `last_trade.result` já for WIN/LOSS/TIMEOUT/DRAW.
+Testes: `tests/test_waiting_result_stale.py`.
 
 ### Parou após 2 operações sem stop win (2026-07-24)
 
@@ -673,9 +744,10 @@ Endpoints permitidos durante a sessão de suporte (`support_safe_paths` em
 
 - `GET /me/access`, `GET /admin/support-sessions/current`
 - `GET /bullex/account`, `GET /bullex/status`, `GET /bullex/balance`
-- `GET /robot`, `GET /robot/state`, `GET /robot/history` — leitura do painel
-  do robô (adicionados para o dashboard de suporte renderizar; antes esses
-  GETs retornavam 403 e o frontend exibia "This page didn't load")
+- `GET /robot`, `GET /robot/state`, `GET /robot/history`, `GET /robot/stats`
+  — leitura do painel do robô (o dashboard de suporte precisa desses GETs)
+- `GET /robot/ws-ticket` — canal ao vivo do estado do robô (somente leitura;
+  o WS `/ws/robot-state` autentica pelo ticket já emitido para o usuário-alvo)
 - `POST /bullex/connect`, `POST /bullex/disconnect`, `POST /bullex/reconnect`
   (suporte pode reconectar a corretora do cliente)
 - `GET /bullex/credentials`, `DELETE /bullex/credentials`
@@ -683,6 +755,25 @@ Endpoints permitidos durante a sessão de suporte (`support_safe_paths` em
 
 Tudo o mais (ligar/desligar robô, configuração, reset, ordens, websocket de
 gráfico) continua bloqueado com `403 IMPERSONATION_READ_ONLY` e auditado.
+
+### Frontend (AppShell) na sessão de suporte
+
+`POST /admin/impersonations` + `window.location.assign("/dashboard")` recarrega
+o painel como o lead. O dashboard, Configurações e Histórico chamam
+`useLiveTradingData()`.
+
+| Peça | Comportamento em suporte |
+|------|--------------------------|
+| `LiveTradingDataProvider` | **Monta** (senão o hook explode: “precisa ser usado dentro de LiveTradingDataProvider”) |
+| Overlay flutuante do robô | **Oculto** (`shouldShowRobotOverlay` = false) |
+| Overlay “aguardando aprovação” | **Não aparece** — mesmo lead pendente sem `grant_access` |
+| Aba Robô em Configurações | **Oculta** (`canUseRobotControls(false)`) |
+| Rotas | Só `/dashboard`, `/configuracoes`, `/history` |
+
+Helpers em `frontend/src/lib/adminPresentation.ts`:
+`shouldMountLiveTradingProvider`, `shouldShowRobotOverlay`,
+`shouldTreatSessionAsInactive`. Em `/admin/*` o provider continua **desligado**
+(performance). Testes: `adminPresentation.test.ts`.
 
 ## 7. Configuração de valores (entrada, stop win, stop loss)
 
@@ -738,8 +829,74 @@ Detalhes: `NARRACAO_ROBO.md` e `ANALISE_CONTINUA.md`.
 O backend ainda envia `next_cycle_at` internamente para o worker; o painel
 só esconde o timer nessa fase.
 
+### Saldo insuficiente (aviso na tela)
+
+Se a Bullex rejeitar a compra com `Insufficient funds` (mesmo com
+`balance=None` no cache), o runtime **para** o robô
+(`INSUFFICIENT_BALANCE`) em vez de só marcar `ORDER_REJECTED` e
+continuar o ciclo. Overlay: título **Saldo insuficiente** + pedido de
+depósito ou redução da entrada. Log:
+`[ORDER_REJECTED_INSUFFICIENT_FUNDS]`. Detalhes: `OVERLAY_ROBO.md` §5.
+
+### Placar sumindo no painel
+
+Causas comuns (2026-08-11):
+
+1. Snapshot Redis expirava (TTL curto) e o gateway em modo `external`
+   devolvia `auto_trader` local com placar 0.
+2. Badges WIN/LOSS sem fundo — contraste fraco no dashboard.
+
+Correção: TTL 600s; `rehydrate_score_from_persistence_if_blank` no
+snapshot/HTTP; `/robot/state` prefere snapshot do runtime; badges com
+fundo. Ver `OVERLAY_ROBO.md` §6.
+
 ## 9. Histórico de mudanças
 
+- **2026-08-17 (Acessar conta do lead quebrava o dashboard)**
+  - Sintoma: admin clica “Acessar conta”, o console mostra
+    `[AUTH USER CHANGED]` e em seguida
+    `useLiveTradingData precisa ser usado dentro de LiveTradingDataProvider`.
+  - Causa: `mountLiveTrading = !impersonating && …` desmontava o provider
+    assim que `/me/access` marcava `impersonating: true`, mas o dashboard
+    (e Configurações) continuam chamando o hook. Lead pendente ainda caía
+    no overlay de “aguardando aprovação”.
+  - Correção: provider monta na sessão de suporte; overlay do robô e
+    bloqueio de inativo não. `GET /robot/ws-ticket` entra em
+    `support_safe_paths`. Ver §5.
+- **2026-08-13 (Reiniciar placar não zerava no overlay)**
+  - Sintoma: clique em Reiniciar placar e o WIN/LOSS voltava ao valor antigo.
+  - Causa: mode=external — gateway zerava só memória local; Redis/runtime
+    mantinham o placar; front fazia `await refetch` do snapshot stale.
+  - Correção: `publish_robot_control_snapshot` + cmd `reset_score` ao
+    runtime; `applyRobotMutationToCache` no overlay; rehydrate respeita
+    `stop_reset_at`. Ver `REINICIAR_PLACAR.md`.
+- **2026-08-13 (Iniciar/Parar operação demorava no overlay)**
+  - Sintoma: botão Parar/Iniciar atrasava vários segundos; às vezes ficava em
+    Parar com `enabled=false` e `worker_running=true` no Redis.
+  - Causa: em mode=external o painel lia snapshot Redis stale; o stop do
+    runtime não republicava após sair de `robot_tasks`; o front fazia
+    `await refetch` e usava `enabled || worker_running`.
+  - Correção: `publish_robot_control_snapshot` no start/stop; runtime
+    publica stop antes do cancel; front aplica payload da mutação e usa só
+    `enabled` para o botão. Ver `INICIAR_PARAR_OPERACAO.md`.
+  - Testes: `tests/test_robot_control_snapshot.py`,
+    `robotCountdown.test.ts` (`isRobotOperationRunning`).
+- **2026-08-11 (saldo insuficiente + placar no overlay)**
+  - Compra REAL com `Insufficient funds` agora para o robô e exibe aviso
+    claro (não fica em loop “analisando”).
+  - Placar: reidratação da persistência + contraste dos badges + TTL
+    snapshot 600s. Testes:
+    `tests/test_insufficient_funds_and_score.py`,
+    `robotPresentation.insufficient.test.ts`.
+- **2026-08-11 (ANALYSIS_TIMEOUT em massa — robô “analisa” e não opera)**
+  - Sintoma: dezenas de contas ligadas, overlay em análise, quase zero
+    ordens. Runtime: `[BULLEX_POOL_STATS] PoolTimeout total=100 ativas=100`.
+  - Causa: cache de candles/payouts só por usuário + refresh por hit;
+    33 robôs M1 esgotavam o pool httpx do `robot-runtime` antes do
+    bullex-service. Ciclo virava `ANALYSIS_TIMEOUT`.
+  - Correção: cache compartilhado + single-flight + refresh coalescido +
+    semáforo 40 no runtime. Ver §1 e `PERFORMANCE_SISTEMA.md`.
+  - Testes: `tests/test_runtime_shared_market_cache.py`.
 - **2026-08-07 (noite — Iniciar Operação derrubava a Bullex)**
   - Sintoma: ao iniciar, painel marcava desconectado / kick na corretora.
   - Causa: auto-reconnect com login novo + `disconnect_account` no start.

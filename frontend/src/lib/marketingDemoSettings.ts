@@ -6,6 +6,12 @@
  * (pop Iniciar Operação).
  */
 
+import {
+  brasiliaDateTimeParts,
+  formatBrasiliaDateTime,
+  fromBrasiliaDate,
+} from "./brasiliaTime.ts";
+
 export type MarketingDirectionMode = "AUTO" | "CALL" | "PUT";
 export type MarketingResultMode = "AUTO" | "WIN" | "LOSS";
 
@@ -153,34 +159,35 @@ export type MarketingTimingMode = "now" | "custom";
  * Formata um instante para o valor de ``input[type=datetime-local]``.
  *
  * Args:
- *   date: Instante a exibir (padrão: agora no fuso local do navegador).
+ *   date: Instante a exibir (padrão: agora).
  *
  * Returns:
- *   String ``YYYY-MM-DDTHH:mm`` no horário local.
+ *   String ``YYYY-MM-DDTHH:mm`` no horário de Brasília.
  */
 export function toLocalDateTimeInputValue(date: Date = new Date()): string {
   const pad = (value: number) => String(value).padStart(2, "0");
+  const parts = brasiliaDateTimeParts(date);
   return [
-    date.getFullYear(),
+    parts.year,
     "-",
-    pad(date.getMonth() + 1),
+    pad(parts.month + 1),
     "-",
-    pad(date.getDate()),
+    pad(parts.day),
     "T",
-    pad(date.getHours()),
+    pad(parts.hour),
     ":",
-    pad(date.getMinutes()),
+    pad(parts.minute),
   ].join("");
 }
 
 /**
- * Converte o valor de ``datetime-local`` (horário local) para ISO8601.
+ * Converte o valor de ``datetime-local`` (horário de Brasília) para ISO8601.
  *
  * Args:
  *   value: String ``YYYY-MM-DDTHH:mm`` ou ``YYYY-MM-DDTHH:mm:ss``.
  *
  * Returns:
- *   ISO8601 com offset local, ou ``null`` se inválido/vazio.
+ *   ISO8601 UTC, ou ``null`` se inválido/vazio.
  */
 export function localDateTimeInputToIso(value: string): string | null {
   const trimmed = value.trim();
@@ -193,14 +200,16 @@ export function localDateTimeInputToIso(value: string): string | null {
   const hour = Number(match[4]);
   const minute = Number(match[5]);
   const second = Number(match[6] ?? "0");
-  const date = new Date(year, month - 1, day, hour, minute, second);
+  const date = fromBrasiliaDate(year, month - 1, day, hour, minute, second);
+  if (Number.isNaN(date.getTime())) return null;
+  const parts = brasiliaDateTimeParts(date);
   if (
-    date.getFullYear() !== year ||
-    date.getMonth() !== month - 1 ||
-    date.getDate() !== day ||
-    date.getHours() !== hour ||
-    date.getMinutes() !== minute ||
-    date.getSeconds() !== second
+    parts.year !== year ||
+    parts.month !== month - 1 ||
+    parts.day !== day ||
+    parts.hour !== hour ||
+    parts.minute !== minute ||
+    parts.second !== second
   ) {
     return null;
   }
@@ -208,23 +217,15 @@ export function localDateTimeInputToIso(value: string): string | null {
 }
 
 /**
- * Formata ``created_at`` ISO para exibição no painel (pt-BR).
+ * Formata ``created_at`` ISO para exibição no painel (pt-BR, Brasília).
  *
  * Args:
  *   value: Timestamp ISO8601 ou indefinido.
  *
  * Returns:
- *   Data/hora local legível, ou string vazia se inválido.
+ *   Data/hora de Brasília, ou string vazia se inválido.
  */
 export function formatMarketingTradeDateTime(value?: string | null): string {
   if (!value) return "";
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return "";
-  return parsed.toLocaleString("pt-BR", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return formatBrasiliaDateTime(value);
 }

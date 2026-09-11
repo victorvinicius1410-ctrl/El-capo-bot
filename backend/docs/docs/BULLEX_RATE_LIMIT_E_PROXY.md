@@ -154,4 +154,11 @@ python -m unittest tests.test_bullex_rate_limit_proxy -v
 
 ## Histórico
 
+- **2026-08-07 (reconexão pós-restart sem vazar status cru)** — Corrigido o
+  caminho que ficava dependente só deste gate: `/sessions/reconnect` agora
+  cai no restore por SSID persistido antes de exigir login novo, e
+  `/bullex/reconnect` nunca mais devolve o status HTTP cru pro frontend
+  quando o fallback falha (inclusive por este gate ainda ativo). Detalhes em
+  [`BULLEX_CREDENCIAIS.md`](./BULLEX_CREDENCIAIS.md) §"Reconexão sem vazar
+  status cru".
 - **2026-08-07** — Documento criado junto com backoff global + suporte a proxy.

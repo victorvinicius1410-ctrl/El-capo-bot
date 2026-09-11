@@ -197,6 +197,7 @@ Valores restaurados ao comportamento original (não alterar):
 | Constante | Valor | Por quê |
 |---|---|---|
 | `result_display_until` | **5s** | Bloqueia `prepare_cycle`; esticar atrasa a análise na vela |
+| Overlay WIN/LOSS + ativo | **60s** | Só UI (`RESULT_OVERLAY_DISPLAY_MS`); não bloqueia o ciclo |
 | `acknowledge_unseen_result(hold_seconds)` | **8s** | Só overlay de tela fechada |
 | `unseen_result` no fechamento | só com painel **offline** | Online, o payload não deve mascarar o ciclo |
 
@@ -221,6 +222,132 @@ A fala de dinheiro usa `formatMoneyForSpeech` (`bullexConnection.ts`):
 
 Sem vírgula nem ponto decimal na string falada.
 
+
+## 4d. Fala longa cortada no meio (2026-09-08)
+
+Sintoma: o El Capo começava a explicar a operação e **parava antes do fim** —
+a explicação nunca era repetida, porque a chave já entrava em `spokenKeys`
+antes do `speak()`.
+
+Três causas somadas, todas em `useRobotNarrator.ts`:
+
+1. **Watchdog cego.** O bloco de `BUSY_WATCHDOG_MS` (25s) cancelava por tempo
+   puro, sem checar `speechSynthesis.speaking`. O texto de `SIGNAL_FOUND` tem
+   ~52 palavras (~22s no `SPEECH_RATE` de 0,92) e passa disso quando a
+   estratégia traz resumo longo — então o watchdog cortava fala legítima.
+2. **Corte de fala longa do Chrome (~15s).** O keep-alive só chamava
+   `resume()` sob `speaking && paused`, mas nesse bug o motor mantém
+   `paused=false` — a condição nunca era satisfeita.
+3. **Preempção por `ORDER_REJECTED`** (prioridade 80 contra 0). Enquanto o
+   par recusado repetia "Entrada rejeitada" a cada vela, ele cortava a
+   explicação da entrada seguinte. Ver o cooldown progressivo em
+   [`ESTRATEGIA.md`](./ESTRATEGIA.md) §6 (2026-09-08).
+
+### Correção vigente
+
+| Peça | Arquivo | Comportamento |
+|---|---|---|
+| `splitSpeechChunks` | `frontend/src/lib/speechChunks.ts` | Quebra o texto em pedaços de até `SPEECH_CHUNK_MAX_CHARS` (140), **sem partir frase** |
+| `speakSequence` | `frontend/src/hooks/useRobotNarrator.ts` | Encadeia os pedaços no `onend` do anterior; só o 1º passa pelo `cancel()` + 60ms do Safari |
+| `onChunkStart` | idem | Reinicia `busyStartedAtRef` a cada pedaço — o watchdog mede **falta de progresso**, não duração total |
+| `engineIdle` | idem | Watchdog normal só corta com o motor parado |
+| `BUSY_HARD_WATCHDOG_MS` | idem | 120s — destrava se o Chrome deixar `speaking` preso em `true` |
+| Keep-alive | idem | `pause()+resume()` incondicional a cada 5s enquanto `speaking` |
+
+O texto ouvido **não mudou** — só a forma de entregá-lo ao motor de voz.
+
+Testes: `frontend/src/lib/robotNarration.test.ts` (bloco "fala longa não é
+cortada no meio").
+
+## 4e. Modo LIVE narrado como operação normal (2026-09-09)
+
+O modo LIVE (`live_demo_mode.py`) afrouxa o portão em OTC para dar cadência à
+transmissão. Até 09/09 ele também **reescrevia a narração**: `apply_live_demo`
+gravava, nos mesmos campos que o overlay fala em voz alta (`narrator_text`,
+`entry_reason`, `signal_explanation`, `analysis_detail`), o texto
+
+> “EURUSD-OTC: entrada de demonstração (CALL). Modo LIVE ligado — o portão de
+> qualidade está afrouxado para dar ritmo à transmissão. Não é sinal de
+> convicção.”
+
+e batizava a estratégia de **“Modo LIVE (demonstração)”**, com resumo “Entrada
+de demonstração, portão afrouxado.”. Na live, o robô anunciava sozinho que
+aquilo não era operação de verdade — no balão, no painel e no histórico.
+
+Havia ainda um segundo caminho, em `narrativa_analise.monta_narrativa`
+(parâmetro `demonstracao`), com o mesmo tipo de texto. Nenhum chamador o usava;
+foi removido para não voltar por engano.
+
+### Correção vigente
+
+`live_demo_mode.narracao_normal` monta a narração igual à de qualquer entrada:
+
+- **Texto falado** = `candle_reading`, a leitura que `narrativa_analise` já
+  produziu das métricas reais daquela vela (mesma função da entrada normal).
+- **Nome da estratégia** = rótulo de `named_strategies.STRATEGY_LABELS`
+  escolhido pelo `price_action_setup` medido: `REVERSAL` → “Padrões de Reversão
+  em Zonas de Exaustão”, `CONTINUATION` → “Continuação de tendência”, resto →
+  “Fluxo de Velas (Seguimento de Força)”.
+- **Resumo e `speech_preview`** na mesma linha do rótulo.
+
+Nada é inventado: a narrativa continua graduando o fecho pelo que as métricas
+mostram, então setup magro sai com texto de setup magro — só não anuncia o modo.
+
+### A chave da estratégia também entregava (mesmo dia)
+
+`strategy_key` não é campo interno: é **campo de tela**, em dois lugares.
+
+1. O Histórico do cliente imprime a chave crua como badge sob o nome da
+   estratégia — “LIVE_DEMO” em letras maiúsculas.
+2. Pior: `build_strategy_narration` (`main.py`) abria com ela a lista de
+   estratégias que o overlay **lê em voz alta**
+   (`used.append(strategy_key)`). Na transmissão, o robô dizia *“Estratégia
+   utilizada: LIVE_DEMO, EMA9/EMA21, RSI…”*.
+
+Agora `apply_live_demo` grava a **chave real do setup medido**
+(`CANDLE_FLOW` / `CONTINUATION` / `EXHAUSTION_REVERSAL`), a mesma do rótulo
+exibido. E `build_strategy_narration` parou de pôr chave interna na lista
+falada — ela agora vem de `used_strategies`, as estratégias do motor.
+
+**O que continua marcado (auditoria):** o booleano `live_demo` no
+`analysis_json`, `quality_reason = "OK_LIVE_DEMO"` (nenhuma tela lê) e a linha
+`[LIVE_DEMO_RELEASE]` no log. **Toda consulta que precisar separar essas
+operações usa `live_demo = true`** — a chave não diz mais. Ver `ESTRATEGIA.md`
+§2026-09-08 (o booleano) e §2026-09-09.
+
+O filtro `CHAVES_INTERNAS` em `useRobotHistory.ts` continua: as ~184 operações
+já gravadas com `strategy_key=LIVE_DEMO` seguem no banco e apareceriam no
+badge do Histórico.
+
+Testes: `tests/test_live_demo_mode.py` (`test_narra_como_operacao_normal`,
+`test_nome_da_estrategia_vem_do_setup_medido`,
+`test_chave_da_estrategia_nao_entrega_o_modo`).
+
+## 4f. “Confluência” na voz da entrada (2026-09-09)
+
+O cliente ouvia, nas entradas sem estratégia nomeada:
+
+> “Estratégia utilizada: **Confluência EMA9/EMA21 + RSI + Candle Force +
+> Pavios + Price Action + Últimos Candles + Volatilidade + Payout**.”
+
+Isso não é nome de estratégia — é o inventário dos filtros que aprovaram o
+sinal, montado em `build_strategy_narration` (`main.py`) como
+`"Confluência " + " + ".join(used)`. A mesma função enfiava a **chave interna**
+(`RETRACEMENT_SR`, `LIVE_DEMO`…) como primeiro item da lista falada.
+
+Havia ainda dois fallbacks com a frase “Estratégia de maior confluência”:
+`entry_voice_details` e `default_strategy_name` (`auto_trader.py`) e
+`strategyLabel` (`robotNarration.ts`).
+
+**Correção:** a preferência agora é a lista do motor — `used_strategies`, que
+vem de `ACTIVE_ENTRY_STRATEGIES` (*Price Action, Psicologia de velas, Padrões
+de vela*, mais *Multi-timeframe 1m/5m/15m* quando a leitura foi combinada).
+São as estratégias reais, com nome de gente. Os componentes derivados dos
+filtros seguem como fallback para sinal que chegue sem a lista, mas sem a
+palavra “Confluência” na frente e sem chave interna.
+
+Teste: `tests/test_auto_trader.py::test_due_cycle_with_valid_signal_creates_pending_signal`.
+
 ## 5. Janela de entrada (inalterada)
 
 Quando há `pending_signal` aguardando a vela:
@@ -242,6 +369,17 @@ na compra: `ACTIVE_CLOSED` vs “baixa qualidade”).
 
 ## 6. Histórico
 
+- **2026-09-09 (confluência)** — “Confluência EMA9/EMA21 + RSI + …” e
+  “Estratégia de maior confluência” saem da voz e do painel: fala as
+  estratégias reais do motor; chave interna nunca mais na lista falada.
+  Ver §4f.
+- **2026-09-09** — Modo LIVE deixa de se anunciar: narração, nome de estratégia
+  e resumo montados como operação normal; `strategy_key` passa a ser a real e
+  `LIVE_DEMO` some do badge do Histórico e da lista falada. Auditoria pelo
+  booleano `live_demo`. Ver §4e.
+- **2026-09-08** — Fala longa deixou de ser cortada: texto quebrado em
+  pedaços encadeados, watchdog só corta com o motor parado, keep-alive do
+  Chrome com `pause()+resume()`. Ver §4d.
 - **2026-07-31 (visual Mac/celular)** — Avatar via canvas (`RobotAvatarVideo`)
   para Safari/iOS aplicar o mesmo `hue-rotate` do Windows. Ver `OVERLAY_ROBO.md`.
 - **2026-07-31 (entrada anunciada sem compra)** — Overlay e voz deixam de

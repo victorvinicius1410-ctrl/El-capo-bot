@@ -64,6 +64,9 @@ Fluxo típico dentro de uma vela:
 > (`NARRACAO_ROBO.md` §4c). Em 2026-08-04 a compra foi para **0–8s** (não
 > alongar o display) para absorver latência de refresh/canal sem voltar ao
 > bug do display 12s.
+>
+> O overlay pode mostrar WIN/LOSS + ativo por **até 60s** (`RESULT_OVERLAY_DISPLAY_MS`)
+> **sem** alterar os 5s de `result_display_until`. Ver `OVERLAY_ROBO.md` §8.
 
 ## 4. Funções-chave
 
@@ -89,18 +92,38 @@ painel. Significado atual:
   intervalo entre análises.
 - O frontend exibe “monitora a cada vela · expira em X min”.
 
-## 6. Metas operacionais (referência)
+## 6. Metas operacionais vs cadência real (2026-08-15)
 
-`MIN_OPERATIONS_PER_HOUR_BY_TIMEFRAME`:
+`MIN_OPERATIONS_PER_HOUR_BY_TIMEFRAME` no código:
 
-| TF | Meta mín. ops/hora |
+| TF | Meta (recovery) | Teto físico (1 op / vela) |
+|---|---|---|
+| M1 | 12 | 60 |
+| M5 | 6 | 12 |
+| M15 | 2 | 4 |
+
+A meta **não é garantia**. Medido nas contas com robô ligado ≥30 min
+(pós-substitution 13/08–15/08, **antes** dos cortes de qualidade):
+
+| TF | Mediana ops/hora | Média | Faixa típica (p25–p75) |
+|---|---|---|---|
+| M1 | **~1** | 1,7 | 0,5–3,3 |
+| M5 | **~2** | 1,8 | 1,5–2,3 |
+| M15 | amostra 1 conta | ~0,7 | — |
+
+Com os cortes ao vivo (WEAK PUT, vela fraca, PUT chase/corpo/pavio), o
+histórico **já ocorrido** perderia ~metade das linhas. Na prática o recovery
+ainda pode preencher com **WEAK CALL** de vela forte no mesmo ciclo, então a
+cadência por conta tende a:
+
+| TF | Tendência por hora (conta ligada o tempo todo) |
 |---|---|
-| M1 | 12 |
-| M5 | 6 |
-| M15 | 2 |
+| M1 | **1 a 3** (mais perto de 1–2; picos ~3 em hora boa) |
+| M5 | **~1** (poucas velas; M5 já era baixo) |
+| M15 | **0 a 1** (muitas velas sem setup) |
 
-São metas de capacidade (mais oportunidades por varredura contínua),
-não garantias. A qualidade do setup ainda manda.
+Não esperar 12 ops/hora no M1: isso era teto de “preencher ciclo com WEAK
+PUT”. Esse volume era o que puxava o acerto para baixo.
 
 ## 7. Testes
 

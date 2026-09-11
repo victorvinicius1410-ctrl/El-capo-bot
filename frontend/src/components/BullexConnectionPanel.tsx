@@ -11,7 +11,10 @@ import {
 } from "@/hooks/useLiveTradingData";
 import { BULLEX_ACCOUNT_QUERY_KEY } from "@/hooks/useBullExAccount";
 import { getStoppedRobotState } from "@/lib/robotState";
-import { markManualBullexDisconnect } from "@/lib/manualBullexDisconnect";
+import {
+  clearManualBullexDisconnect,
+  markManualBullexDisconnect,
+} from "@/lib/manualBullexDisconnect";
 import {
   formatBullExBalance,
   isBullExConnected,
@@ -93,6 +96,9 @@ export function BullexConnectionPanel() {
       return;
     }
     setCredentialsOpen(false);
+    // Reconectar por vontade própria é o que encerra a desconexão manual —
+    // mesma regra do `bullex_manual_disconnect` no gateway.
+    clearManualBullexDisconnect();
     toast.success("Conta Bullex conectada. Login salvo de forma segura para o robô.");
     await Promise.all([
       account.refetch(),
@@ -113,6 +119,7 @@ export function BullexConnectionPanel() {
       setCredentialsOpen(true);
       return;
     }
+    clearManualBullexDisconnect();
     toast.success("Sessão Bullex restaurada com as credenciais salvas.");
     await Promise.all([
       account.refetch(),
@@ -125,15 +132,18 @@ export function BullexConnectionPanel() {
   async function disconnect() {
     setPending(true);
     setError(null);
+    // ANTES do POST: o poll/WS corre em paralelo e pode devolver snapshot
+    // Redis ainda "conectado" na janela da requisição. Sem a marca cedo,
+    // isBullExConnected e o reconcile do robô desfazem o clique na UI.
+    markManualBullexDisconnect();
     try {
       const response = await bullexApi.disconnect();
       if (!response.ok) {
+        clearManualBullexDisconnect();
         setError(response.error);
         toast.error(response.error || "Não foi possível desconectar a Bullex.");
         return;
       }
-      // Impede auto-reconnect + preferStable de desfazer o clique.
-      markManualBullexDisconnect();
       const disconnectedAccount: BullExAccount = {
         connected: false,
         balance: null,

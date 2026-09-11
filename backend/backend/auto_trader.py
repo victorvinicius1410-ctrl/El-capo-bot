@@ -4,6 +4,8 @@ import math
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+
+from backend.brasilia_time import is_brasilia_today
 from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -56,6 +58,7 @@ from backend.status import (
 )
 
 from backend.signal_engine import (
+    ACTIVE_ENTRY_STRATEGIES,
     cycle_minutes_for_timeframe,
     seconds_until_next_analysis,
 )
@@ -93,6 +96,9 @@ ANALYSIS_TIMEOUT_SECONDS = 10
 # Janela em que o resultado fica disponível para a narração do placar.
 # Independente de `result_display_until` (que controla o ciclo operacional).
 RESULT_VOICE_TTL_SECONDS = 25
+# Overlay: WIN/LOSS + ativo somem após 60s do fechamento. Independente de
+# `result_display_until` (5s, ciclo operacional). Não esticar os 5s.
+RESULT_OVERLAY_DISPLAY_SECONDS = 60
 # Status em que o robô já engatou um novo ciclo: o payload não deve voltar a
 # exibir o WIN/LOSS anterior (`unseen_result`) por cima deles.
 ROBOT_BUSY_STATUSES = {
@@ -155,10 +161,25 @@ def spoken_entry_direction(direction: str) -> str:
     return normalized or "direção não definida"
 
 
+def spoken_strategies(signal: dict[str, Any]) -> str:
+    """Nome falado da estratégia: o real, nunca "maior confluência".
+
+    O fallback antigo era a frase "Estratégia de maior confluência", que não é
+    o nome de nada — o motor tem estratégias com nome (`ACTIVE_ENTRY_STRATEGIES`)
+    e o sinal as carrega em ``used_strategies``. Quando o `strategy_name` vem
+    vazio, é essa lista que o robô fala.
+    """
+    nome = str(signal.get("strategy_name") or "").strip()
+    if nome and not nome.lower().startswith("estratégia de maior confluência"):
+        return nome
+    usadas = [str(item).strip() for item in (signal.get("used_strategies") or []) if str(item).strip()]
+    return ", ".join(usadas) if usadas else ", ".join(ACTIVE_ENTRY_STRATEGIES)
+
+
 def entry_voice_details(signal: dict[str, Any], *, include_score: bool) -> str:
     symbol = str(signal.get("symbol") or signal.get("active") or "").strip() or "ativo não definido"
     direction = spoken_entry_direction(str(signal.get("direction") or signal.get("signal") or ""))
-    strategy = str(signal.get("strategy_name") or "Estratégia de maior confluência").strip()
+    strategy = spoken_strategies(signal)
     reason = str(
         signal.get("entry_reason")
         or signal.get("strategy_reason")
@@ -247,6 +268,11 @@ def resolve_robot_stop_reason(
     current_wins = int(wins if wins is not None else getattr(state, "wins", 0) or 0)
     current_losses = int(losses if losses is not None else getattr(state, "losses", 0) or 0)
     session_profit = float(profit if profit is not None else getattr(state, "profit", 0) or 0)
+    # Todo chamador deriva wins/losses/profit do placar exibido; o stop só
+    # conta ordem real, então tira a parte que o Shift+O pôs lá.
+    current_wins = max(0, current_wins - int(getattr(state, "stop_offset_wins", 0) or 0))
+    current_losses = max(0, current_losses - int(getattr(state, "stop_offset_losses", 0) or 0))
+    session_profit -= float(getattr(state, "stop_offset_profit", 0) or 0)
 
     if loss_mode == "operations":
         ops = max(0, int(getattr(state, "stop_loss_operations", 0) or 0))
@@ -273,6 +299,48 @@ def resolve_robot_stop_reason(
                 return STATUS_STOP_WIN_HIT
 
     return None
+
+
+def is_synthetic_trade(trade: dict[str, Any]) -> bool:
+    """True para operação criada pelo Shift+O, que não passou pela corretora.
+
+    Ordem real tem id numérico da corretora; a sintética nasce com UUID. A
+    operação real espelhada no painel marketing guarda o id da corretora em
+    ``broker_order_id`` e continua contando. Id vazio conta como real: na
+    dúvida o stop protege.
+    """
+    order_id = str(trade.get("order_id") or "").strip()
+    if not order_id or order_id.isdigit():
+        return False
+    return not str(trade.get("broker_order_id") or "").strip().isdigit()
+
+
+def set_display_score(state: Any, wins: int, losses: int, profit: float) -> None:
+    """Troca o placar exibido por um valor vindo do Shift+O.
+
+    A diferença vai inteira para ``stop_offset_*``: o que é real não muda, só
+    a vitrine. Só para mudança de placar feita pelo Shift+O — resultado de
+    ordem real incrementa ``wins``/``losses`` direto e precisa contar.
+    """
+    wins = max(0, int(wins))
+    losses = max(0, int(losses))
+    profit = round(float(profit), 2)
+    state.stop_offset_wins = int(state.stop_offset_wins or 0) + wins - int(state.wins or 0)
+    state.stop_offset_losses = int(state.stop_offset_losses or 0) + losses - int(state.losses or 0)
+    state.stop_offset_profit = round(
+        float(state.stop_offset_profit or 0) + profit - float(state.profit or 0), 2
+    )
+    state.wins = wins
+    state.losses = losses
+    state.profit = profit
+
+
+def clear_stop_offsets(state: Any, *, profit_only: bool = False) -> None:
+    """Zera a parte do Shift+O junto com o placar que ela compunha."""
+    state.stop_offset_profit = 0.0
+    if not profit_only:
+        state.stop_offset_wins = 0
+        state.stop_offset_losses = 0
 
 
 class RobotConfigUpdate(BaseModel):
@@ -342,7 +410,18 @@ class RobotState:
     stop_loss_mode: str = "money"
     stop_win_operations: int = 5
     stop_loss_operations: int = 3
+    # Parte do placar (wins/losses/profit) que veio do Shift+O — gerar placar,
+    # simular ou excluir operação — e não de ordem real. O stop desconta isto:
+    # placar de vitrine não pode desligar o robô. Em 10/09 um "gerar placar"
+    # 8x2 +R$480 disparou STOP_WIN_HIT real na conta marketing.
+    stop_offset_wins: int = 0
+    stop_offset_losses: int = 0
+    stop_offset_profit: float = 0.0
     max_entries_per_cycle: int = 1
+    # Modo LIVE: cadência de demonstração para transmissão. Só conta de
+    # marketing consegue ligar (o endpoint recusa as demais). Afrouxa o portão
+    # em OTC — mais entradas, mesmo acerto de ~50%. Ver `live_demo_mode.py`.
+    live_demo: bool = False
     allow_real: bool = True
     confirm_real: bool = True
     martingale_enabled: bool = False
@@ -379,6 +458,10 @@ class RobotState:
     rejection_reason: str | None = None
     server_time: str | None = None
     server_time_source: str = "vps_fallback"
+    # Instantâneo em que `server_time` foi amostrado (Bullex/VPS). Usado por
+    # `estimate_state_server_timestamp` — NÃO reutilizar `connection_checked_at`
+    # nem sobrescrever com relógio estimado (drift composto → compra cedo).
+    server_time_sampled_at: datetime | None = None
     connected: bool = False
     active_mode: str | None = "REAL"
     connection_checked_at: datetime | None = None
@@ -450,6 +533,7 @@ class RobotState:
             "result_client_seen_at",
             "stop_reset_at",
             "connection_checked_at",
+            "server_time_sampled_at",
             "last_connected_at",
             "connection_grace_until",
             "sync_started_at",
@@ -561,6 +645,8 @@ class RobotState:
         # até o painel voltar (unseen_result), mesmo após a janela operacional de 5s.
         # Só quando o robô ainda não engatou um novo ciclo — senão o painel
         # esconderia o sinal/ordem em andamento.
+        # O until é âncora em finished_at+60s (não `now+60` a cada serialize,
+        # que prendia o overlay em WIN/LOSS indefinidamente).
         if (
             self.unseen_result
             and self.last_trade is not None
@@ -575,7 +661,9 @@ class RobotState:
                 or self.cycle_result
                 or ""
             ).upper()
-            if trade_result in {STATUS_WIN, STATUS_LOSS, STATUS_DRAW}:
+            finished_at = parse_datetime(self.last_trade.get("finished_at")) or self.result_received_at
+            overlay_until = (finished_at or now) + timedelta(seconds=RESULT_OVERLAY_DISPLAY_SECONDS)
+            if trade_result in {STATUS_WIN, STATUS_LOSS, STATUS_DRAW} and now < overlay_until:
                 data["unseen_result"] = True
                 data["cycle_result"] = trade_result
                 data["status"] = trade_result
@@ -584,8 +672,9 @@ class RobotState:
                 )
                 data["analysis_message"] = None
                 data["status_message"] = data["operation_message"]
-                if not data.get("result_display_until"):
-                    data["result_display_until"] = (now + timedelta(seconds=60)).isoformat()
+                data["result_display_until"] = overlay_until.isoformat()
+            else:
+                data["unseen_result"] = bool(self.unseen_result)
         else:
             data["unseen_result"] = bool(self.unseen_result) and self.status not in {
                 STATUS_STOP_WIN_HIT,
@@ -945,6 +1034,7 @@ class AutoTrader:
             "result_client_seen_at",
             "stop_reset_at",
             "connection_checked_at",
+            "server_time_sampled_at",
             "last_connected_at",
             "connection_grace_until",
             "sync_started_at",
@@ -1012,9 +1102,10 @@ class AutoTrader:
         sobrescrito por snapshots atrasados — em 08/08 clientes viram o placar
         cair sozinho (4x0 → 1x0). O histórico é a fonte de verdade.
 
-        Usa a MESMA janela de ``build_management_summary`` (operações de hoje,
-        posteriores ao último reset), para placar e stop win/loss não
-        divergirem. Não altera a decisão de parada: ela já vinha do histórico.
+        Usa a MESMA janela de ``build_management_summary`` (operações do dia
+        civil de Brasília, posteriores ao último reset), para placar e stop
+        win/loss não divergirem. Não altera a decisão de parada: ela já vinha
+        do histórico.
 
         Args:
             state: Estado restaurado, alterado no lugar.
@@ -1027,11 +1118,13 @@ class AutoTrader:
             # corrige. "Tem histórico, mas nada na janela" cai no cálculo normal
             # abaixo e zera corretamente.
             return
-        today = utc_now().date()
         reset_at = state.stop_reset_at if isinstance(state.stop_reset_at, datetime) else None
         wins = 0
         losses = 0
         profit = 0.0
+        synthetic_wins = 0
+        synthetic_losses = 0
+        synthetic_profit = 0.0
         for trade in trades:
             result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
             if result not in {"WIN", "LOSS"}:
@@ -1044,7 +1137,7 @@ class AutoTrader:
                     continue
             if not isinstance(finished_at, datetime):
                 continue
-            if finished_at.date() != today:
+            if not is_brasilia_today(finished_at):
                 continue
             if reset_at is not None and finished_at < reset_at:
                 continue
@@ -1053,9 +1146,19 @@ class AutoTrader:
             else:
                 losses += 1
             profit += float(trade.get("profit") or 0)
+            if is_synthetic_trade(trade):
+                if result == "WIN":
+                    synthetic_wins += 1
+                else:
+                    synthetic_losses += 1
+                synthetic_profit += float(trade.get("profit") or 0)
         state.wins = wins
         state.losses = losses
         state.profit = round(profit, 2)
+        # O placar recalculado inclui as linhas do Shift+O; o stop não.
+        state.stop_offset_wins = synthetic_wins
+        state.stop_offset_losses = synthetic_losses
+        state.stop_offset_profit = round(synthetic_profit, 2)
 
     def recover_sync_timeout(self, user_id: str) -> tuple[bool, RobotState]:
         state = self.get(user_id)
@@ -1612,7 +1715,12 @@ class AutoTrader:
         confidence = int(signal.get("confidence") or signal.get("strategy_score") or signal.get("score") or 0)
         payout = signal.get("payout")
         payout_text = f" e payout de {float(payout):.0f}%" if payout is not None else ""
-        default_strategy_name = "Estratégia de maior confluência"
+        # Sem estratégia nomeada, o nome era a frase "Estratégia de maior
+        # confluência" — que não é o nome de nada e ia para a voz, o painel e o
+        # Histórico. O padrão agora são as estratégias reais do motor.
+        default_strategy_name = ", ".join(
+            [str(item).strip() for item in (signal.get("used_strategies") or []) if str(item).strip()]
+        ) or ", ".join(ACTIVE_ENTRY_STRATEGIES)
         default_reason = (
             f"{symbol} com direção {direction}, confiança {confidence}{payout_text}. "
             "Entrada aprovada pela leitura técnica do ciclo."
@@ -1636,6 +1744,29 @@ class AutoTrader:
             "metrics": dict(signal.get("metrics") or {}),
             "strategy_name": signal.get("strategy_name") or default_strategy_name,
             "strategy_key": signal.get("strategy_key"),
+            # O `pending_signal` e a ULTIMA lista fixa de campos do caminho, e
+            # e ela que a validacao pre-compra le. Sem `live_demo` aqui o
+            # marcador morria entre a selecao e a compra: em 08/09/2026 o log
+            # mostrava [ENTRY_BLOCKED] reason=LEVEL_CONFLICT com
+            # trade_allowed=True e confidence=60 — o candidato do modo LIVE
+            # chegava ate a janela de entrada e era recusado ali, virando
+            # [ORDER_REJECTED] reason=NO_AVAILABLE_ASSET.
+            "live_demo": signal.get("live_demo") is True,
+            # Mesma armadilha, agora com a REV-Z (10/09/2026): sem o veredito
+            # aqui, o candidato do mercado aberto chegava à compra sem a marca,
+            # a confirmação no fechamento nunca rodava e o portão recusava com
+            # SEM_VEREDITO_REVZ. Duas horas de indicações (EURUSD z -4,5,
+            # USDCAD z +3,7...) e nenhuma ordem.
+            "revz": dict(signal["revz"]) if isinstance(signal.get("revz"), dict) else None,
+            # Veredito de S/R (10/09/2026). Sem os dois aqui o motivo da análise
+            # morria neste dicionário — o log da reconferência mostrava
+            # `motivo_analise=None` em toda ordem — e o registro da operação
+            # nunca soube se a entrada respeitou o nível.
+            "sr_respect_reason": signal.get("sr_respect_reason"),
+            "sr_entry_recheck_reason": signal.get("sr_entry_recheck_reason"),
+            # Filtro de pavio (11/09/2026), na análise e no disparo.
+            "wick_reason": signal.get("wick_reason"),
+            "wick_entry_reason": signal.get("wick_entry_reason"),
             "strategy_summary": signal.get("strategy_summary"),
             "analysis_detail": signal.get("analysis_detail")
             or signal.get("entry_reason")
@@ -2054,9 +2185,11 @@ class AutoTrader:
             state.wins = 0
             state.losses = 0
             self._histories[user_id] = []
+            clear_stop_offsets(state)
         if reset_score or reset_daily_profit:
             state.profit = 0.0
             state.stop_reset_at = now
+            clear_stop_offsets(state, profit_only=True)
 
         self._sources[user_id] = "memory"
         return state
@@ -2076,6 +2209,7 @@ class AutoTrader:
         state.wins = 0
         state.losses = 0
         state.profit = 0.0
+        clear_stop_offsets(state)
         state.stop_reset_at = now
         state.unseen_result = False
         state.result_client_seen_at = None
@@ -2140,7 +2274,6 @@ class AutoTrader:
         include_trade: dict[str, Any] | None = None,
     ) -> dict[str, float]:
         state = self.get(user_id)
-        today = utc_now().date()
         reset_at = parse_datetime(state.stop_reset_at)
         trades = list(self._histories.get(user_id, []))
         if include_trade is not None:
@@ -2154,9 +2287,11 @@ class AutoTrader:
             if result not in {"WIN", "LOSS"}:
                 continue
             finished_at = parse_datetime(trade.get("finished_at"))
-            if finished_at is None or finished_at.date() != today:
+            if finished_at is None or not is_brasilia_today(finished_at):
                 continue
             if reset_at is not None and finished_at < reset_at:
+                continue
+            if is_synthetic_trade(trade):
                 continue
             trade_profit = float(trade.get("profit") or 0)
             net_profit += trade_profit
@@ -2398,10 +2533,33 @@ class AutoTrader:
         state.last_order_error = reason
         return state
 
-    def update_entry_window(self, user_id: str, window: dict[str, Any]) -> RobotState:
+    def update_entry_window(
+        self,
+        user_id: str,
+        window: dict[str, Any],
+        *,
+        persist_server_clock: bool = True,
+    ) -> RobotState:
+        """Aplica o contrato de janela ao estado do robô.
+
+        Args:
+            user_id: Dono do robô.
+            window: Contrato de ``get_entry_window`` / refresh.
+            persist_server_clock: Se True, grava ``server_time`` +
+                ``server_time_sampled_at`` como nova âncora absoluta (amostra
+                Bullex/VPS ou avanço monotônico pós-scan). Se False, só
+                atualiza campos de janela a partir de um relógio *estimado* —
+                não pode virar âncora senão o próximo estimate compostará o
+                elapsed e a compra sai cedo (relato ~45s antes do close).
+
+        Returns:
+            Estado atualizado do robô.
+        """
         state = self.get(user_id)
-        state.server_time = window["server_time"]
-        state.server_time_source = str(window.get("server_time_source") or "bullex")
+        if persist_server_clock:
+            state.server_time = window["server_time"]
+            state.server_time_source = str(window.get("server_time_source") or "bullex")
+            state.server_time_sampled_at = utc_now()
         waiting_next_cycle = (
             state.status == STATUS_WAITING_NEXT_CYCLE
             and not state.pending_signal
@@ -2762,7 +2920,7 @@ class AutoTrader:
         del history[:-100]
         return True, state
 
-    def remove_history_trade(self, user_id: str, order_id: str) -> bool:
+    def remove_history_trade(self, user_id: str, order_id: str) -> dict[str, Any] | None:
         """
         Remove uma operação do histórico em memória pelo ``order_id``.
 
@@ -2774,22 +2932,27 @@ class AutoTrader:
             order_id: Identificador da operação (UUID sintético ou Bullex).
 
         Returns:
-            True quando ao menos uma linha foi removida da memória.
+            A operação removida, ou None se não havia linha com esse id.
         """
         normalized_user = str(user_id or "").strip()
         normalized_order = str(order_id or "").strip()
         if not normalized_user or not normalized_order:
-            return False
+            return None
         history = self._histories.get(normalized_user) or []
-        filtered = [
-            item
-            for item in history
-            if str(item.get("order_id") or "").strip() != normalized_order
-        ]
-        if len(filtered) == len(history):
-            return False
+        removed: dict[str, Any] | None = None
+        filtered: list[dict[str, Any]] = []
+        for item in history:
+            if (
+                removed is None
+                and str(item.get("order_id") or "").strip() == normalized_order
+            ):
+                removed = dict(item)
+                continue
+            filtered.append(item)
+        if removed is None:
+            return None
         self._histories[normalized_user] = filtered
-        return True
+        return removed
 
     def replace_history(self, user_id: str, trades: list[dict[str, Any]]) -> None:
         """

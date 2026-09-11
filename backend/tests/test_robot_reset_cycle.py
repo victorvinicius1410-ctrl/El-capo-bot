@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from backend import main
 from backend.auto_trader import AutoTrader, utc_now
@@ -220,14 +220,14 @@ class RobotResetCycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "persist_robot"):
             stop_response = await main.robot_stop({"user_id": user_id})
             config_response = await main.robot_config(
-                {"entry_value": 100, "stop_win": 500, "stop_loss": 300},
+                {"entry_value": 5, "stop_win": 500, "stop_loss": 300},
                 {"user_id": user_id},
             )
 
         self.assertEqual(stop_response.status_code, 200)
         self.assertEqual(config_response.status_code, 200)
         self.assertTrue(json.loads(config_response.body)["ok"])
-        self.assertEqual(main.auto_trader.get(user_id).entry_value, 100.0)
+        self.assertEqual(main.auto_trader.get(user_id).entry_value, 5.0)
 
     async def test_stale_open_operation_cleared_when_robot_already_stopped(self) -> None:
         user_id = "user-stale-open-cleared"
@@ -260,6 +260,90 @@ class RobotResetCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"], "ROBOT_RUNNING_CONFIG_LOCKED")
         self.assertEqual(payload["message"], "Pare o robô antes de alterar configurações.")
+
+    async def test_robot_config_unlocks_when_redis_says_stopped_but_gateway_enabled(self) -> None:
+        """
+        Split-brain external: runtime parou (Stop Loss) e Redis tem enabled=false,
+        mas a memória do gateway ainda tem enabled=true — o pop-up de início
+        não pode travar com "Pare o robô...".
+        """
+        user_id = "user-config-ghost-enabled"
+        state = main.auto_trader.start(user_id)
+        state.wins = 0
+        state.losses = 3
+        state.profit = -90.0
+        remote = {
+            "ok": True,
+            "data": {
+                "enabled": False,
+                "worker_running": False,
+                "status": "STOP_LOSS_HIT",
+                "wins": 0,
+                "losses": 3,
+                "profit": -90.0,
+            },
+        }
+
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
+            patch.object(main.robot_bus, "get_snapshot", return_value=remote),
+            patch.object(main, "persist_robot"),
+        ):
+            response = await main.robot_config({"entry_value": 5}, {"user_id": user_id})
+
+        payload = json.loads(response.body)
+        refreshed = main.auto_trader.get(user_id)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["data"]["entry_value"], 5)
+        self.assertFalse(refreshed.enabled)
+        self.assertEqual(refreshed.status, "STOP_LOSS_HIT")
+        self.assertEqual(refreshed.losses, 3)
+
+    async def test_reconcile_keeps_lock_when_redis_still_enabled(self) -> None:
+        user_id = "user-config-redis-still-on"
+        main.auto_trader.start(user_id)
+        remote = {
+            "ok": True,
+            "data": {"enabled": True, "worker_running": True, "status": "WAITING_NEXT_CYCLE"},
+        }
+
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
+            patch.object(main.robot_bus, "get_snapshot", return_value=remote),
+        ):
+            locked = main.robot_config_locked(user_id, main.auto_trader.get(user_id))
+
+        self.assertTrue(locked)
+        self.assertTrue(main.auto_trader.get(user_id).enabled)
+
+    async def test_ensure_robot_worker_skips_when_redis_says_stopped(self) -> None:
+        user_id = "user-ensure-ghost-enabled"
+        main.auto_trader.start(user_id)
+        remote = {
+            "ok": True,
+            "data": {
+                "enabled": False,
+                "worker_running": False,
+                "status": "STOPPED",
+                "wins": 1,
+                "losses": 0,
+                "profit": 10.0,
+            },
+        }
+
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
+            patch.object(main.robot_bus, "get_snapshot", return_value=remote),
+            patch.object(main.robot_bus, "publish_command") as publish_cmd,
+        ):
+            main.ensure_robot_worker(user_id)
+
+        publish_cmd.assert_not_called()
+        self.assertFalse(main.auto_trader.get(user_id).enabled)
 
     async def test_robot_config_allows_changes_after_robot_is_fully_stopped(self) -> None:
         user_id = "user-config-unlocked"
@@ -426,7 +510,7 @@ class RobotResetCycleTests(unittest.IsolatedAsyncioTestCase):
         state.profit = 2500.0
         state.stop_win = 1000.0
         state.stop_win_mode = "money"
-        state.entry_value = 100.0
+        state.entry_value = 5.0
 
         with (
             patch.object(

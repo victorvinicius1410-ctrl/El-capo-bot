@@ -4,6 +4,7 @@ import {
   isMarketingSimulationAccount,
   normalizeMarketingHistory,
   normalizeMarketingStats,
+  overlayScoreFromTrades,
 } from "./marketingSimulation.ts";
 
 describe("marketingSimulation", () => {
@@ -68,5 +69,17 @@ describe("marketingSimulation", () => {
     assert.equal(stats.wins, 3);
     assert.equal(stats.losses, 1);
     assert.equal(stats.winRate, 75);
+  });
+
+  it("calcula o placar do overlay a partir das operações geradas", () => {
+    const score = overlayScoreFromTrades([
+      { result: "WIN", profit: 8.7 },
+      { result: "WIN", profit: 8.7 },
+      { result: "LOSS", profit: -10 },
+      { result: "WIN", profit: 8.7 },
+    ]);
+    assert.equal(score.wins, 3);
+    assert.equal(score.losses, 1);
+    assert.equal(score.profit, 16.1);
   });
 });

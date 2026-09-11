@@ -22,7 +22,14 @@ if [[ ! -d "$SRC_STATIC/assets" ]]; then
   exit 1
 fi
 
-rsync -a --delete "$SRC_STATIC/" "$DEST/"
+# `protect assets/***`: NÃO apagar os bundles da versão anterior. Quem estiver
+# com o HTML antigo em cache pede chunk com hash antigo; se ele sumiu, o painel
+# quebra e o cliente não consegue chegar na versão nova sozinho. Como o HTML
+# agora é no-cache (ver nginx), na próxima navegação ele já pega a versão nova.
+rsync -a --delete -f 'P assets/***' "$SRC_STATIC/" "$DEST/"
+
+# Assets órfãos de mais de 7 dias podem sair — nenhum HTML cacheado sobrevive tanto.
+find "$DEST/assets" -type f -mtime +7 -delete 2>/dev/null || true
 
 if [[ -d "$SRC_DIST" ]]; then
   [[ -f "$SRC_DIST/index.html" ]] && cp -a "$SRC_DIST/index.html" "$DEST/"

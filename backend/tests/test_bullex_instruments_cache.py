@@ -12,9 +12,19 @@ class FakeAssetsClient:
         self.calls = 0
 
     def update_ACTIVES_OPCODE(self, timeout=8) -> None:
-        self.calls += 1
+        # Nao e mais o caminho usado: `read_assets_uncached` passou a ler direto
+        # o canal binario. O contador acompanhou a mudanca.
+        pass
 
     def get_all_ACTIVES_OPCODE(self) -> dict[str, int]:
+        return {"EURUSD-OTC": 1, "GBPUSD-OTC": 2}
+
+    def get_ALL_Binary_ACTIVES_OPCODE(self, timeout=8) -> dict[str, int]:
+        self.calls += 1
+        # `read_assets_uncached` passou a usar esta leitura em 06/09/2026: a
+        # anterior varria tambem os canais de cripto/forex/cfd, que a BullEx nao
+        # oferece, e cada um estourava o timeout de /assets. O fake nao tinha o
+        # metodo e o endpoint caia em INSTRUMENTS_TEMPORARY_UNAVAILABLE.
         return {"EURUSD-OTC": 1, "GBPUSD-OTC": 2}
 
 

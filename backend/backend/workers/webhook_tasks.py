@@ -38,6 +38,9 @@ celery_app.conf.update(
     enable_utc=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    # Garante emails.deliver no mesmo processo do webhook-worker.
+    # Sem isso a entrega fica forever em status=pending (fila sem consumidor).
+    imports=("backend.workers.email_tasks",),
 )
 
 
@@ -197,3 +200,9 @@ def end_trial(company_id: str, user_id: str, request_id: str) -> dict[str, str |
         Resultado mínimo do encerramento.
     """
     return asyncio.run(_expire_trial(company_id, user_id, request_id))
+
+
+# Import tardio: registra `emails.deliver` no mesmo Celery app do webhook-worker.
+# Sem este import, o worker só conhece webhooks.deliver/trials.end e os e-mails
+# ficam eternamente em status=pending (nunca enviados de verdade).
+from backend.workers import email_tasks as _email_tasks  # noqa: E402,F401

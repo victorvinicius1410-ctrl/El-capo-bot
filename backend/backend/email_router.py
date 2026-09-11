@@ -52,6 +52,14 @@ class PreviewPayload(BaseModel):
     html_body: str | None = Field(default=None, max_length=200_000)
 
 
+class TestEmailPayload(BaseModel):
+    """Destinatário opcional do e-mail de teste (admin)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipient_email: str | None = Field(default=None, max_length=320)
+
+
 def create_email_router(
     service: EmailService,
     require_admin_user: Callable[..., Any],
@@ -171,11 +179,21 @@ def create_email_router(
     async def send_test_email(
         event_type: DomainEventType,
         request: Request,
+        payload: TestEmailPayload | None = None,
         auth: dict[str, str] = Depends(require_admin_user),
     ) -> Response:
-        """Envia teste ao email da sessão autenticada (nunca do body)."""
-        recipient = (auth.get("email") or "").strip().lower()
-        if not recipient:
+        """
+        Envia teste para o e-mail informado no body ou, se omitido, o da sessão.
+
+        Args:
+            event_type: Evento cujo template será renderizado.
+            request: Request HTTP (correlation id).
+            payload: Opcional com `recipient_email`.
+            auth: Sessão admin já validada.
+        """
+        body_recipient = (payload.recipient_email if payload else None) or ""
+        recipient = body_recipient.strip().lower() or (auth.get("email") or "").strip().lower()
+        if not recipient or "@" not in recipient:
             return _error_response(EmailValidationError("RECIPIENT_INVALID"), request)
         try:
             delivery = await service.send_test(_actor(auth), event_type, recipient)

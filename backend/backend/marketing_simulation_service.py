@@ -8,8 +8,27 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from backend.named_strategies import (
+    RETRACEMENT_SR_TIMEFRAMES,
+    STRATEGY_CANDLE_FLOW,
+    STRATEGY_CONTINUATION,
+    STRATEGY_EXHAUSTION_REVERSAL,
+    STRATEGY_LABELS,
+    STRATEGY_RETRACEMENT_SR,
+)
+
 if TYPE_CHECKING:
     from backend.admin_repository import AdminRepository
+
+_SIMULATED_STRATEGY_FIELDS = (
+    "strategy_name",
+    "strategy_key",
+    "strategy_summary",
+    "analysis_detail",
+    "used_strategies",
+    "timeframe",
+    "period",
+)
 
 
 class MarketingSimulationService:
@@ -80,10 +99,172 @@ class MarketingSimulationService:
         "GBPJPY-OTC",
     )
     MAX_GENERATED_TRADES = 100
-    # Cadência contínua = duração da vela (não mais 5× legado).
+    # Duração da vela operacional (timeframe exibido no histórico).
     PERIOD_SECONDS = {"M1": 60, "M5": 300, "M15": 900}
+    DEFAULT_PERIOD = "M5"
+    # Intervalos irregulares entre operações (múltiplos da vela). O robô analisa
+    # a cada candle, mas só entra quando há sinal — não opera a cada minuto.
+    GAP_MULTIPLIER_RANGE = {
+        "M1": (4, 22),
+        "M5": (2, 9),
+        "M15": (2, 6),
+    }
+    CONFLUENCE_COMPONENTS = (
+        "EMA9/EMA21",
+        "RSI",
+        "Candle Force",
+        "Pavios",
+        "Suporte/Resistencia",
+        "Volatilidade",
+        "Payout",
+    )
     # Payout típico OTC quando a Bullex não responde.
     FALLBACK_PAYOUT = 85
+
+    @staticmethod
+    def _strategy_seed(trade: dict[str, Any]) -> str:
+        """Gera semente determinística para estratégia simulada estável."""
+        parts = (
+            str(trade.get("id") or "").strip(),
+            str(trade.get("_synthetic_sequence") or "").strip(),
+            str(trade.get("broker_order_id") or "").strip(),
+            str(trade.get("asset") or "").strip(),
+            str(trade.get("direction") or "").strip(),
+            str(trade.get("created_at") or "").strip(),
+        )
+        return "|".join(part for part in parts if part)
+
+    @classmethod
+    def build_simulated_strategy(
+        cls,
+        *,
+        seed: str,
+        direction: str,
+        asset: str,
+        period: str,
+    ) -> dict[str, Any]:
+        """
+        Monta estratégia simulada realista para exibição no histórico.
+
+        Args:
+            seed: Semente determinística (id/sequência da operação).
+            direction: CALL ou PUT.
+            asset: Símbolo do ativo.
+            period: Timeframe operacional (M1, M5 ou M15).
+
+        Returns:
+            Campos de estratégia compatíveis com ``TRADE_ANALYSIS_FIELDS``.
+        """
+        period_key = str(period or cls.DEFAULT_PERIOD).strip().upper()
+        if period_key not in cls.PERIOD_SECONDS:
+            period_key = cls.DEFAULT_PERIOD
+        seed_number = int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16], 16)
+        rng = random.Random(seed_number)
+        direction_key = str(direction or "CALL").strip().upper()
+        asset_label = str(asset or "EURUSD-OTC").replace("-OTC", "")
+
+        candidates = [
+            STRATEGY_RETRACEMENT_SR,
+            STRATEGY_EXHAUSTION_REVERSAL,
+            STRATEGY_CANDLE_FLOW,
+            STRATEGY_CONTINUATION,
+            "CONFLUENCE",
+            "CONFLUENCE",
+        ]
+        if period_key not in RETRACEMENT_SR_TIMEFRAMES:
+            candidates = [key for key in candidates if key != STRATEGY_RETRACEMENT_SR]
+        choice = rng.choice(candidates)
+
+        if choice == "CONFLUENCE":
+            used = rng.sample(
+                list(cls.CONFLUENCE_COMPONENTS),
+                k=rng.randint(2, min(4, len(cls.CONFLUENCE_COMPONENTS))),
+            )
+            strategy_name = "Confluência " + " + ".join(used)
+            strategy_key = STRATEGY_CONTINUATION
+        else:
+            strategy_name = STRATEGY_LABELS[choice]
+            strategy_key = choice
+            used = [choice]
+
+        direction_label = "compra" if direction_key == "CALL" else "venda"
+        strategy_summary = (
+            f"Sinal de {direction_label} em {asset_label} ({period_key}) "
+            f"com leitura {strategy_name.lower()}."
+        )
+        analysis_detail = (
+            f"Setup simulado para demonstração: {strategy_name}. "
+            f"Direção {direction_key} no timeframe {period_key}, "
+            f"com confluência de {', '.join(used)}."
+        )
+        return {
+            "strategy_name": strategy_name,
+            "strategy_key": strategy_key,
+            "strategy_summary": strategy_summary,
+            "analysis_detail": analysis_detail,
+            "used_strategies": used,
+            "timeframe": period_key,
+            "period": period_key,
+        }
+
+    @classmethod
+    def enrich_trade_with_strategy(
+        cls,
+        trade: dict[str, Any],
+        *,
+        period: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Garante campos de estratégia simulada em trades sintéticos.
+
+        Args:
+            trade: Operação marketing (persistida ou recém-gerada).
+            period: Timeframe fallback quando ausente no trade.
+
+        Returns:
+            Cópia enriquecida com estratégia determinística se faltante.
+        """
+        if str(trade.get("strategy_name") or "").strip():
+            enriched = dict(trade)
+            if not str(enriched.get("timeframe") or "").strip():
+                enriched["timeframe"] = str(
+                    period or enriched.get("period") or cls.DEFAULT_PERIOD
+                ).upper()
+            return enriched
+        resolved_period = str(
+            trade.get("timeframe") or trade.get("period") or period or cls.DEFAULT_PERIOD
+        ).upper()
+        strategy = cls.build_simulated_strategy(
+            seed=cls._strategy_seed(trade),
+            direction=str(trade.get("direction") or "CALL"),
+            asset=str(trade.get("asset") or "EURUSD-OTC"),
+            period=resolved_period,
+        )
+        enriched = dict(trade)
+        enriched.update(strategy)
+        return enriched
+
+    @classmethod
+    def preserve_simulated_metadata(
+        cls,
+        source: dict[str, Any],
+        stored: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Mantém metadados simulados que não existem na tabela marketing.
+
+        Args:
+            source: Trade gerado em memória antes do insert.
+            stored: Trade retornado pelo repositório.
+
+        Returns:
+            Trade mesclado com estratégia/timeframe preservados.
+        """
+        merged = dict(stored)
+        for field in _SIMULATED_STRATEGY_FIELDS:
+            if source.get(field) is not None:
+                merged[field] = source[field]
+        return cls.enrich_trade_with_strategy(merged)
 
     @staticmethod
     def normalize_created_at(value: str | None) -> str:
@@ -122,6 +303,7 @@ class MarketingSimulationService:
         direction: str | None = None,
         result: str | None = None,
         created_at: str | None = None,
+        period: str | None = None,
     ) -> dict[str, Any]:
         """
         Gera a próxima operação simulada.
@@ -137,6 +319,7 @@ class MarketingSimulationService:
             direction: CALL ou PUT; se omitido, sorteia.
             result: WIN ou LOSS forçado; se omitido, usa a taxa alvo.
             created_at: Timestamp ISO8601; se omitido, usa o instante atual.
+            period: Timeframe operacional (M1/M5/M15) para estratégia simulada.
 
         Returns:
             Operação com marcadores obrigatórios de conteúdo sintético.
@@ -185,6 +368,13 @@ class MarketingSimulationService:
             amount=resolved_amount,
             payout=resolved_payout,
         )
+        resolved_period = str(period or self.DEFAULT_PERIOD).strip().upper()
+        strategy = self.build_simulated_strategy(
+            seed=f"{self._total}|{resolved_created_at}|{resolved_asset}|{resolved_direction}",
+            direction=resolved_direction,
+            asset=resolved_asset,
+            period=resolved_period,
+        )
         item = {
             "id": f"synthetic-{self._total:06d}",
             "is_simulated": True,
@@ -198,6 +388,7 @@ class MarketingSimulationService:
             "payout": resolved_payout,
             "profit": profit,
             "created_at": resolved_created_at,
+            **strategy,
         }
         self.history.append(item)
         return dict(item)
@@ -235,14 +426,15 @@ class MarketingSimulationService:
         self,
         count: int,
         *,
-        period: str = "M1",
+        period: str = DEFAULT_PERIOD,
         now: datetime | None = None,
     ) -> list[str]:
         """
-        Gera horários dentro da janela do período operacional.
+        Gera horários irregulares dentro da janela operacional.
 
-        Espaça as operações pela cadência contínua do timeframe (M1=1min,
-        M5=5min, M15=15min) com jitter leve (±20%), sem espalhar o dia inteiro.
+        O El Capo analisa a cada vela, mas só entra quando há sinal válido.
+        Os gaps entre operações simuladas variam (múltiplos da vela + segundos
+        não redondos), evitando a aparência de uma operação a cada minuto.
 
         Args:
             count: Quantidade de timestamps.
@@ -257,7 +449,7 @@ class MarketingSimulationService:
         """
         if count < 0:
             raise ValueError("Quantidade de horários inválida")
-        period_key = str(period or "M1").strip().upper()
+        period_key = str(period or self.DEFAULT_PERIOD).strip().upper()
         period_seconds = self.PERIOD_SECONDS.get(period_key)
         if period_seconds is None:
             raise ValueError("Período deve ser M1, M5 ou M15")
@@ -268,18 +460,26 @@ class MarketingSimulationService:
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
 
+        min_mult, max_mult = self.GAP_MULTIPLIER_RANGE[period_key]
         stamps: list[datetime] = []
-        cursor = end
-        for index in range(count):
-            jitter = self._random.uniform(-0.2, 0.2) * period_seconds
-            if index == 0:
-                # Última operação perto do agora, ainda dentro da janela.
-                cursor = end - timedelta(seconds=max(5.0, abs(jitter) * 0.35))
-            else:
-                cursor = cursor - timedelta(seconds=period_seconds + jitter)
+        cursor = end - timedelta(seconds=self._random.uniform(45, 240))
+        stamps.append(cursor)
+
+        for _ in range(count - 1):
+            gap_mult = self._random.uniform(min_mult, max_mult)
+            gap_seconds = (gap_mult * period_seconds) + self._random.randint(23, 187)
+            cursor = cursor - timedelta(seconds=gap_seconds)
             stamps.append(cursor)
+
         stamps.reverse()
-        return [stamp.astimezone(timezone.utc).isoformat() for stamp in stamps]
+        normalized: list[str] = []
+        for stamp in stamps:
+            adjusted = stamp.replace(
+                second=self._random.randint(3, 57),
+                microsecond=0,
+            )
+            normalized.append(adjusted.astimezone(timezone.utc).isoformat())
+        return normalized
 
     async def generate_score_history(
         self,
@@ -289,12 +489,12 @@ class MarketingSimulationService:
         amount: float,
         payout: int | None = None,
         asset: str | None = None,
-        period: str = "M1",
+        period: str = DEFAULT_PERIOD,
         payout_by_asset: dict[str, int] | None = None,
         payout_resolver: Callable[[str], Awaitable[int | None]] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Substitui o histórico sintético pelo placar solicitado.
+        Cria operações sintéticas para o placar solicitado, sem apagar as antigas.
 
         Args:
             wins: Quantidade de WINs desejada.
@@ -332,9 +532,6 @@ class MarketingSimulationService:
             for symbol, value in (payout_by_asset or {}).items()
         }
 
-        await repository.clear_simulated_trades(company_id, user_id)
-        self.replace_history([])
-
         generated: list[dict[str, Any]] = []
         for index, result in enumerate(results):
             trade_asset, trade_payout = await self._resolve_asset_and_payout(
@@ -349,8 +546,10 @@ class MarketingSimulationService:
                 asset=trade_asset,
                 result=result,
                 created_at=timestamps[index],
+                period=period,
             )
             stored = await repository.save_simulated_trade(company_id, user_id, trade)
+            stored = self.preserve_simulated_metadata(trade, stored)
             self.history[-1] = dict(stored)
             generated.append(dict(stored))
         return generated
@@ -473,15 +672,16 @@ class MarketingSimulationService:
         await self.reload_history()
         return updated
 
-    async def delete_trade(self, trade_id: str) -> bool:
+    async def delete_trade(self, trade_id: str) -> dict[str, Any] | None:
         """
         Exclui uma operação e sincroniza o cache do simulador.
 
         Args:
-            trade_id: Identificador da operação sintética.
+            trade_id: Identificador da operação sintética (UUID) ou
+                ``broker_order_id`` da Bullex.
 
         Returns:
-            True quando uma operação da sessão foi excluída.
+            A operação excluída, ou None se não existia.
 
         Raises:
             RuntimeError: Se o simulador não estiver ligado a um repositório.

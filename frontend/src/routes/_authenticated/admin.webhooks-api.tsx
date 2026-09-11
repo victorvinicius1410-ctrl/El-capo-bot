@@ -51,6 +51,7 @@ import {
   normalizeWebhookCollections,
   validateWebhookDraft,
 } from "@/lib/webhookPresentation";
+import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
 
 type WebhookSection = "destinos" | "api" | "entregas";
@@ -391,7 +392,7 @@ function DeliveriesSection({
               <TableCell>
                 {delivery.latency_ms == null ? "—" : `${delivery.latency_ms} ms`}
               </TableCell>
-              <TableCell>{new Date(delivery.created_at).toLocaleString("pt-BR")}</TableCell>
+              <TableCell>{formatBrasiliaDateTime(delivery.created_at) || delivery.created_at}</TableCell>
               <TableCell className="text-right">
                 {canReplay && delivery.status !== "delivered" ? (
                   <button

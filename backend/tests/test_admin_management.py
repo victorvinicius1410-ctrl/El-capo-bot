@@ -56,6 +56,28 @@ class AdminManagementServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created.company_id, "company-a")
         self.assertEqual(created.account_type, AccountType.TRIAL)
         self.assertIsNotNone(created.expires_at)
+        self.assertEqual(created.plan_name, "Teste grátis (7 dias)")
+
+    async def test_create_trial_persists_requested_days_in_plan_name(self) -> None:
+        created = await self.service.create_client(
+            self.owner,
+            ClientCreate(
+                name="Trial Curto",
+                email="trial3@example.com",
+                phone=None,
+                trader_id="TRIAL-3",
+                password="SenhaForte1",
+                account_type=AccountType.TRIAL,
+                trial_days=3,
+                payment_status=PaymentStatus.NOT_REQUIRED,
+            ),
+        )
+
+        self.assertEqual(created.plan_name, "Teste grátis (3 dias)")
+        assert created.expires_at is not None
+        delta = created.expires_at - datetime.now(timezone.utc)
+        self.assertGreater(delta, timedelta(days=2))
+        self.assertLess(delta, timedelta(days=4))
 
     async def test_create_client_requires_permission(self) -> None:
         actor = AdminActor(
@@ -254,9 +276,27 @@ class AdminDashboardServiceTests(unittest.TestCase):
         ]
         histories = {
             "winner": [
-                {"order_id": "1", "result": "WIN", "profit": 12, "active": "EURUSD-OTC"},
-                {"order_id": "2", "result": "WIN", "profit": 8, "active": "EURUSD-OTC"},
-                {"order_id": "3", "result": "LOSS", "profit": -2, "active": "GBPUSD-OTC"},
+                {
+                    "order_id": "1",
+                    "result": "WIN",
+                    "profit": 12,
+                    "active": "EURUSD-OTC",
+                    "finished_at": now.replace(hour=12, minute=0, second=0).isoformat(),
+                },
+                {
+                    "order_id": "2",
+                    "result": "WIN",
+                    "profit": 8,
+                    "active": "EURUSD-OTC",
+                    "finished_at": now.replace(hour=12, minute=30, second=0).isoformat(),
+                },
+                {
+                    "order_id": "3",
+                    "result": "LOSS",
+                    "profit": -2,
+                    "active": "GBPUSD-OTC",
+                    "finished_at": now.replace(hour=15, minute=0, second=0).isoformat(),
+                },
                 {
                     "order_id": "synthetic",
                     "result": "WIN",
@@ -266,7 +306,13 @@ class AdminDashboardServiceTests(unittest.TestCase):
                 },
             ],
             "loser": [
-                {"order_id": "4", "result": "LOSS", "profit": -10, "active": "GBPUSD-OTC"}
+                {
+                    "order_id": "4",
+                    "result": "LOSS",
+                    "profit": -10,
+                    "active": "GBPUSD-OTC",
+                    "finished_at": now.replace(hour=18, minute=0, second=0).isoformat(),
+                }
             ],
         }
 
@@ -302,6 +348,168 @@ class AdminDashboardServiceTests(unittest.TestCase):
         self.assertEqual(dashboard["top_losers"][0]["user_id"], "loser")
         self.assertEqual(dashboard["most_accurate_assets"][0]["asset"], "EURUSD-OTC")
         self.assertEqual(dashboard["least_accurate_assets"][0]["asset"], "GBPUSD-OTC")
+        self.assertEqual(dashboard["operations"]["total"], 4)
+        self.assertEqual(dashboard["operations"]["wins"], 2)
+        self.assertEqual(dashboard["operations"]["losses"], 2)
+        self.assertEqual(dashboard["operations"]["win_rate"], 50.0)
+        self.assertEqual(dashboard["operations"]["profit"], 8.0)
+        self.assertEqual(len(dashboard["hourly_results"]), 24)
+        hour_09 = next(row for row in dashboard["hourly_results"] if row["hour"] == 9)
+        self.assertEqual(hour_09["operations"], 2)
+        self.assertEqual(hour_09["wins"], 2)
+        hour_12 = next(row for row in dashboard["hourly_results"] if row["hour"] == 12)
+        self.assertEqual(hour_12["operations"], 1)
+        self.assertEqual(hour_12["losses"], 1)
+        hour_15 = next(row for row in dashboard["hourly_results"] if row["hour"] == 15)
+        self.assertEqual(hour_15["operations"], 1)
+        self.assertEqual(hour_15["losses"], 1)
+
+    def test_dashboard_user_rankings_return_top_10(self) -> None:
+        now = datetime.now(timezone.utc)
+        clients: list[ClientRecord] = []
+        histories: dict[str, list[dict]] = {}
+        for index in range(12):
+            winner_id = f"winner-{index}"
+            loser_id = f"loser-{index}"
+            clients.append(
+                ClientRecord(
+                    user_id=winner_id,
+                    company_id="company-a",
+                    name=f"Ganhador {index:02d}",
+                    email=f"{winner_id}@example.com",
+                    phone=None,
+                    trader_id=f"WIN-{index}",
+                    account_type=AccountType.CLIENT,
+                    payment_status=PaymentStatus.PAID,
+                    plan_name=None,
+                    grant_access=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            clients.append(
+                ClientRecord(
+                    user_id=loser_id,
+                    company_id="company-a",
+                    name=f"Perdedor {index:02d}",
+                    email=f"{loser_id}@example.com",
+                    phone=None,
+                    trader_id=f"LOSS-{index}",
+                    account_type=AccountType.CLIENT,
+                    payment_status=PaymentStatus.PAID,
+                    plan_name=None,
+                    grant_access=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            histories[winner_id] = [
+                {
+                    "order_id": f"w-{index}",
+                    "result": "WIN",
+                    "profit": 100 - index,
+                    "active": "EURUSD-OTC",
+                }
+            ]
+            histories[loser_id] = [
+                {
+                    "order_id": f"l-{index}",
+                    "result": "LOSS",
+                    "profit": -100 + index,
+                    "active": "GBPUSD-OTC",
+                }
+            ]
+
+        dashboard = calculate_admin_dashboard(
+            clients,
+            histories,
+            days=30,
+            now=now,
+        )
+
+        self.assertEqual(len(dashboard["top_winners"]), 10)
+        self.assertEqual(len(dashboard["top_losers"]), 10)
+        self.assertEqual(dashboard["top_winners"][0]["user_id"], "winner-0")
+        self.assertEqual(dashboard["top_winners"][-1]["user_id"], "winner-9")
+        self.assertEqual(dashboard["top_losers"][0]["user_id"], "loser-0")
+        self.assertEqual(dashboard["top_losers"][-1]["user_id"], "loser-9")
+        self.assertNotIn("winner-10", [item["user_id"] for item in dashboard["top_winners"]])
+        self.assertNotIn("loser-10", [item["user_id"] for item in dashboard["top_losers"]])
+
+    def test_dashboard_excludes_marketing_accounts(self) -> None:
+        now = datetime.now(timezone.utc)
+        clients = [
+            ClientRecord(
+                user_id="client-real",
+                company_id="company-a",
+                name="Cliente Real",
+                email="client@example.com",
+                phone=None,
+                trader_id="CLI-1",
+                account_type=AccountType.CLIENT,
+                payment_status=PaymentStatus.PAID,
+                plan_name=None,
+                grant_access=True,
+                created_at=now,
+                updated_at=now,
+            ),
+            ClientRecord(
+                user_id="marketing-user",
+                company_id="company-a",
+                name="Conta Marketing",
+                email="marketing@example.com",
+                phone=None,
+                trader_id="MKT-1",
+                account_type=AccountType.MARKETING,
+                payment_status=PaymentStatus.NOT_REQUIRED,
+                plan_name=None,
+                grant_access=True,
+                created_at=now,
+                updated_at=now,
+            ),
+        ]
+        histories = {
+            "client-real": [
+                {
+                    "order_id": "real-1",
+                    "result": "WIN",
+                    "profit": 5,
+                    "active": "EURUSD-OTC",
+                    "finished_at": now.replace(hour=12).isoformat(),
+                }
+            ],
+            "marketing-user": [
+                {
+                    "order_id": "mkt-1",
+                    "result": "WIN",
+                    "profit": 500,
+                    "active": "EURUSD-OTC",
+                    "finished_at": now.replace(hour=14).isoformat(),
+                },
+                {
+                    "order_id": "mkt-2",
+                    "result": "WIN",
+                    "profit": 500,
+                    "active": "EURUSD-OTC",
+                    "finished_at": now.replace(hour=15).isoformat(),
+                },
+            ],
+        }
+
+        dashboard = calculate_admin_dashboard(
+            clients, histories, days=30, now=now, exclude_marketing_accounts=True
+        )
+
+        self.assertEqual(dashboard["operations"]["total"], 1)
+        self.assertEqual(dashboard["operations"]["wins"], 1)
+        self.assertEqual(dashboard["operations"]["profit"], 5.0)
+        self.assertEqual(dashboard["top_winners"][0]["user_id"], "client-real")
+        self.assertEqual(len(dashboard["top_losers"]), 0)
+        hour_09 = next(row for row in dashboard["hourly_results"] if row["hour"] == 9)
+        self.assertEqual(hour_09["operations"], 1)
+        hour_11 = next(row for row in dashboard["hourly_results"] if row["hour"] == 11)
+        self.assertEqual(hour_11["operations"], 0)
+        self.assertEqual(dashboard["most_accurate_assets"][0]["operations"], 1)
 
 
 class AdminManagementApiTests(unittest.TestCase):
@@ -443,6 +651,11 @@ class AdminManagementApiTests(unittest.TestCase):
         self.assertEqual(effective_access.status_code, 200)
         self.assertTrue(effective_access.json()["data"]["impersonating"])
         self.assertEqual(effective_access.json()["data"]["user_id"], client["id"])
+        robot_state = self.client.get("/robot/state", headers=self.headers)
+        self.assertEqual(robot_state.status_code, 200)
+        ws_ticket = self.client.get("/robot/ws-ticket", headers=self.headers)
+        self.assertEqual(ws_ticket.status_code, 200)
+        self.assertTrue(ws_ticket.json()["data"]["ticket"])
         blocked_write = self.client.post("/robot/start", headers=self.headers)
         self.assertEqual(blocked_write.status_code, 403)
         self.assertEqual(blocked_write.json()["error"], "IMPERSONATION_READ_ONLY")

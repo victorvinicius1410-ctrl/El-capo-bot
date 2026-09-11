@@ -10,11 +10,26 @@ import {
   stopReasonKind,
   unlockSpeechSynthesis,
 } from "@/lib/robotNarration";
+import { splitSpeechChunks } from "@/lib/speechChunks";
 import type { RobotState } from "@/lib/robotState";
 
 const SPEECH_RATE = 0.92;
-/** Libera o narrador se onend/onerror do TTS nunca disparar (bug Chrome). */
+/**
+ * Libera o narrador se onend/onerror do TTS nunca disparar (bug Chrome).
+ *
+ * Só vale quando o motor NÃO está falando — antes ele disparava por tempo puro
+ * e cortava a explicação da entrada no meio, que é longa de propósito.
+ */
 const BUSY_WATCHDOG_MS = 25_000;
+/**
+ * Trava real: mesmo falando, ninguém segura o canal mais que isto.
+ *
+ * Existe porque o Chrome pode deixar `speaking` preso em `true` depois de o
+ * motor morrer — aí o watchdog normal nunca destravaria a fila.
+ */
+const BUSY_HARD_WATCHDOG_MS = 120_000;
+/** Intervalo do keep-alive que impede o Chrome de matar fala longa. */
+const SPEECH_KEEPALIVE_MS = 5_000;
 /**
  * Safari/macOS descarta speak() logo após cancel(). Um tick curto evita
  * a fila morta que deixava o Capo mudo no MacBook.
@@ -52,24 +67,79 @@ function resolveNarratorVoice(): SpeechSynthesisVoice | null {
   return cachedVoice;
 }
 
+interface SpeechSequenceOptions {
+  /** Pedaços já sanitizados, na ordem de leitura. */
+  chunks: string[];
+  voice: SpeechSynthesisVoice;
+  holdRef: { current: SpeechSynthesisUtterance | null };
+  /** Chamado quando o primeiro pedaço começa a sair. */
+  onStart: () => void;
+  /** Chamado a cada pedaço iniciado — reinicia o relógio do watchdog. */
+  onChunkStart: () => void;
+  /** Chamado no fim do último pedaço, em erro, ou se o speak() explodir. */
+  onDone: () => void;
+  /** Enquanto false a sequência para sozinha (preempção, mute, unmount). */
+  isCurrent: () => boolean;
+}
+
 /**
- * Agenda speak() após cancel — necessário no Safari/Chrome macOS.
- * Mantém referência da utterance (Safari GC mata a fala se soltar cedo).
+ * Fala o texto em pedaços encadeados — necessário no Safari/Chrome macOS.
+ *
+ * Só o PRIMEIRO pedaço passa pelo `cancel()` + atraso curto (Safari descarta
+ * `speak()` logo após `cancel()`); os seguintes entram no `onend` do anterior,
+ * então a leitura sai contínua para quem ouve. Mantém referência da utterance
+ * viva porque o GC do Safari mata a fala se ela for solta cedo.
+ *
+ * @returns Handle do timer inicial, para o chamador poder cancelar.
  */
-function speakUtterance(
-  utterance: SpeechSynthesisUtterance,
-  holdRef: { current: SpeechSynthesisUtterance | null },
-  onFail: () => void,
-): number {
-  holdRef.current = utterance;
-  window.speechSynthesis.cancel();
-  return window.setTimeout(() => {
+function speakSequence(options: SpeechSequenceOptions): number {
+  const { chunks, voice, holdRef, onStart, onChunkStart, onDone, isCurrent } = options;
+  let index = 0;
+  let started = false;
+
+  const buildUtterance = (text: string): SpeechSynthesisUtterance => {
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.voice = voice;
+    utterance.lang = voice.lang || "pt-BR";
+    utterance.rate = SPEECH_RATE;
+    utterance.pitch = speechPitchForVoice(voice);
+    utterance.onstart = () => {
+      if (!isCurrent()) return;
+      if (!started) {
+        started = true;
+        onStart();
+      }
+    };
+    utterance.onend = () => {
+      if (!isCurrent()) return;
+      speakNext();
+    };
+    utterance.onerror = () => onDone();
+    return utterance;
+  };
+
+  function speakNext(): void {
+    if (!isCurrent()) return;
+    if (index >= chunks.length) {
+      onDone();
+      return;
+    }
+    const utterance = buildUtterance(chunks[index]);
+    index += 1;
+    holdRef.current = utterance;
+    onChunkStart();
     try {
       if (window.speechSynthesis.paused) window.speechSynthesis.resume();
       window.speechSynthesis.speak(utterance);
     } catch {
-      onFail();
+      onDone();
     }
+  }
+
+  window.speechSynthesis.cancel();
+  return window.setTimeout(() => {
+    if (!isCurrent()) return;
+    speakNext();
   }, SPEAK_AFTER_CANCEL_MS);
 }
 
@@ -136,17 +206,26 @@ export function useRobotNarrator(
   }, [supported]);
 
   // Chrome/Safari: speechSynthesis pausa sozinho; resume periódico evita fila morta.
+  //
+  // O `resume()` sozinho não bastava: no corte de fala longa do Chrome (~15s) o
+  // motor para de emitir som mas mantém `speaking=true` e `paused=false`, então
+  // a condição antiga nunca era satisfeita. O `pause()+resume()` reinicia o
+  // cronômetro interno do motor sem interromper o áudio para quem ouve.
   useEffect(() => {
     if (!supported) return;
     const timer = window.setInterval(() => {
       try {
-        if (window.speechSynthesis.speaking && window.speechSynthesis.paused) {
+        if (!window.speechSynthesis.speaking) return;
+        if (window.speechSynthesis.paused) {
           window.speechSynthesis.resume();
+          return;
         }
+        window.speechSynthesis.pause();
+        window.speechSynthesis.resume();
       } catch {
         // ignore
       }
-    }, 5_000);
+    }, SPEECH_KEEPALIVE_MS);
     return () => window.clearInterval(timer);
   }, [supported]);
 
@@ -213,10 +292,21 @@ export function useRobotNarrator(
     lastEnabledRef.current = robotState.enabled;
 
     // Watchdog: onend do SpeechSynthesis às vezes não dispara (Chrome).
+    //
+    // `busyStartedAtRef` é reiniciado a cada PEDAÇO falado, então o tempo aqui
+    // mede "sem progresso", não a duração total da explicação. Fala em curso
+    // (`speaking`/`pending`) nunca é cancelada pelo watchdog normal — só pelo
+    // limite duro, que existe para o caso de o motor morrer com `speaking`
+    // preso em `true`.
+    const busyForMs =
+      busyRef.current && busyStartedAtRef.current > 0
+        ? Date.now() - busyStartedAtRef.current
+        : 0;
+    const engineIdle =
+      !window.speechSynthesis.speaking && !window.speechSynthesis.pending;
     if (
-      busyRef.current &&
-      busyStartedAtRef.current > 0 &&
-      Date.now() - busyStartedAtRef.current > BUSY_WATCHDOG_MS
+      busyForMs > BUSY_HARD_WATCHDOG_MS ||
+      (busyForMs > BUSY_WATCHDOG_MS && engineIdle)
     ) {
       const stuckKey = currentKeyRef.current;
       if (stuckKey) releaseSpeechSlot(stuckKey);
@@ -296,6 +386,9 @@ export function useRobotNarrator(
         // ignore
       }
       // Só bloqueia se realmente houver fala; se stuck, o watchdog libera.
+      // Com `busyStartedAtRef` zerado o motor está apenas terminando o pedaço
+      // anterior — cancelar aqui cortava o fim da frase. Espera o próximo tick.
+      if (busyStartedAtRef.current === 0) return;
       if (Date.now() - busyStartedAtRef.current < BUSY_WATCHDOG_MS) return;
       window.speechSynthesis.cancel();
     }
@@ -332,17 +425,22 @@ export function useRobotNarrator(
       setTick((value) => value + 1);
     };
 
-    const utterance = new SpeechSynthesisUtterance(sanitizeForSpeech(nextEvent.text));
-    utterance.voice = voice;
-    utterance.lang = voice.lang || "pt-BR";
-    utterance.rate = SPEECH_RATE;
-    utterance.pitch = speechPitchForVoice(voice);
-    utterance.onstart = () => {
-      if (currentKeyRef.current === nextEvent.key) setSpeaking(true);
-    };
-    utterance.onend = () => finish();
-    utterance.onerror = () => finish();
-    speakTimerRef.current = speakUtterance(utterance, utteranceRef, finish);
+    const chunks = splitSpeechChunks(sanitizeForSpeech(nextEvent.text));
+    if (chunks.length === 0) {
+      finish();
+      return;
+    }
+    speakTimerRef.current = speakSequence({
+      chunks,
+      voice,
+      holdRef: utteranceRef,
+      onStart: () => setSpeaking(true),
+      onChunkStart: () => {
+        busyStartedAtRef.current = Date.now();
+      },
+      onDone: finish,
+      isCurrent: () => currentKeyRef.current === nextEvent.key,
+    });
 
     function clearSpeakTimer() {
       if (speakTimerRef.current != null) {
@@ -407,19 +505,22 @@ export function useRobotNarrator(
         }, 400);
       };
 
-      const utterance = new SpeechSynthesisUtterance(
-        sanitizeForSpeech(ROBOT_START_NARRATION_TEXT),
-      );
-      utterance.voice = voice;
-      utterance.lang = voice.lang || "pt-BR";
-      utterance.rate = SPEECH_RATE;
-      utterance.pitch = speechPitchForVoice(voice);
-      utterance.onstart = () => {
-        if (currentKeyRef.current === voiceoverKey) setSpeaking(true);
-      };
-      utterance.onend = () => finish();
-      utterance.onerror = () => finish();
-      speakTimerRef.current = speakUtterance(utterance, utteranceRef, finish);
+      const chunks = splitSpeechChunks(sanitizeForSpeech(ROBOT_START_NARRATION_TEXT));
+      if (chunks.length === 0) {
+        finish();
+        return;
+      }
+      speakTimerRef.current = speakSequence({
+        chunks,
+        voice,
+        holdRef: utteranceRef,
+        onStart: () => setSpeaking(true),
+        onChunkStart: () => {
+          busyStartedAtRef.current = Date.now();
+        },
+        onDone: finish,
+        isCurrent: () => currentKeyRef.current === voiceoverKey,
+      });
     }
   }, [currency, enabled, muted, secondsUntilNextCycle, robotState, speaking, tick, supported]);
 

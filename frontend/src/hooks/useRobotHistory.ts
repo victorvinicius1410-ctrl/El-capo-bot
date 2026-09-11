@@ -3,7 +3,7 @@ import { ApiError, apiRequest } from "@/lib/api";
 import { useAuth } from "@/lib/useAuth";
 
 export type RobotHistoryDays = number;
-export type RobotHistoryResult = "WIN" | "LOSS";
+export type RobotHistoryResult = "WIN" | "LOSS" | "DRAW";
 
 export interface RobotHistoryItem {
   id: string;
@@ -111,16 +111,29 @@ function normalizeHistory(input: unknown): RobotHistoryItem[] {
     .filter((item): item is RobotHistoryItem => item !== null);
 }
 
+/** Chaves internas que nao vao para a tela do cliente. */
+const CHAVES_INTERNAS = new Set(["LIVE_DEMO"]);
+
+function chaveVisivel(chave: string | null): string | null {
+  return chave && CHAVES_INTERNAS.has(chave.toUpperCase()) ? null : chave;
+}
+
 function normalizeHistoryItem(input: unknown): RobotHistoryItem | null {
   const value = record(input);
   const active = text(value.active ?? value.symbol);
   const direction = text(value.direction ?? value.signal).toUpperCase();
   const resultValue = text(value.result ?? value.cycle_result ?? value.outcome ?? value.status).toUpperCase();
+  // O empate devolve a entrada: nao e vitoria nem derrota. Antes ele caia no
+  // `null` abaixo e a operacao era DESCARTADA aqui — some do Historico mesmo
+  // com o backend gravando. Ver `dashboardDailyStats`, que tambem nao pode
+  // conta-lo como derrota.
   const result = ["WIN", "GALE_WIN", "WON"].includes(resultValue)
     ? "WIN"
     : ["LOSS", "GALE_LOSS", "LOST"].includes(resultValue)
       ? "LOSS"
-      : null;
+      : ["DRAW", "EQUAL", "TIE"].includes(resultValue)
+        ? "DRAW"
+        : null;
   if (!active || (direction !== "CALL" && direction !== "PUT") || !result) return null;
   const galeStep = numeric(value.gale_step ?? value.martingale_step);
   const cycle = text(value.cycle_result).toUpperCase();
@@ -154,8 +167,14 @@ function normalizeHistoryItem(input: unknown): RobotHistoryItem | null {
     strategyName: optionalText(
       value.strategy_name ?? value.strategyName ?? analysis.strategy_name ?? analysis.strategyName,
     ),
-    strategyKey: optionalText(
-      value.strategy_key ?? value.strategyKey ?? analysis.strategy_key ?? analysis.strategyKey,
+    // A chave e mostrada crua no Historico (badge sob o nome da estrategia).
+    // `LIVE_DEMO` aparecia ali com todas as letras e entregava, na tela do
+    // cliente, o que a narracao acabou de deixar de dizer. A marca continua
+    // gravada no banco e visivel no admin — some so desta view.
+    strategyKey: chaveVisivel(
+      optionalText(
+        value.strategy_key ?? value.strategyKey ?? analysis.strategy_key ?? analysis.strategyKey,
+      ),
     ),
     strategySummary: optionalText(
       value.strategy_summary ??

@@ -167,8 +167,12 @@ class AdminRepository(ABC):
         company_id: str,
         user_id: str,
         trade_id: str,
-    ) -> bool:
-        """Exclui operação sintética somente no escopo autenticado."""
+    ) -> dict[str, Any] | None:
+        """Exclui operação sintética somente no escopo autenticado.
+
+        Returns:
+            A operação excluída, ou None se não existia.
+        """
 
     @abstractmethod
     async def clear_simulated_trades(
@@ -505,7 +509,7 @@ class InMemoryAdminRepository(AdminRepository):
         company_id: str,
         user_id: str,
         trade_id: str,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         """Exclui pelo id da linha ou pelo order_id espelhado da corretora."""
         rows = self.simulated_trades.get((company_id, user_id), [])
         for index, trade in enumerate(rows):
@@ -514,9 +518,10 @@ class InMemoryAdminRepository(AdminRepository):
                 str(trade.get("broker_order_id") or ""),
             }
             if trade_id in identifiers:
+                removed = dict(trade)
                 del rows[index]
-                return True
-        return False
+                return removed
+        return None
 
     async def clear_simulated_trades(
         self,

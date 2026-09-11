@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -24,6 +25,8 @@ from backend.admin_models import (
     PaymentStatus,
 )
 from backend.admin_repository import AdminRepository
+
+logger = logging.getLogger("backend-gateway")
 
 # Coluna `marketing_simulated_trades.id` é UUID; IDs da Bullex (numéricos) ou
 # rótulos sintéticos geram 400 no PostgREST se usados em `id=eq.…`.
@@ -839,7 +842,19 @@ class SupabaseAdminRepository(AdminRepository):
         stored = dict(trade)
         stored["_synthetic_sequence"] = int(payload["synthetic_sequence"])
         if rows:
-            return _simulated_trade_from_row(rows[0])
+            stored_row = _simulated_trade_from_row(rows[0])
+            for field in (
+                "strategy_name",
+                "strategy_key",
+                "strategy_summary",
+                "analysis_detail",
+                "used_strategies",
+                "timeframe",
+                "period",
+            ):
+                if trade.get(field) is not None:
+                    stored_row[field] = trade[field]
+            return stored_row
         return stored
 
     async def _insert_simulated_trade(
@@ -872,6 +887,15 @@ class SupabaseAdminRepository(AdminRepository):
         except RuntimeError as exc:
             if "broker_order_id" not in payload or not _is_missing_broker_column(exc):
                 raise
+            # Degradar em silêncio escondeu por 5 semanas que a migration
+            # nunca tinha rodado em produção (03/09/2026): o espelho ficava
+            # órfão e toda a exclusão por order_id virava no-op.
+            logger.warning(
+                "[MARKETING_BROKER_COLUMN_MISSING] op=insert user_id=%s "
+                "action=espelho gravado SEM vinculo — rode "
+                "backend/migration_marketing_broker_order_id.sql",
+                payload.get("user_id"),
+            )
             payload.pop("broker_order_id")
             return await self._request(
                 "POST",
@@ -967,7 +991,7 @@ class SupabaseAdminRepository(AdminRepository):
         company_id: str,
         user_id: str,
         trade_id: str,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         """
         Exclui trade sintético com filtros obrigatórios de tenant e usuário.
 
@@ -981,14 +1005,14 @@ class SupabaseAdminRepository(AdminRepository):
             trade_id: UUID da linha ou order_id da corretora.
 
         Returns:
-            True quando uma linha foi excluída.
+            A operação excluída, ou None se não havia linha.
         """
         if _is_uuid(trade_id):
             column, value = "id", trade_id
         else:
             column, value = "broker_order_id", str(trade_id or "").strip()
         if not value:
-            return False
+            return None
         try:
             rows = await self._request(
                 "DELETE",
@@ -1003,9 +1027,31 @@ class SupabaseAdminRepository(AdminRepository):
         except RuntimeError as exc:
             if column == "broker_order_id" and _is_missing_broker_column(exc):
                 # Migration pendente: o chamador usa o fallback do robô.
-                return False
+                logger.warning(
+                    "[MARKETING_BROKER_COLUMN_MISSING] op=delete user_id=%s "
+                    "trade_id=%s action=espelho NAO removido — rode "
+                    "backend/migration_marketing_broker_order_id.sql",
+                    user_id,
+                    trade_id,
+                )
+                return None
             raise
-        return bool(rows)
+        if not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, dict):
+            return None
+        try:
+            return _simulated_trade_from_row(row)
+        except (KeyError, TypeError, ValueError):
+            # Prefer=representation às vezes devolve só o id; o caller ainda
+            # precisa saber que a exclusão ocorreu para limpar o robô.
+            return {
+                "id": str(row.get("id") or trade_id),
+                "result": str(row.get("result") or "").upper() or None,
+                "profit": row.get("profit"),
+                "broker_order_id": row.get("broker_order_id"),
+            }
 
     async def clear_simulated_trades(
         self,

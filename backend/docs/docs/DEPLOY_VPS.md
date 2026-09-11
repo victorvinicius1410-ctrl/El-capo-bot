@@ -27,8 +27,8 @@ Projeto Compose: `elcapooneline` (mantém volumes antigos).
 
 | Container | Função | Porta |
 |-----------|--------|-------|
-| `backend-gateway` | FastAPI API/WS (`ROBOT_RUNTIME_MODE=external`) | host `8080` |
-| `robot-runtime` | Workers do robô (`ROBOT_RUNTIME_MODE=worker`) | — |
+| `backend-gateway` | FastAPI API/WS (`ROBOT_RUNTIME_MODE=external`); relay `robot:state` → WS | host `8080` |
+| `robot-runtime` | Workers do robô (`ROBOT_RUNTIME_MODE=worker`); pub snapshots Redis DB1 | — |
 | `bullex-service` | API BullEx interna (`BULLEX_MAX_CONCURRENT_API_CALLS=3`) | rede Docker `8000` |
 | `webhook-redis` | Redis (Celery DB0 + robot bus DB1) | interno `6379` |
 | `webhook-worker` | Worker Celery | — |
@@ -75,6 +75,18 @@ curl -sS https://api.elcapobot.online/health
 
 O script `deploy-backend.sh` tenta o `/health` por até ~60 s (startup pode
 atrasar se o Supabase estiver lento na hidratação da pattern memory).
+
+**Janela de 502 no deploy:** `docker compose up -d --build` recria
+`backend-gateway` (e dependentes). Enquanto o upstream em `:8080` está
+morto/reiniciando, o Nginx responde **502** sem `Access-Control-Allow-Origin`.
+No browser isso aparece como “CORS blocked” + falha em
+`/robot/state`, `/bullex/credentials` e `wss://…/ws/robot-state`. Após o
+health local/remoto voltar a 200, os headers CORS voltam (origem
+`https://app.elcapobot.online`).
+
+**WebSocket no gateway:** a imagem precisa de `websockets` (ver
+[`ROBOT_STATE_WEBSOCKET.md`](./ROBOT_STATE_WEBSOCKET.md)). Sem isso o upgrade
+falha com 404 e o log `No supported WebSocket library detected`.
 
 Parar (mantém volumes):
 

@@ -17,6 +17,8 @@ from backend.email_repository import InMemoryEmailRepository
 from backend.email_router import create_email_router
 from backend.email_service import (
     DEFAULT_BODIES,
+    DEFAULT_SUBJECTS,
+    FACTORY_RENEWAL_SNIPPET,
     EmailAuthorizationError,
     EmailConfig,
     EmailService,
@@ -67,11 +69,44 @@ class EmailServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_list_seeds_defaults_disabled(self) -> None:
-        """Lista garante um template por evento, desativado por padrão."""
+    async def test_list_seeds_every_event_enabled(self) -> None:
+        """Lista garante um template por evento e todos já nascem ativos."""
         templates = await self.service.list_templates(owner())
         self.assertEqual(len(templates), len(DomainEventType))
-        self.assertTrue(all(not item.is_enabled for item in templates))
+        enabled = {item.event_type for item in templates if item.is_enabled}
+        self.assertEqual(enabled, set(DomainEventType))
+        self.assertEqual(set(DEFAULT_BODIES), set(DomainEventType))
+
+    async def test_list_upgrades_factory_renewal_template(self) -> None:
+        """HTML curto e desligado da renovação é substituído e ativado uma vez."""
+        from backend.email_models import EmailTemplate
+        from backend.email_repository import new_template_id
+
+        now = datetime.now(timezone.utc)
+        old_html = (
+            "<p>Olá <strong>{{customer_name}}</strong>, "
+            "Sua assinatura <strong>{{plan_name}}</strong> foi renovada "
+            "({{amount}} {{currency}}).</p>"
+        )
+        self.repository.templates[(COMPANY_ID, DomainEventType.SUBSCRIPTION_RENEWED.value)] = (
+            EmailTemplate(
+                id=new_template_id(),
+                company_id=COMPANY_ID,
+                event_type=DomainEventType.SUBSCRIPTION_RENEWED,
+                subject="Assinatura renovada — ElCapo",
+                html_body=old_html,
+                is_enabled=False,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        templates = await self.service.list_templates(owner())
+        renewed = next(
+            item for item in templates if item.event_type == DomainEventType.SUBSCRIPTION_RENEWED
+        )
+        self.assertTrue(renewed.is_enabled)
+        self.assertIn("ACESSAR O PAINEL", renewed.html_body)
+        self.assertNotIn(FACTORY_RENEWAL_SNIPPET, renewed.html_body)
 
     async def test_update_requires_manage_permission(self) -> None:
         """Viewer não edita HTML."""
@@ -120,14 +155,14 @@ class EmailServiceTests(unittest.IsolatedAsyncioTestCase):
             DEFAULT_BODIES[DomainEventType.PURCHASE_COMPLETED],
             variables,
         )
-        self.assertIn("Defina sua senha em:", rendered.html_body)
         self.assertIn(
             'href="https://app.example.com/reset-password?token=abc"',
             rendered.html_body,
         )
+        self.assertNotIn('href=""', rendered.html_body)
 
-    async def test_purchase_email_omits_first_access_link_for_existing_customer(self) -> None:
-        """Renovação de cliente já cadastrado não mostra link de 1º acesso vazio."""
+    async def test_purchase_cta_falls_back_to_login_without_first_access(self) -> None:
+        """Sem link de senha, o botão aponta para o login em vez de href vazio."""
         variables = self.service.build_variables(
             DomainEventType.PURCHASE_COMPLETED,
             {
@@ -141,12 +176,62 @@ class EmailServiceTests(unittest.IsolatedAsyncioTestCase):
             DEFAULT_BODIES[DomainEventType.PURCHASE_COMPLETED],
             variables,
         )
-        self.assertNotIn("Defina sua senha em:", rendered.html_body)
         self.assertNotIn('href=""', rendered.html_body)
+        self.assertIn('href="https://app.example.com/login"', rendered.html_body)
+
+    async def test_purchase_email_omits_first_access_link_for_existing_customer(self) -> None:
+        """Template de quem já tinha conta não pede senha nova."""
+        variables = self.service.build_variables(
+            DomainEventType.PURCHASE_EXISTING_ACCOUNT,
+            {
+                "customer": {"name": "Ana", "email": "ana@example.com"},
+                "plan": {"name": "Mensal"},
+                "data": {"amount": 147.9, "currency": "BRL"},
+            },
+        )
+        rendered = EmailService.render(
+            "Compra confirmada",
+            DEFAULT_BODIES[DomainEventType.PURCHASE_EXISTING_ACCOUNT],
+            variables,
+        )
+        self.assertNotIn("Defina sua senha", rendered.html_body)
+        self.assertNotIn("{{first_access", rendered.html_body)
+        self.assertNotIn('href=""', rendered.html_body)
+        self.assertIn("https://app.example.com/login", rendered.html_body)
+        self.assertIn("mesma senha", rendered.html_body)
+
+    async def test_renewal_email_confirms_plan_and_login(self) -> None:
+        """Renovação confirma valor e aponta para o painel, sem link de 1º acesso."""
+        variables = self.service.build_variables(
+            DomainEventType.SUBSCRIPTION_RENEWED,
+            {
+                "customer": {"name": "Ana", "email": "ana@example.com"},
+                "plan": {"name": "Mensal"},
+                "data": {"amount": 147.9, "currency": "BRL"},
+            },
+        )
+        rendered = EmailService.render(
+            "Assinatura renovada",
+            DEFAULT_BODIES[DomainEventType.SUBSCRIPTION_RENEWED],
+            variables,
+        )
+        self.assertIn("renovada", rendered.html_body.lower())
+        self.assertIn("R$ 147,90", rendered.html_body)
+        self.assertIn("https://app.example.com/login", rendered.html_body)
+        self.assertNotIn("Defina sua senha", rendered.html_body)
 
     async def test_queue_skips_disabled_template(self) -> None:
-        """Template desativado não gera entrega."""
+        """Template desativado pelo admin não gera entrega."""
         await self.service.list_templates(owner())
+        await self.service.update_template(
+            owner(),
+            DomainEventType.TRIAL_STARTED,
+            EmailTemplateUpdate(
+                subject="Trial",
+                html_body="<p>oi</p>",
+                is_enabled=False,
+            ),
+        )
         event = DomainEvent(
             id="evt-1",
             company_id=COMPANY_ID,
@@ -163,6 +248,29 @@ class EmailServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await self.service.queue_for_event(event)
         self.assertIsNone(result)
+
+    async def test_queue_seeds_existing_account_template_when_missing(self) -> None:
+        """Compra de conta existente envia mesmo sem o admin abrir a lista de templates."""
+        event = DomainEvent(
+            id="evt-existing-seed",
+            company_id=COMPANY_ID,
+            event_type=DomainEventType.PURCHASE_EXISTING_ACCOUNT,
+            subject_user_id="user-3",
+            request_id="req-existing",
+            payload={
+                "customer": {"name": "Ana", "email": "ana@example.com"},
+                "plan": {"name": "Mensal"},
+                "data": {"amount": 147.9, "currency": "BRL"},
+            },
+            occurred_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+        )
+        with patch("backend.workers.email_tasks.deliver_email") as task:
+            task.delay = lambda *args, **kwargs: None
+            delivery = await self.service.queue_for_event(event)
+        self.assertIsNotNone(delivery)
+        assert delivery is not None
+        self.assertEqual(delivery.event_type, DomainEventType.PURCHASE_EXISTING_ACCOUNT)
 
     async def test_queue_and_deliver_enabled_template(self) -> None:
         """Template ativo enfileira e envia via provedor mockado."""
@@ -253,8 +361,8 @@ class EmailServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         other = await self.service.list_templates(owner(OTHER_COMPANY_ID))
         trial = next(item for item in other if item.event_type == DomainEventType.TRIAL_ENDED)
-        self.assertEqual(trial.subject, "Seu teste grátis encerrou — ElCapo")
-        self.assertFalse(trial.is_enabled)
+        self.assertEqual(trial.subject, DEFAULT_SUBJECTS[DomainEventType.TRIAL_ENDED])
+        self.assertNotEqual(trial.subject, "Fim A")
 
     async def test_webhook_queue_also_triggers_email(self) -> None:
         """queue_event_deliveries notifica o EmailService."""
@@ -393,6 +501,101 @@ class EmailRouterTests(unittest.TestCase):
         response = self.client.post("/admin/emails/templates/trial.started/test")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "VALIDATION_ERROR")
+
+    def test_test_send_accepts_recipient_in_body(self) -> None:
+        """Admin pode informar o destinatário do e-mail de teste no body."""
+        self.service.config = EmailConfig(
+            enabled=True,
+            api_key="re_test",
+            from_address="ElCapo <noreply@example.com>",
+            frontend_url="http://localhost:5173",
+            provider="resend",
+        )
+        captured: dict[str, str] = {}
+
+        async def _fake_send(*, to_email: str, subject: str, html_body: str) -> str:
+            captured["to_email"] = to_email
+            return "msg_test_1"
+
+        with patch.object(self.service, "_send_message", new=_fake_send):
+            response = self.client.post(
+                "/admin/emails/templates/trial.started/test",
+                json={"recipient_email": "teste@destino.com"},
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured.get("to_email"), "teste@destino.com")
+        self.assertEqual(response.json()["data"]["status"], "delivered")
+
+    def test_test_send_rejects_invalid_recipient(self) -> None:
+        """Destinatário inválido no body retorna VALIDATION_ERROR."""
+        self.service.config = EmailConfig(
+            enabled=True,
+            api_key="re_test",
+            from_address="ElCapo <noreply@example.com>",
+            frontend_url="http://localhost:5173",
+            provider="resend",
+        )
+        response = self.client.post(
+            "/admin/emails/templates/trial.started/test",
+            json={"recipient_email": "sem-arroba"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "VALIDATION_ERROR")
+
+
+class EmailWorkerRegistrationTests(unittest.TestCase):
+    """Garante que o worker Celery conhece emails.deliver."""
+
+    def test_webhook_celery_app_registers_email_deliver_task(self) -> None:
+        """Task emails.deliver deve existir no mesmo app do webhook-worker."""
+        from backend.workers.webhook_tasks import celery_app
+
+        self.assertIn("emails.deliver", celery_app.tasks)
+
+
+class EmailOrphanPendingTests(unittest.IsolatedAsyncioTestCase):
+    """Pendentes nunca despachados passam a falhar de forma explícita."""
+
+    async def asyncSetUp(self) -> None:
+        self.repository = InMemoryEmailRepository()
+        self.service = EmailService(
+            self.repository,
+            EmailConfig(
+                enabled=True,
+                api_key="re_test",
+                from_address="ElCapo <noreply@example.com>",
+                frontend_url="https://app.example.com",
+            ),
+        )
+
+    async def test_list_deliveries_marks_stale_pending_as_failed(self) -> None:
+        """Pending com 0 tentativas e idade alta vira failed (nunca enviou)."""
+        from datetime import timedelta
+
+        from backend.email_models import EmailDelivery, EmailDeliveryStatus
+
+        stale = EmailDelivery(
+            id="del-stale",
+            company_id=COMPANY_ID,
+            event_id="evt-stale",
+            event_type=DomainEventType.PURCHASE_COMPLETED,
+            recipient_email_hash="abc",
+            subject="Bem-vindo",
+            status=EmailDeliveryStatus.PENDING,
+            attempt_count=0,
+            provider_message_id=None,
+            latency_ms=None,
+            next_attempt_at=None,
+            last_error_code=None,
+            request_id="req-stale",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            updated_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+        await self.repository.save_delivery(stale)
+        items = await self.service.list_deliveries(owner())
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].status, EmailDeliveryStatus.FAILED)
+        self.assertEqual(items[0].last_error_code, "DISPATCH_TIMEOUT")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,7 @@ from backend.admin_dashboard_cache import (
 )
 from backend.admin_dashboard_service import calculate_admin_dashboard
 from backend.admin_dashboard_warm import AdminDashboardWarmer
+from backend.brasilia_time import history_cutoff
 from backend.admin_service import (
     AdminManagementService,
     AuthorizationError,
@@ -45,7 +47,7 @@ from backend.admin_service import (
 from backend.marketing_simulation_service import MarketingSimulationService
 
 AssetPayoutResolver = Callable[[str, str], Awaitable[int | None]]
-RobotHistoryDeleter = Callable[[str, str], bool]
+RobotHistoryDeleter = Callable[..., Any]
 HistoryLoader = Callable[[str, int], list[dict[str, Any]]]
 HistoryBatchLoader = Callable[[list[str], int], dict[str, list[dict[str, Any]]]]
 logger = logging.getLogger("backend-admin-router")
@@ -152,12 +154,7 @@ async def compute_admin_dashboard_payload(
         histories_by_user.setdefault(client.user_id, [])
 
     period_end = datetime.now(timezone.utc)
-    period_start = (period_end - timedelta(days=days - 1)).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    period_start = history_cutoff(days, period_end)
     revenue_events, lifecycle_events = await asyncio.gather(
         service.repository.list_revenue_events(
             actor.company_id,
@@ -350,7 +347,7 @@ class GenerateScoreHistoryPayload(BaseModel):
     amount: float = Field(gt=0)
     payout: int | None = Field(default=None, ge=0, le=100)
     asset: str | None = Field(default=None, min_length=1, max_length=50)
-    period: Literal["M1", "M5", "M15"] = "M1"
+    period: Literal["M1", "M5", "M15"] = "M5"
 
     @field_validator("asset")
     @classmethod
@@ -440,6 +437,7 @@ def create_admin_router(
     marketing_display_sync: Callable[[str, list[dict[str, Any]], dict[str, Any]], None] | None = None,
     asset_payout_resolver: AssetPayoutResolver | None = None,
     robot_history_deleter: RobotHistoryDeleter | None = None,
+    marketing_score_remover: Callable[[str, dict[str, Any]], None] | None = None,
     history_batch_loader: Callable[[list[str], int], dict[str, list[dict[str, Any]]]] | None = None,
     access_profile_invalidator: Callable[[str], None] | None = None,
     dashboard_warmer: AdminDashboardWarmer | None = None,
@@ -459,6 +457,8 @@ def create_admin_router(
             (user_id, symbol) → percentual 0-100.
         robot_history_deleter: Opcional — remove operação do histórico `/robot`
             por order_id (ex.: ordens ao vivo da Bullex na conta marketing).
+        marketing_score_remover: Opcional — subtrai WIN/LOSS/lucro do placar
+            após exclusão (uma vez, mesmo limpando UUID + broker_order_id).
         history_batch_loader: Opcional — carrega histórico de N usuários em
             lote (evita N+1 no ``GET /admin/dashboard``).
         access_profile_invalidator: Opcional — limpa cache de auth do gateway
@@ -499,18 +499,30 @@ def create_admin_router(
             simulations[key] = simulator
         return simulator
 
-    async def sync_marketing_display(auth: dict[str, str]) -> None:
-        """Propaga o histórico Shift+O para o placar/histórico idêntico ao cliente."""
+    async def sync_marketing_display(
+        auth: dict[str, str],
+        history: list[dict[str, Any]] | None = None,
+        stats: dict[str, Any] | None = None,
+    ) -> None:
+        """Propaga o lote informado para o overlay, sem apagar o histórico antigo."""
         if marketing_display_sync is None:
             return
-        history = await service.repository.list_simulated_trades(
-            auth["company_id"],
-            auth["user_id"],
-            limit=10_000,
-        )
-        simulator = await get_simulator(auth)
-        simulator.replace_history(history)
-        marketing_display_sync(auth["user_id"], history, simulator.build_stats())
+        if history is None:
+            history = await service.repository.list_simulated_trades(
+                auth["company_id"],
+                auth["user_id"],
+                limit=10_000,
+            )
+            from backend.marketing_simulation_service import MarketingSimulationService
+
+            history = [
+                MarketingSimulationService.enrich_trade_with_strategy(dict(item))
+                for item in history
+            ]
+            simulator = await get_simulator(auth)
+            simulator.replace_history(history)
+            stats = simulator.build_stats()
+        marketing_display_sync(auth["user_id"], history, stats or {})
 
     @router.get("/me/access")
     async def get_my_access(
@@ -1289,8 +1301,15 @@ def create_admin_router(
             auth["user_id"],
             generated,
         )
+        from backend.marketing_simulation_service import MarketingSimulationService
+
+        stored = MarketingSimulationService.preserve_simulated_metadata(generated, stored)
         simulator.history[-1] = dict(stored)
-        await sync_marketing_display(auth)
+        await sync_marketing_display(
+            auth,
+            history=[dict(stored)],
+            stats=_score_stats_from_trades([stored], accumulate=True),
+        )
         return {"ok": True, "data": _simulated_trade_view(stored)}
 
     @router.post("/marketing-simulation/generate-history", status_code=201)
@@ -1299,16 +1318,18 @@ def create_admin_router(
         auth: dict[str, str] = Depends(require_authenticated_user),
     ) -> dict[str, Any]:
         """
-        Substitui o histórico sintético pelo placar informado no Shift+O.
+        Substitui o placar do overlay pelo lote informado no Shift+O.
 
         Body: wins, losses, amount (valor de entrada), period e asset opcional.
         O payout é consultado automaticamente na corretora a partir do ativo
         (pode ser enviado manualmente só para compatibilidade/testes).
+        O histórico antigo permanece; só o placar visual do El Capo é
+        reescrito para o lote gerado.
         """
         _require_marketing_simulation(auth)
         simulator = await get_simulator(auth)
         body = payload.model_dump(exclude_unset=True)
-        period = str(body.get("period") or "M1")
+        period = str(body.get("period") or "M5")
         fixed_asset = body.get("asset")
         fixed_payout = body.get("payout")
 
@@ -1335,7 +1356,11 @@ def create_admin_router(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        await sync_marketing_display(auth)
+        await sync_marketing_display(
+            auth,
+            history=generated,
+            stats=_score_stats_from_trades(generated),
+        )
         return {
             "ok": True,
             "data": [_simulated_trade_view(item) for item in generated],
@@ -1347,9 +1372,17 @@ def create_admin_router(
     ) -> dict[str, Any]:
         """Lista exclusivamente o histórico sintético da sessão atual."""
         _require_marketing_simulation(auth)
+        # `limit=10_000` como em todos os outros chamadores. Sem ele valia o
+        # default 100 do repositório e, como a ordem é `synthetic_sequence.asc`,
+        # o corte comia justamente as operações NOVAS: em 01/09 a conta
+        # `81c49f33` tinha 525 sintéticas e o painel só recebia as 100 mais
+        # antigas (26/07 a 30/07), sumindo com 425. Pior, o `replace_history`
+        # logo abaixo recalculava o placar em cima dessa fatia truncada, então
+        # abrir a aba Histórico corrompia o placar exibido.
         history = await service.repository.list_simulated_trades(
             auth["company_id"],
             auth["user_id"],
+            limit=10_000,
         )
         key = (auth["company_id"], auth["user_id"])
         if key in simulations:
@@ -1380,7 +1413,11 @@ def create_admin_router(
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="SIMULATED_TRADE_NOT_FOUND")
-        await sync_marketing_display(auth)
+        await sync_marketing_display(
+            auth,
+            history=[dict(updated)],
+            stats={"skip_score": True},
+        )
         return {"ok": True, "data": _simulated_trade_view(updated)}
 
     @router.delete("/marketing-simulation/trades/{trade_id}", status_code=204)
@@ -1394,18 +1431,65 @@ def create_admin_router(
         Aceita o UUID de ``marketing_simulated_trades`` (Shift+O) **ou** o
         ``order_id`` exibido em ``/robot/history`` (operações ao vivo Bullex).
         IDs não-UUID não consultam a coluna UUID do Supabase (evita 400/500).
+
+        Limpa UUID e ``broker_order_id`` nas fontes do robô e ajusta o placar
+        **uma vez** (antes o placar só caía se a linha existisse em
+        ``robot_trade_history`` com o mesmo id — exclusão pelo UUID do
+        espelho deixava WIN/LOSS no overlay).
         """
         _require_marketing_simulation(auth)
         simulator = await get_simulator(auth)
         deleted_marketing = await simulator.delete_trade(trade_id)
-        deleted_robot = False
-        if not deleted_marketing and robot_history_deleter is not None:
-            deleted_robot = bool(robot_history_deleter(auth["user_id"], trade_id))
-        if not deleted_marketing and not deleted_robot:
+        order_ids: set[str] = {str(trade_id or "").strip()}
+        trade_meta: dict[str, Any] | None = (
+            dict(deleted_marketing) if isinstance(deleted_marketing, dict) else None
+        )
+        if trade_meta:
+            for key in ("id", "broker_order_id", "order_id"):
+                value = str(trade_meta.get(key) or "").strip()
+                if value:
+                    order_ids.add(value)
+
+        # O deleter real aceita `adjust_score`; mocks antigos de teste só
+        # aceitam (user_id, order_id). Decidir pela assinatura em vez de
+        # capturar TypeError: um TypeError vindo de DENTRO do deleter caía no
+        # fallback com `adjust_score=True` e o placar era decrementado duas
+        # vezes — aqui e no `marketing_score_remover` logo abaixo.
+        takes_adjust_score = True
+        if robot_history_deleter is not None:
+            try:
+                inspect.signature(robot_history_deleter).bind(
+                    "user",
+                    "order",
+                    adjust_score=False,
+                )
+            except (TypeError, ValueError):
+                takes_adjust_score = False
+
+        removed_robot = False
+        if robot_history_deleter is not None:
+            for order_id in sorted(order_ids):
+                if not order_id:
+                    continue
+                if takes_adjust_score:
+                    removed = robot_history_deleter(
+                        auth["user_id"],
+                        order_id,
+                        adjust_score=False,
+                    )
+                else:
+                    removed = robot_history_deleter(auth["user_id"], order_id)
+                if removed:
+                    removed_robot = True
+                    if trade_meta is None and isinstance(removed, dict):
+                        trade_meta = removed
+
+        if trade_meta is None and not deleted_marketing and not removed_robot:
             # Idempotente: duplo clique / cache stale após exclusão bem-sucedida.
             return Response(status_code=204)
-        if deleted_marketing:
-            await sync_marketing_display(auth)
+
+        if trade_meta is not None and marketing_score_remover is not None:
+            marketing_score_remover(auth["user_id"], trade_meta)
         return Response(status_code=204)
 
     return router
@@ -1446,6 +1530,36 @@ def _require_marketing_simulation(auth: dict[str, str]) -> None:
 def _simulated_trade_view(item: dict[str, Any]) -> dict[str, Any]:
     """Remove metadados internos do sequenciamento antes da resposta."""
     return {key: value for key, value in item.items() if not key.startswith("_")}
+
+
+def _score_stats_from_trades(
+    trades: list[dict[str, Any]],
+    *,
+    accumulate: bool = False,
+) -> dict[str, Any]:
+    """
+    Calcula o placar de um lote de operações sintéticas.
+
+    Args:
+        trades: Operações recém-criadas ou editadas.
+        accumulate: Quando True, o overlay soma este lote ao placar atual
+            em vez de substituí-lo.
+
+    Returns:
+        Contadores no formato esperado por ``sync_marketing_display_to_robot``.
+    """
+    wins = sum(1 for item in trades if str(item.get("result") or "").upper() == "WIN")
+    losses = sum(1 for item in trades if str(item.get("result") or "").upper() == "LOSS")
+    profit = round(sum(float(item.get("profit") or 0) for item in trades), 2)
+    total = wins + losses
+    return {
+        "wins": wins,
+        "losses": losses,
+        "total_trades": total,
+        "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+        "profit": profit,
+        "accumulate": accumulate,
+    }
 
 
 def _is_pending_lead(item: ClientRecord) -> bool:

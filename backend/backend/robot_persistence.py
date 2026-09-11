@@ -6,10 +6,12 @@ import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+from backend.brasilia_time import history_cutoff_iso
 
 import httpx
 
@@ -37,6 +39,11 @@ ROBOT_SETTING_FIELDS = (
     "martingale_enabled",
     "martingale_steps",
     "martingale_multiplier",
+    # Modo LIVE fica só na persistência local: a tabela de settings da Supabase
+    # não tem essa coluna, e gravar campo desconhecido lá derruba o sync. É um
+    # ajuste de demonstração, não uma preferência que precise viajar entre
+    # ambientes. Ver `live_demo_mode.py`.
+    "live_demo",
 )
 
 SUPABASE_ROBOT_SETTING_FIELDS = (
@@ -72,6 +79,7 @@ ROBOT_SETTING_DEFAULTS: dict[str, Any] = {
     "martingale_enabled": False,
     "martingale_steps": 1,
     "martingale_multiplier": 2,
+    "live_demo": False,
 }
 TRADE_ANALYSIS_FIELDS = (
     "analyzed_direction",
@@ -80,6 +88,23 @@ TRADE_ANALYSIS_FIELDS = (
     "strategy_mode",
     "strategy_name",
     "strategy_key",
+    # Marca a operacao como entrada do modo LIVE. Desde 09/09/2026 e a UNICA
+    # marca: `strategy_key` passou a levar a chave real do setup (e campo de
+    # tela). O booleano sobrevive a qualquer renomeacao de
+    # estrategia e e o que a auditoria consulta para excluir o modo das
+    # medicoes — a contaminacao que a auditoria de 03/09 teve que desfazer.
+    "live_demo",
+    # Veredito da REV-Z (mercado aberto, desde 10/09/2026): z da indicação e z
+    # no fechamento que confirmou a entrada. É a medida para a frente da
+    # estratégia; `None` nas operações do OTC.
+    "revz",
+    # Veredito de S/R na análise e na reconferência do disparo (10/09/2026).
+    # É o que prova, ordem a ordem, que a entrada respeitou o nível.
+    "sr_respect_reason",
+    "sr_entry_recheck_reason",
+    # Filtro de pavio na análise e no disparo (11/09/2026).
+    "wick_reason",
+    "wick_entry_reason",
     "strategy_summary",
     "analysis_detail",
     "speech_preview",
@@ -102,6 +127,13 @@ TRADE_ANALYSIS_FIELDS = (
     "near_support",
     "near_resistance",
     "price_action_setup",
+    # Telemetria de execução (2026-08-30): permite medir depois do fato se a
+    # ordem pegou o início da vela. `opened_at` só é gravado após o ACK da
+    # corretora, então não serve para isso.
+    "entry_candle_second",
+    "entry_candle_second_authorized",
+    "entry_window_end_second",
+    "entry_server_time_source",
 )
 
 
@@ -275,7 +307,8 @@ class RobotPersistence(ABC):
 
         Args:
             user_ids: Identificadores dos clientes do tenant.
-            days: Janela em dias (finished_at >= agora - days).
+            days: Janela em dias civis de Brasília (finished_at >= meia-noite
+                do primeiro dia da janela).
 
         Returns:
             Mapa user_id → lista de trades (lista vazia se sem histórico).
@@ -624,7 +657,7 @@ class SQLiteRobotPersistence(RobotPersistence):
             )
 
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cutoff = history_cutoff_iso(days)
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -653,7 +686,7 @@ class SQLiteRobotPersistence(RobotPersistence):
         result: dict[str, list[dict[str, Any]]] = {user_id: [] for user_id in normalized}
         if not normalized:
             return result
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).isoformat()
+        cutoff = history_cutoff_iso(days)
         placeholders = ",".join("?" for _ in normalized)
         with self._connect() as connection:
             rows = connection.execute(
@@ -1089,7 +1122,7 @@ class SupabaseRobotPersistence(RobotPersistence):
         )
 
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cutoff = history_cutoff_iso(days)
         rows = self._request(
             "GET",
             f"/robot_trade_history?user_id=eq.{quote(user_id, safe='')}"
@@ -1119,7 +1152,7 @@ class SupabaseRobotPersistence(RobotPersistence):
         result: dict[str, list[dict[str, Any]]] = {user_id: [] for user_id in normalized}
         if not normalized:
             return result
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).isoformat()
+        cutoff = history_cutoff_iso(days)
         chunk_size = self._HISTORY_BATCH_CHUNK_SIZE
         for offset in range(0, len(normalized), chunk_size):
             chunk = normalized[offset : offset + chunk_size]
@@ -1242,7 +1275,15 @@ def create_robot_persistence() -> RobotPersistence:
 
 def build_trade_history_item(user_id: str, trade: dict[str, Any]) -> dict[str, Any]:
     result = str(trade.get("result") or "").strip().upper()
-    if result not in {"WIN", "LOSS"}:
+    # DRAW (empate: a vela fecha no preco de abertura e a corretora devolve a
+    # entrada) e resultado FINAL — `main.py` ja o trata como tal em
+    # `{"WIN","LOSS","TIMEOUT","DRAW"}`. So aqui ele era recusado, entao a
+    # operacao estourava com TRADE_RESULT_NOT_FINAL e SUMIA do Historico: o
+    # cliente via acontecer na tela e depois nao encontrava. Raro no uso normal,
+    # frequente com o modo LIVE, que entra quase toda vela (08/09/2026).
+    # TIMEOUT continua fora de proposito: ali o resultado e DESCONHECIDO, e
+    # gravar desconhecido como historico e pior do que nao gravar.
+    if result not in {"WIN", "LOSS", "DRAW"}:
         raise ValueError("TRADE_RESULT_NOT_FINAL")
     order_id = str(trade.get("order_id") or "").strip()
     if not order_id:

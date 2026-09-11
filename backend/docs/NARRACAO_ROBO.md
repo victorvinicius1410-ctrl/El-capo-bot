@@ -197,6 +197,7 @@ Valores restaurados ao comportamento original (não alterar):
 | Constante | Valor | Por quê |
 |---|---|---|
 | `result_display_until` | **5s** | Bloqueia `prepare_cycle`; esticar atrasa a análise na vela |
+| Overlay WIN/LOSS + ativo | **60s** | Só UI (`RESULT_OVERLAY_DISPLAY_MS`); não bloqueia o ciclo |
 | `acknowledge_unseen_result(hold_seconds)` | **8s** | Só overlay de tela fechada |
 | `unseen_result` no fechamento | só com painel **offline** | Online, o payload não deve mascarar o ciclo |
 
@@ -221,6 +222,43 @@ A fala de dinheiro usa `formatMoneyForSpeech` (`bullexConnection.ts`):
 
 Sem vírgula nem ponto decimal na string falada.
 
+
+## 4d. Fala longa cortada no meio (2026-09-08)
+
+Sintoma: o El Capo começava a explicar a operação e **parava antes do fim** —
+a explicação nunca era repetida, porque a chave já entrava em `spokenKeys`
+antes do `speak()`.
+
+Três causas somadas, todas em `useRobotNarrator.ts`:
+
+1. **Watchdog cego.** O bloco de `BUSY_WATCHDOG_MS` (25s) cancelava por tempo
+   puro, sem checar `speechSynthesis.speaking`. O texto de `SIGNAL_FOUND` tem
+   ~52 palavras (~22s no `SPEECH_RATE` de 0,92) e passa disso quando a
+   estratégia traz resumo longo — então o watchdog cortava fala legítima.
+2. **Corte de fala longa do Chrome (~15s).** O keep-alive só chamava
+   `resume()` sob `speaking && paused`, mas nesse bug o motor mantém
+   `paused=false` — a condição nunca era satisfeita.
+3. **Preempção por `ORDER_REJECTED`** (prioridade 80 contra 0). Enquanto o
+   par recusado repetia "Entrada rejeitada" a cada vela, ele cortava a
+   explicação da entrada seguinte. Ver o cooldown progressivo em
+   [`ESTRATEGIA.md`](./ESTRATEGIA.md) §6 (2026-09-08).
+
+### Correção vigente
+
+| Peça | Arquivo | Comportamento |
+|---|---|---|
+| `splitSpeechChunks` | `frontend/src/lib/speechChunks.ts` | Quebra o texto em pedaços de até `SPEECH_CHUNK_MAX_CHARS` (140), **sem partir frase** |
+| `speakSequence` | `frontend/src/hooks/useRobotNarrator.ts` | Encadeia os pedaços no `onend` do anterior; só o 1º passa pelo `cancel()` + 60ms do Safari |
+| `onChunkStart` | idem | Reinicia `busyStartedAtRef` a cada pedaço — o watchdog mede **falta de progresso**, não duração total |
+| `engineIdle` | idem | Watchdog normal só corta com o motor parado |
+| `BUSY_HARD_WATCHDOG_MS` | idem | 120s — destrava se o Chrome deixar `speaking` preso em `true` |
+| Keep-alive | idem | `pause()+resume()` incondicional a cada 5s enquanto `speaking` |
+
+O texto ouvido **não mudou** — só a forma de entregá-lo ao motor de voz.
+
+Testes: `frontend/src/lib/robotNarration.test.ts` (bloco "fala longa não é
+cortada no meio").
+
 ## 5. Janela de entrada (inalterada)
 
 Quando há `pending_signal` aguardando a vela:
@@ -242,6 +280,9 @@ na compra: `ACTIVE_CLOSED` vs “baixa qualidade”).
 
 ## 6. Histórico
 
+- **2026-09-08** — Fala longa deixou de ser cortada: texto quebrado em
+  pedaços encadeados, watchdog só corta com o motor parado, keep-alive do
+  Chrome com `pause()+resume()`. Ver §4d.
 - **2026-07-31 (visual Mac/celular)** — Avatar via canvas (`RobotAvatarVideo`)
   para Safari/iOS aplicar o mesmo `hue-rotate` do Windows. Ver `OVERLAY_ROBO.md`.
 - **2026-07-31 (entrada anunciada sem compra)** — Overlay e voz deixam de

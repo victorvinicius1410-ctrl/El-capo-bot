@@ -1,7 +1,7 @@
 # Shell layout — menu do painel (desktop + mobile)
 
 Documento do layout autenticado (`AppShell`): sidebar no desktop e menu
-hamburger no celular. Atualizado em **2026-08-07**.
+hamburger no celular. Atualizado em **2026-08-17**.
 
 ## 1. Objetivo
 
@@ -89,6 +89,8 @@ A partir de `768px`:
 
 ## 6. Histórico
 
+- **2026-08-17** — Sessão de suporte: `LiveTradingDataProvider` monta no
+  dashboard do lead; overlay do robô continua oculto. Ver `ROBO_E_SUPORTE.md` §5.
 - **2026-08-07** — Desktop: sidebar `fixed` + `margin-left` no conteúdo;
   corrige menu que descia com o scroll da página (sticky quebrado por
   `overflow-x: hidden`).

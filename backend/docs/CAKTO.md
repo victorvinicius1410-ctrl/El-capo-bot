@@ -87,7 +87,11 @@ corpo). Resolução de tenant pela **oferta** (`cakto_offer_id`), nunca por
 3. Se o e-mail ainda não tem perfil → cria usuário Auth + linha em
    `user_access_profiles` + link de primeiro acesso.
 4. Libera `grant_access=true` e `approval_status=approved`.
-5. Enfileira e-mail nativo `purchase.completed` (aba **E-mails → Entregas**).
+5. Enfileira e-mail nativo:
+   - conta nova → `purchase.completed` (link para definir senha);
+   - conta já existente (trial, cadastro prévio, etc.) → `purchase.existing_account`
+     (mesma senha; CTA de login);
+   - `subscription_renewed` → `subscription.renewed`.
 6. Responde **202** mesmo se destinos HTTP de saída falharem (a liberação já
    foi persistida).
 
@@ -98,6 +102,7 @@ corpo). Resolução de tenant pela **oferta** (`cakto_offer_id`), nunca por
 | Nginx `POST /webhooks/cakto` → **401** | `PROD_CAKTO_WEBHOOK_SECRET` ≠ secret do app webhook na Cakto | Alinhar o `.env` com o secret do painel (API `GET /public_api/webhook/` / histórico) e redeploy |
 | Nginx **500** após auth OK | Filtro PostgREST inválido em `outgoing_webhook_endpoints` ou falha ao enfileirar e-mail | Backend resiliente: e-mail enfileira mesmo sem destinos; filtro usa `{evento}` Postgres |
 | Conta Auth criada sem acesso | Perfil `user_access_profiles` ausente | `ensure_purchase_customer` no webhook de compra |
+| Conta criada, assinatura inativa | `purchase_approved` retornou **422** após provisionar Auth/perfil (ledger/e-mail falhou); só `subscription_created` chegou depois | Corrigido em **2026-08-24**: acesso liberado logo após criar perfil, antes do ledger; reprocessamento idempotente reativa pendente |
 | Entregas de e-mail vazia | Eventos nunca processados (401) **ou** tabelas `email_*` ausentes | Corrigir secret + migration `migration_native_emails.sql` |
 
 Para recuperar compras já pagas após alinhar o secret: reprocessar o histórico

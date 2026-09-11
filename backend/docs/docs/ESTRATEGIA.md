@@ -3,24 +3,29 @@
 Documento de referência da lógica de seleção e aprovação de operações.
 Criado em 2026-07-21 junto com a correção do portão de qualidade da entrada.
 
-## Estado atual (2026-08-07)
+## Estado atual (2026-08-16 — **produção: volta 13–14/08**)
 
 O robô opera com a **estratégia clássica** (`confidence_model_version =
-backup-classic`) + bloqueio `SR_ZONE` + **bloqueios anti-loss** medidos no
-histórico real (2026-08-04). Cadência de análise contínua (a cada vela
-M1/M5/M15) permanece ativa. A ordem enviada à corretora segue a **mesma
-direção** aprovada pela análise (sem inversão).
+backup-classic`) + bloqueio `SR_ZONE` + **anti-loss de 04/08 e substitution
+de 13/08**. Os cortes de **15/08** (WEAK PUT, vela 45%, DOJI hard, PUT/CALL
+chase, REPEAT_ENTRY) foram **desligados**: no sábado o WR caiu para 32–45%
+contra ~50–51% da substitution. Flags em `signal_engine.py` = `False`.
+
+Cadência de análise contínua permanece. A ordem segue a **mesma direção**
+aprovada pela análise.
 
 | Aspecto | Valor atual |
 |---|---|
 | Modelo de confiança | `backup-classic` (score bruto); **portão usa `strategy_score`**, não confiança bruta |
 | Velas analisadas por ativo | **100** (`ROBOT_CANDLE_COUNT`) do timeframe da operação |
 | Perfis | aggressive 70 / balanced 80 / conservative 90 |
-| Setups de price action | `CONTINUATION`, `REVERSAL`, `SUPPORT_RESISTANCE` |
+| Setups de price action | `CONTINUATION`, `REVERSAL`, `SUPPORT_RESISTANCE` (WEAK como fallback, **CALL e PUT**) |
 | Zona de suporte/resistência | **Bloqueio crítico `SR_ZONE`** |
 | Anti-loss (2026-08-04) | `LAST_3_ALIGNMENT`, `WEAK_CONTINUATION_PUT`, `CONTINUATION_DEAD_RSI`, `TREND_CLEAR`, cooldown pós-LOSS |
+| Substitution (2026-08-13) | Ranking `(quality_tier, strategy_score, payout, conf≤92)` — WEAK perde o slot; AUDUSD demovido |
+| Cortes 15/08 | **Off** (`WEAK_PUT`, `CANDLE_WEAK`, `DOJI`, `PUT_*`, `CALL_CHASE`, `REPEAT_ENTRY` = False) |
 | Estratégias nomeadas no pipeline | Desativadas |
-| Direção executada | **Igual ao sinal aprovado**: análise CALL executa CALL; análise PUT executa PUT |
+| Direção executada | **Igual ao sinal aprovado** |
 
 ### Edge medido por timeframe (backtest walk-forward, 2026-07-29)
 
@@ -60,7 +65,7 @@ Arquivos: `backend/signal_engine.py` (análise técnica) e `backend/main.py`
    `main.py`) tornam o sinal reprovado (`trade_allowed = False`):
    `CANDLE_STRENGTH`, `DOJI_FILTER`, `PRICE_ACTION_SETUP`, `REVERSAL_AGAINST`,
    `LEVEL_CONFLICT`, `LEVEL_REJECTION`, `SR_ZONE`, `TREND_CLEAR` (só sideways),
-   `LAST_3_ALIGNMENT`, `WEAK_CONTINUATION_PUT`,
+   `LAST_3_ALIGNMENT`, `WEAK_CONTINUATION_PUT`, `WEAK_PUT`,
    além dos operacionais (`ACTIVE_CLOSED`, `ASSET_COOLDOWN`,
    `GLOBAL_LOSS_COOLDOWN`, `CANDLES_UNAVAILABLE`, stops etc.). Soft
    (só penalizam score): `TREND_STRENGTH`, `SIDEWAYS_FILTER`, `WICK_REJECTION`,
@@ -75,12 +80,29 @@ repetidos com WR muito abaixo do empate (~53%). Esses contextos **não operam**:
 | Bloqueio | Regra | Evidência |
 |---|---|---|
 | `LAST_3_ALIGNMENT` | CONTINUATION só se `last_3_direction` = UP (CALL) / DOWN (PUT) | WR **8,3%** quando contra as 3 velas |
-| `WEAK_CONTINUATION_PUT` | CONTINUATION+PUT vetado em EURUSD, AUDUSD, USDCAD, USDCHF (OTC/aberto) | WR agregado 30–41% nesses pares |
+| `WEAK_CONTINUATION_PUT` | CONTINUATION+PUT vetado em EURUSD, AUDUSD, USDCAD, USDCHF, **EURGBP**, **AUDJPY** (OTC/aberto) | WR 30–41% (2026-08-04) + EURGBP PUT ~29% / AUDJPY PUT ~35% (2026-08-13) |
 | `CONTINUATION_DEAD_RSI` | Soft (penalidade 18); portão `strategy_score` ainda barre a maioria | WR **28,6%** — hard zerava frequência |
 | `TREND_CLEAR` | **Crítico só se `trend==SIDEWAYS`**; força fraca → soft `TREND_STRENGTH` | WR **30,4%** no sideways |
 | Portão por `strategy_score` | `candidate_meets_cycle_threshold` exige score **após** penalidades ≥ `min_confidence`; confiança bruta não abre ordem | conf ≥95 tinha WR **37,8%** |
-| Ranking | `candidate_rank` = `(strategy_score, payout, confidence)` — confiança só desempata | evita preferir score bruto alto |
-| `FREQUENCY_RECOVERY` | Após **8** ciclos `NO_OPPORTUNITY`, suaviza: `TREND_CLEAR`, `PRICE_ACTION_SETUP`, `CANDLE_STRENGTH`, `DOJI_FILTER`, `LEVEL_REJECTION`; score mínimo 70. **Não** afrouxa `LAST_3`, `WEAK_CONTINUATION_PUT`, `SR_ZONE`, `LEVEL_CONFLICT` | Prod: 88 ciclos com `allowed=0` |
+| Ranking | `candidate_rank` = `(quality_tier, strategy_score, payout, conf≤92)` — **WEAK (tier 0) perde** para CONTINUATION/REVERSAL/S-R; AUDUSD demovido; confiança só desempate limitado | substitution no mesmo ciclo |
+| `FREQUENCY_RECOVERY` | Após **2** ciclos `NO_OPPORTUNITY`, suaviza hard de: `TREND_CLEAR`, `PRICE_ACTION_SETUP`, `LEVEL_REJECTION`; score mínimo 70. **Não** afrouxa `LAST_3`, `WEAK_CONTINUATION_PUT`, `SR_ZONE`, `LEVEL_CONFLICT` | volume via WEAK |
+
+### Substitution (2026-08-13) — mais acerto sem cortar volume
+
+Objetivo: **não cancelar o ciclo**; trocar o candidato ruim pelo próximo bom no
+mesmo scan.
+
+1. O recovery ainda pode liberar `trade_allowed` em setup WEAK (evita robô parado).
+2. O ranking coloca WEAK no tier 0; qualquer CONTINUATION/REVERSAL/S-R elegível
+   ganha o slot mesmo com `strategy_score` menor.
+3. Se **só** existir WEAK aprovado, ele opera (fallback de frequência), **CALL ou PUT**.
+   Cortes `WEAK_PUT` / vela 45% / chase **estão desligados** (2026-08-16).
+4. CONTINUATION+PUT nos pares tóxicos (agora com EURGBP/AUDJPY) continua
+   **hard block** — não depende de ranking.
+
+Funções: `candidate_quality_tier`, `candidate_rank`, `choose_better_candidate`
+em `backend/main.py`; constantes em `signal_engine.py`.
+Testes: `tests/test_accuracy_ranking_substitution.py`.
 
 | Filtro | Papel |
 |---|---|
@@ -89,12 +111,16 @@ repetidos com WR muito abaixo do empate (~53%). Esses contextos **não operam**:
 | `SIDEWAYS_FILTER` | Soft (penaliza score); redundante com `TREND_CLEAR` |
 | `WICK_REJECTION` / `CONTINUATION_DEAD_RSI` | Soft (penalizam score) |
 | `LAST_3_ALIGNMENT` / `WEAK_CONTINUATION_PUT` | **Críticos** anti-loss |
-| `SR_ZONE` / `LEVEL_*` / corpo fraco (`CANDLE_STRENGTH`) | **Críticos** de estrutura |
+| `SR_ZONE` / `LEVEL_*` | **Críticos** de estrutura |
+| `CANDLE_STRENGTH` / `DOJI_FILTER` | **Soft** (perfil); cortes 45%/DOJI hard = **off** |
 
 Flags em `signal_engine.py`: `LAST_3_ALIGNMENT_HARD_BLOCK`,
 `CONTINUATION_DEAD_RSI_HARD_BLOCK`, `WEAK_CONTINUATION_PUT_HARD_BLOCK`,
-`TREND_CLEAR_HARD_BLOCK` (todas `True`). Lista: `WEAK_CONTINUATION_PUT_ASSETS`.
-Perfil `conservative`: strength mínima **15** (era 20).
+`TREND_CLEAR_HARD_BLOCK` (todas `True`). Cortes 15/08 (`WEAK_PUT_HARD_BLOCK`,
+`CANDLE_WEAK_HARD_BLOCK`, `DOJI_HARD_BLOCK`, `PUT_*`, `CALL_CHASE`,
+`REPEAT_ENTRY`) = **False**.
+Lista: `WEAK_CONTINUATION_PUT_ASSETS`. Helper: `is_weak_put_setup` (código
+mantido, flag off).
 
 **Nota sobre confiança:** em opções binárias OTC o score técnico alto **não**
 prova edge. A decisão usa filtros estruturais + `strategy_score`.
@@ -226,6 +252,9 @@ reativar o gate MTF, a lógica completa está em
 
 ## 5. Testes
 
+- `tests/test_accuracy_ranking_substitution.py` — ranking anti-loss,
+  substitution WEAK→CONTINUATION, EURGBP/AUDJPY no hard PUT, penalidade de
+  `PRICE_ACTION_SETUP` no recovery, hard block `WEAK_PUT` (WEAK CALL ok).
 - `tests/test_loss_pattern_blocks.py` — bloqueios anti-loss (last_3, PUT fraco,
   RSI morto, TREND_CLEAR crítico, portão por strategy_score, cooldown pós-LOSS).
 - `tests/test_pattern_memory.py` — memória de padrões (chave, veto, gale,
@@ -243,6 +272,24 @@ reativar o gate MTF, a lógica completa está em
 
 ## 6. Histórico de mudanças
 
+- **2026-08-15 (vela fraca + DOJI — interno, sem deploy)** — Além de WEAK
+  PUT: hard block corpo &lt; 45% e DOJI ≤ 10%. Recovery não afrouxa.
+  Hipótese nas 677 ops: 370 restantes, 220x150, **59,5%**. Volume: WEAK CALL
+  com vela forte + substitution + não cortar horário. Ver
+  [`CORTES_QUALIDADE.md`](./CORTES_QUALIDADE.md).
+- **2026-08-14 (WEAK PUT cortado — código interno, sem deploy)** — Auditoria
+  das 677 ops pós-substitution: WEAK PUT 265 ops, 113x152, **42,6%**; WEAK
+  CALL 194 ops, 111x83, **57,2%**. Sem WEAK PUT o placar hipotético seria
+  235x177 (**57,0%**). Hard block `WEAK_PUT` em todos os ativos; recovery e
+  portão do ciclo não afrouxam. WEAK CALL permanece. Detalhe:
+  [`WEAK_PUT_BLOCK.md`](./WEAK_PUT_BLOCK.md). Testes:
+  `WeakPutHardBlockTests` em `test_accuracy_ranking_substitution.py`.
+- **2026-08-13 (acertividade / substitution)** — Auditoria das últimas 100
+  LOSS: 64% WEAK liberado no recovery, conf ≥95 sem edge, CONTINUATION+PUT
+  fraco em EURGBP/AUDJPY. Ranking com `quality_tier` (WEAK perde o slot),
+  `PRICE_ACTION_SETUP` mantém penalidade de score no recovery, lista tóxica
+  PUT + EURGBP/AUDJPY, demote AUDUSD. Volume preservado (WEAK só fallback).
+  Testes: `test_accuracy_ranking_substitution.py`.
 - **2026-08-07 (execução alinhada à análise)** — Remove a política de
   inversão CALL↔PUT na montagem da ordem. `resolve_robot_execution_direction`
   envia à BullEx a mesma direção aprovada pelo pipeline; gale continua
@@ -340,13 +387,15 @@ Funções: `normalize_market_mode`, `is_forex_open_market_open`,
 | Escolha do usuário | Sessão forex | Modo efetivo (varredura/ordens) |
 |---|---|---|
 | OTC | qualquer | OTC (`*-OTC`) |
-| Ambos (BOTH) | qualquer | **sempre OTC** |
-| Aberto (OPEN) | aberta (dom 22:00 UTC → sex 22:00 UTC) | OPEN (pares sem `-OTC`) |
-| Aberto (OPEN) | fechada | **OTC** (fallback; UI mostra cadeado + horas até abrir) |
+| Ambos (BOTH) | **aberta** | **BOTH** (10 OTC + 10 abertos; OTC primeiro) |
+| Ambos (BOTH) | fechada | OTC |
+| Aberto (OPEN) | aberta | OPEN (pares sem `-OTC`) |
+| Aberto (OPEN) | aberta, canal turbo/binary fechado em todos | **OTC** (fallback; log `OPEN_MARKET_NO_CHANNEL_FALLBACK_OTC`) |
+| Aberto (OPEN) | fechada | **OTC** (UI cadeado + horas até abrir) |
 
-Motivo do BOTH→OTC: varrer OTC+aberto (~20 ativos) em fila sequencial
-estourava timeouts de payout (~4s), usava cache stale e perdia a janela
-de compra 0–5s (`ENTRY_WINDOW_MISSED` / `asset not available`).
+Motivo histórico do BOTH→só-OTC: varrer ~20 ativos estourava timeout de
+payout. Com cache compartilhado de mercado isso foi revertido em 2026-08-15
+para o Aberto **de fato operar**. Ver [`MERCADO_ABERTO.md`](./MERCADO_ABERTO.md).
 
 UI (`RobotControlPanel`, `StartOperationDialog`): as três opções ficam
 sempre visíveis. Com forex fechado, **Mercado aberto** aparece com ícone

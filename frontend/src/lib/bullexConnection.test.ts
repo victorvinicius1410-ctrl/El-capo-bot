@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  clearManualBullexDisconnect,
+  isManualBullexDisconnectActive,
   markManualBullexDisconnect,
   resetManualBullexDisconnectForTests,
 } from "./manualBullexDisconnect.ts";
@@ -42,6 +44,7 @@ describe("isBullExConnected com pending", () => {
   });
 
   it("status CONNECTED prevalece sobre account connected:false stale", () => {
+    resetManualBullexDisconnectForTests();
     assert.equal(
       isBullExConnected({
         account: { connected: false } as never,
@@ -51,7 +54,22 @@ describe("isBullExConnected com pending", () => {
     );
   });
 
+  it("desconexão manual vence status CONNECTED e cachedGrace (bug 12/08)", () => {
+    resetManualBullexDisconnectForTests();
+    markManualBullexDisconnect();
+    assert.equal(
+      isBullExConnected({
+        account: { connected: true, email: "a@b.com", balance: 10 } as never,
+        accountStatus: { status: "CONNECTED" },
+        cachedGrace: true,
+      }),
+      false,
+    );
+    resetManualBullexDisconnectForTests();
+  });
+
   it("backoff sozinho nao confirma desconexao no banner", () => {
+    resetManualBullexDisconnectForTests();
     assert.equal(isBullExDisconnected({ accountStatus: { status: "BACKOFF" } }), false);
     assert.equal(
       isBullExConnected({
@@ -109,6 +127,29 @@ describe("preferStableBullExAccount", () => {
     };
     assert.deepEqual(preferStableBullExAccount(good, next), next);
     resetManualBullexDisconnectForTests();
+  });
+
+  it("desconexão manual não expira sozinha (bug 09/08: voltava a Conectado)", () => {
+    // A marca durava 60s. Depois disso o poll seguinte era mascarado de volta
+    // para "Conectado" e só recarregar a página resolvia — por isso o cliente
+    // clicava em Desconectar várias vezes.
+    resetManualBullexDisconnectForTests();
+    markManualBullexDisconnect();
+    const next = {
+      ...good,
+      connected: false,
+      balance: null,
+      email: null,
+      mode: null,
+      status: "disconnected" as const,
+    };
+    assert.equal(isManualBullexDisconnectActive(), true);
+    assert.deepEqual(preferStableBullExAccount(good, next), next);
+
+    // Só reconectar por vontade própria encerra a marca.
+    clearManualBullexDisconnect();
+    assert.equal(isManualBullexDisconnectActive(), false);
+    assert.deepEqual(preferStableBullExAccount(good, next), good);
   });
 });
 

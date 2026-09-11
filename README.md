@@ -40,3 +40,9 @@ curl -sS https://api.elcapobot.online/health
 ```
 
 DNS: veja `docs/DNS.md` (IP `2.25.187.128`).
+
+## Staging (teste)
+
+Sistema secundário em `/opt/elcapo2` → `app.elcapo2.shop` / `api.elcapo2.shop`.
+Docs: [`docs/STAGING_ELCAPO2.md`](docs/STAGING_ELCAPO2.md) e
+[`docs/DNS_ELCAPO2.md`](docs/DNS_ELCAPO2.md).

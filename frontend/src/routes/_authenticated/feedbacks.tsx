@@ -18,6 +18,7 @@ import {
   type FeedbackItem,
   type FeedbackStatus,
 } from "@/lib/api";
+import { formatBrasiliaDate } from "@/lib/brasiliaTime";
 import { useAuth } from "@/lib/useAuth";
 
 export const Route = createFileRoute("/_authenticated/feedbacks")({
@@ -447,9 +448,9 @@ function resolveVideoEmbed(rawUrl: string): VideoEmbed | null {
 function formatFeedbackDate(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("pt-BR", {
+  return formatBrasiliaDate(date, {
     day: "2-digit",
     month: "short",
     year: "numeric",
-  }).format(date);
+  });
 }

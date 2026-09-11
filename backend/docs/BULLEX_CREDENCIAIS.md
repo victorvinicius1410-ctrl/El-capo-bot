@@ -4,7 +4,7 @@ Documento da persistência criptografada de email/senha da corretora Bullex,
 para o cliente não precisar reconectar a cada queda de sessão e para o robô
 operar com a tela fechada.
 
-Atualizado em **2026-08-07**.
+Atualizado em **2026-08-12**.
 
 ## Objetivo
 
@@ -70,10 +70,10 @@ Quando a sessão cai (SSID inválido / restart do bullex-service):
 | Método | Rota | Comportamento |
 |---|---|---|
 | POST | `/bullex/connect` | Conecta e **salva** credenciais criptografadas |
-| POST | `/bullex/disconnect` | Derruba sessão; **mantém** credenciais salvas |
-| POST | `/bullex/reconnect` | Tenta SSID; se não conectar, usa credenciais salvas |
-| GET | `/bullex/status` | Se desconectado + login salvo → auto-reconnect |
-| GET | `/bullex/account` | Se desconectado + login salvo → auto-reconnect |
+| POST | `/bullex/disconnect` | Derruba sessão; **apaga** credenciais criptografadas; marca desconexão manual (Redis); sobrescreve snapshot do robô no Redis como desconectado |
+| POST | `/bullex/reconnect` | Tenta SSID; se não conectar, usa credenciais salvas. **Recusado** se houver desconexão manual (`[BULLEX_RECONNECT_BLOCKED]`) — só `POST /bullex/connect` libera |
+| GET | `/bullex/status` | Se desconexão manual → sempre `connected:false`. Senão, se desconectado + login salvo + **robô ligado** → auto-reconnect |
+| GET | `/bullex/account` | Idem status (early-return em desconexão manual) |
 | GET | `/bullex/credentials` | `{ credentials_saved, email }` — sem senha |
 | DELETE | `/bullex/credentials` | Esquece credenciais (ação explícita do cliente) |
 
@@ -269,9 +269,43 @@ Clique em **Desconectar Bullex** → spinner → pill continua **Conectado**
 |--------|---------|
 | Gateway | `apply_manual_disconnect_session_state` — zera grace/cache sem preservar REAL |
 | FE painel | UI otimista no disconnect + toast; hint de sessão incompleta |
-| FE | `markManualBullexDisconnect()` — 60s sem auto-reconnect / preferStable |
+| FE | `markManualBullexDisconnect()` — marca sem TTL (só limpa no connect) |
 | FE | `syncing` só com `connected && metricsMissing` (BACKOFF sozinho não trava login) |
 | Testes | `test_manual_disconnect_cache.py`, testes FE de suppress manual |
+
+## Incidente: Desconectar volta a “Conectado” (2026-08-12)
+
+### Sintoma
+
+Clientes clicam **Desconectar Bullex** dezenas de vezes. Backend responde
+`[BULLEX_DISCONNECT] upstream_ok=True credentials_kept=False`, mas o pill
+volta para **Conectado** em segundos. Logs mostram a marca Redis ativa
+(`[BACKOFF_CACHE_SKIPPED] reason=manual_disconnect`), mas a UI mente.
+
+### Causa raiz
+
+Em `ROBOT_RUNTIME_MODE=external`, `GET /robot/state` e o WS preferem o
+snapshot Redis (`robot:snapshot:{user_id}`, TTL **600s**). No disconnect o
+runtime cancela o worker e para de republicar — o snapshot antigo fica com
+`connected=true`. O refetch/WS após o clique traz esse stale e o painel
+“desfaz” a desconexão. Também: `isBullExConnected` não respeitava a marca
+manual; status/account podiam cair em `memory_*_fallback`.
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| Gateway `bullex_disconnect` | `publish_manual_disconnect_robot_snapshot` sobrescreve o Redis |
+| Gateway `/robot/state` + snapshot WS | Se `is_manual_disconnect`, ignora snapshot Redis stale |
+| Gateway status/account | Early-return `connected:false` (`source=manual_disconnect`) |
+| `memory_account_fallback` | Retorna `None` sob desconexão manual |
+| `robot-runtime` | Após cmd `disconnect`, publica snapshot desconectado |
+| FE | Marca manual vence grace/`CONNECTED`; marca **antes** do POST |
+| FE `useLiveTradingData` | WS/poll não aplicam `connected=true` com marca ativa |
+| Testes | `test_manual_disconnect_cache.py` (+3), `bullexConnection.test.ts` |
+
+Para voltar a conectar: o cliente informa email/senha de novo (credenciais
+são apagadas no disconnect).
 
 ## Incidente: sessão cai sozinha e `/robot/start` devolve 409 (2026-08-08)
 
@@ -328,66 +362,10 @@ Correção definitiva = uma sessão Bullex por processo (worker por usuário ou
 pool com afinidade por `user_id`), ou mover o estado do `ws/client.py` para um
 objeto por sessão. Os fixes acima reduzem a frequência, **não** eliminam.
 
-## Incidente: 100% dos logins com `Websocket connection timeout` (2026-08-08)
-
-### Sintoma
-
-Nenhuma sessão da corretora subia — `LOGIN_SUCCESS` e `SESSION-ALIVE` zerados,
-`[BULLEX_SSID_RECONNECT_FAILED]` ~273/15min, `[ROBOT_WORKER_BLOCKED_DISCONNECTED]`
-~1180/15min e `/sessions/reconnect` → 404 em série. No painel: “Conta Bullex
-desconectada ou sessão expirada”. Última sessão boa: 2026-08-07T23:48Z.
-
-### Causa raiz
-
-Regressão do isolamento por sessão (Fase 3, `SessionGlobals` + `ContextVar`):
-
-1. `SessionManager._activate_session` prende o `SessionGlobals` da sessão no
-   ContextVar **e** no `session.client.api` daquele momento.
-2. `stable_api.connect()` e `restore_with_ssid()` fazem `self.api = BullexAPI(...)`
-   logo depois — e o `__init__` criava `self._session_globals = SessionGlobals()`
-   **zerado**.
-3. A thread do websocket chamava `bind_api_session_globals(api_novo)` e gravava
-   `check_websocket_if_connect = 1` nesse objeto novo.
-4. `start_websocket` esperava no objeto **antigo** (ContextVar da thread
-   chamadora) → nunca via o `1` → `Websocket connection timeout` aos 15s, mesmo
-   com o log `INFO:websocket:Websocket connected`.
-
-O proxy e a rede estavam saudáveis (handshake WS pelo proxy em ~0,7s).
-
-### Correção
-
-`bullexapi/api.py` (`BullexAPI.__init__`): herda o `SessionGlobals` ativo no
-ContextVar quando há sessão; fora de `_session_context` usa objeto próprio
-(`get_session_globals()` devolveria o fallback do processo, o que faria duas
-sessões compartilharem estado).
-
-```python
-_active = global_value.current_session_globals.get()
-self._session_globals = _active if _active is not None else global_value.SessionGlobals()
-```
-
-Efeito medido no minuto seguinte ao deploy: `Websocket connection timeout` de
-100% → **0**; `LOGIN_SUCCESS`, `[SESSION_RESTORE] status=success`,
-`[REAL_MODE_CONFIRMED] active_mode=REAL` voltaram.
-
-### Regressão logo depois: `invalid_credentials` com a senha certa
-
-Herdar o `SessionGlobals` fez o `BullexAPI` novo enxergar o **SSID antigo** da
-sessão. `BullexAPI.connect()` tem um atalho “temp ssid reconnect for speed up”
-que só dispara com `global_value.SSID != None` — antes, um api novo sempre
-tinha SSID vazio e ia direto para o login limpo. Com o SSID morto herdado, o
-atalho falhava e o erro voltava ao painel como **“Email ou senha Bullex
-inválidos”**.
-
-Correção: `stable_api.connect()` zera `global_value.SSID` antes de
-`self.api.connect()` — login por senha é sempre limpo; quem quer reusar SSID
-usa `restore_with_ssid()`. Medido após o deploy: `invalid_credentials` 15 → **0**.
-
 ## Histórico
 
-- **2026-08-08** — `BullexAPI.__init__` criava `SessionGlobals` zerado depois do
-  `_activate_session`, quebrando 100% dos logins com timeout de websocket; ver
-  seção incidente acima.
+- **2026-08-12** — Snapshot Redis stale após Desconectar fazia o painel voltar
+  a "Conectado"; ver seção incidente acima.
 - **2026-08-08** — Keepalive do WS da corretora, SSID salvo sobrevivendo a
   queda transitória e fim da sessão “meio pronta”; ver seção incidente acima.
 - **2026-08-07 (noite — disconnect stuck)** — Desconectar não “pegava” por

@@ -21,9 +21,89 @@ import json
 import logging
 import os
 import signal
+import uuid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("robot-runtime")
+
+
+def _is_valid_account_user_id(user_id: str) -> bool:
+    """Confere se `user_id` é um UUID (formato do Supabase Auth).
+
+    Defesa contra o incidente 2026-08-18 ~22h18: 35 usuários de teste
+    (`user-demo`, etc.) ficaram com `enabled=true` na tabela `robot_states`
+    de produção e o runtime religou workers reais para eles, dobrando a
+    carga sobre o `_call_gate` do bullex-service e zerando o cache
+    compartilhado de mercado para TODOS os usuários por 40+ minutos. Todo
+    usuário real chega aqui com `user_id` = UUID da sessão autenticada
+    (Supabase Auth); nenhum fluxo legítimo de `/robot/start` usa outro
+    formato. Ver docs/ROBO_E_SUPORTE.md e docs/PERFORMANCE_SISTEMA.md.
+    """
+    try:
+        uuid.UUID(str(user_id))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _capture_live_session_score(auto_trader: object, user_id: str) -> dict[str, object]:
+    """Lê wins/losses/profit da memória viva antes de um restore forçado.
+
+    Args:
+        auto_trader: Instância do AutoTrader do runtime.
+        user_id: Cliente alvo.
+
+    Returns:
+        Placar e ``stop_reset_at`` atuais em memória.
+    """
+    state = auto_trader.get(user_id)  # type: ignore[attr-defined]
+    return {
+        "wins": int(getattr(state, "wins", 0) or 0),
+        "losses": int(getattr(state, "losses", 0) or 0),
+        "profit": float(getattr(state, "profit", 0) or 0),
+        "stop_reset_at": getattr(state, "stop_reset_at", None),
+        "stop_offset_wins": int(getattr(state, "stop_offset_wins", 0) or 0),
+        "stop_offset_losses": int(getattr(state, "stop_offset_losses", 0) or 0),
+        "stop_offset_profit": float(getattr(state, "stop_offset_profit", 0) or 0),
+    }
+
+
+def _prefer_live_session_score(
+    auto_trader: object,
+    user_id: str,
+    live: dict[str, object],
+) -> None:
+    """Mantém o placar vivo quando a persistência está atrasada ou após reset.
+
+    Args:
+        auto_trader: Instância do AutoTrader do runtime.
+        user_id: Cliente alvo.
+        live: Placar capturado antes do ``restore``.
+    """
+    state = auto_trader.get(user_id)  # type: ignore[attr-defined]
+    live_wins = int(live.get("wins") or 0)
+    live_losses = int(live.get("losses") or 0)
+    live_profit = float(live.get("profit") or 0)
+    live_reset = live.get("stop_reset_at")
+    live_blank = live_wins == 0 and live_losses == 0 and abs(live_profit) < 1e-9
+    if live_reset is not None and live_blank:
+        state.wins = 0
+        state.losses = 0
+        state.profit = 0.0
+        state.stop_offset_wins = 0
+        state.stop_offset_losses = 0
+        state.stop_offset_profit = 0.0
+        state.stop_reset_at = live_reset
+        return
+    restored_total = int(getattr(state, "wins", 0) or 0) + int(getattr(state, "losses", 0) or 0)
+    if live_wins + live_losses > restored_total:
+        state.wins = live_wins
+        state.losses = live_losses
+        state.profit = live_profit
+        # O placar vivo vem com a parte do Shift+O que ele carrega.
+        state.stop_offset_wins = int(live.get("stop_offset_wins") or 0)
+        state.stop_offset_losses = int(live.get("stop_offset_losses") or 0)
+        state.stop_offset_profit = float(live.get("stop_offset_profit") or 0)
 
 
 def _hydrate_user_from_persistence(
@@ -38,9 +118,9 @@ def _hydrate_user_from_persistence(
     Args:
         gateway: Módulo/objeto com ``robot_persistence`` e ``auto_trader``.
         user_id: Cliente alvo.
-        force: Ignora o estado em memória e recarrega mesmo assim. Use no
-            ``start``/``stop``, onde a decisão do cliente veio pelo gateway e
-            ainda não existe no runtime.
+        force: Recarrega mesmo com estado em memória. Use no ``start``
+            (enabled veio do gateway). No ``stop`` deixe False para não
+            sobrescrever o placar vivo com a DB atrasada.
     """
     persistence = getattr(gateway, "robot_persistence", None)
     auto_trader = getattr(gateway, "auto_trader", None)
@@ -56,10 +136,16 @@ def _hydrate_user_from_persistence(
     # grava `enabled=True` na persistência. Sem hidratar aqui o runtime ficaria
     # com o `enabled=False` antigo e `ensure_robot_worker` recusaria subir o
     # worker — painel dizendo "ativo" e nada operando.
-    if not force:
-        has_state = getattr(auto_trader, "has_state", None)
-        if callable(has_state) and has_state(user_id):
+    #
+    # `stop` NÃO usa force: a memória viva do runtime pode estar à frente da
+    # DB (último WIN ainda em persistência async). Re-hidratar no stop
+    # recalculava o placar pelo histórico atrasado (ex.: 10x12 → 9x12).
+    live_score = None
+    has_state = getattr(auto_trader, "has_state", None)
+    if callable(has_state) and has_state(user_id):
+        if not force:
             return
+        live_score = _capture_live_session_score(auto_trader, user_id)
     try:
         for uid, state_payload in persistence.load_states():
             if str(uid) != user_id:
@@ -77,6 +163,22 @@ def _hydrate_user_from_persistence(
                     trades = []
             source = getattr(gateway, "robot_persistence_source", lambda: "runtime")()
             auto_trader.restore(user_id, state_payload, trades, source=source)
+            if live_score is not None:
+                _prefer_live_session_score(auto_trader, user_id, live_score)
+            # `restore` recalcula o placar pelo histórico e
+            # `_prefer_live_session_score` mantém o MAIOR total: os dois
+            # desfaziam uma exclusão recente. A baixa intencional vigente
+            # tem a última palavra.
+            enforce = getattr(gateway, "apply_session_score_authority_to_state", None)
+            if callable(enforce):
+                try:
+                    enforce(user_id)
+                except Exception:
+                    logger.warning(
+                        "[ROBOT_RUNTIME_SCORE_AUTHORITY_FAILED] user_id=%s",
+                        user_id,
+                        exc_info=True,
+                    )
             return
     except Exception:
         logger.warning(
@@ -92,6 +194,16 @@ async def _handle_command(gateway: object, payload: dict) -> None:
     action = str(payload.get("action") or "").strip().lower()
     if not user_id or not action:
         return
+    if action in {"start", "ensure"} and not _is_valid_account_user_id(user_id):
+        # Guarda contra fixtures/dados de teste com `enabled=true` em produção
+        # (incidente 2026-08-18 ~22h18 — ver docs/ROBO_E_SUPORTE.md). Nunca
+        # cria worker real para um user_id que não é UUID de sessão autenticada.
+        logger.warning(
+            "[ROBOT_WORKER_REJECTED_INVALID_USER_ID] user_id=%s action=%s",
+            user_id,
+            action,
+        )
+        return
     if action in {"start", "ensure"}:
         # `start` = decisão explícita do cliente, chegou pelo gateway: precisa
         # recarregar. `ensure` = polling do painel a cada ~5s: NÃO pode
@@ -103,17 +215,196 @@ async def _handle_command(gateway: object, payload: dict) -> None:
             mark(user_id)
         gateway.ensure_robot_worker(user_id)  # type: ignore[attr-defined]
         logger.info("[ROBOT_RUNTIME_CMD] action=%s user_id=%s", action, user_id)
+    elif action in {"disconnect", "reconnected"}:
+        # Só o gateway atende /bullex/disconnect, mas quem publica o snapshot
+        # do painel é este processo. Sem propagar, o runtime seguia mandando
+        # `connected: true` e o painel voltava para "Conectado" sozinho.
+        manual = getattr(gateway, "bullex_manual_disconnect", None)
+        if action == "disconnect":
+            if manual is not None:
+                manual.add(user_id)
+            gateway.auto_trader.disconnect_account(user_id)  # type: ignore[attr-defined]
+            task = getattr(gateway, "robot_tasks", {}).pop(user_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            # Publica snapshot desconectado AGORA. O loop `_snapshot_publisher`
+            # só cobre users em `robot_tasks` — sem isso o Redis fica com o
+            # snapshot antigo (connected=true, TTL 600s) e o gateway external
+            # serve "Conectado" no painel.
+            publish = getattr(gateway, "publish_manual_disconnect_robot_snapshot", None)
+            if callable(publish):
+                try:
+                    publish(user_id)
+                except Exception:
+                    logger.warning(
+                        "[ROBOT_RUNTIME_DISCONNECT_SNAPSHOT_FAILED] user_id=%s",
+                        user_id,
+                        exc_info=True,
+                    )
+        elif manual is not None:
+            manual.discard(user_id)
+        logger.info("[ROBOT_RUNTIME_CMD] action=%s user_id=%s", action, user_id)
     elif action == "stop":
-        # Também é decisão explícita do cliente vinda do gateway.
-        _hydrate_user_from_persistence(gateway, user_id, force=True)
-        state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
-        state.enabled = False
+        # Não force-hydrate: o placar vivo do worker é a fonte de verdade.
+        # `stop()` só desliga; wins/losses permanecem.
+        _hydrate_user_from_persistence(gateway, user_id, force=False)
+        stop_fn = getattr(gateway.auto_trader, "stop", None)  # type: ignore[attr-defined]
+        if callable(stop_fn):
+            stop_fn(user_id)
+        else:
+            state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
+            state.enabled = False
+        # Remove do dict ANTES do snapshot: o loop `_snapshot_publisher` senão
+        # republica worker_running=true por cima do stop do gateway.
         task = getattr(gateway, "robot_tasks", {}).pop(user_id, None)
+        publish = getattr(gateway, "publish_robot_control_snapshot", None)
+        if callable(publish):
+            try:
+                publish(user_id, worker_running=False)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_STOP_SNAPSHOT_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
         if task is not None and not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            # Não prender o listener no cancel (Bullex pode levar vários segundos).
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(task, timeout=2.0)
         logger.info("[ROBOT_RUNTIME_CMD] action=stop user_id=%s", user_id)
+    elif action == "reset_score":
+        # Gateway já zerou + persistiu; aqui só alinha a memória do runtime
+        # para o `_snapshot_publisher` não republicar wins/losses antigos.
+        # Não hidratar da persistência: a memória viva pode ter placar à
+        # frente da DB; `reset_score` zera o que está na sessão agora.
+        reset_fn = getattr(gateway.auto_trader, "reset_score", None)  # type: ignore[attr-defined]
+        if callable(reset_fn):
+            reset_fn(user_id)
+        # Marca de baixa intencional anterior (exclusão marketing) não pode
+        # sobreviver ao Reiniciar placar.
+        clear_authority = getattr(gateway, "clear_session_score_authority", None)
+        if callable(clear_authority):
+            clear_authority(user_id)
+        publish = getattr(gateway, "publish_robot_control_snapshot", None)
+        if callable(publish):
+            try:
+                publish(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_RESET_SCORE_SNAPSHOT_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        logger.info("[ROBOT_RUNTIME_CMD] action=reset_score user_id=%s", user_id)
+    elif action == "live_mode":
+        # O gateway atende POST /robot/live-mode, mas a memória que o motor lê
+        # (`analyze_signal(live_demo=...)`) é a deste processo. Sem aplicar aqui
+        # o modo nunca ligava com o robô rodando, e o persist do runtime
+        # sobrescrevia o True do gateway.
+        state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
+        state.live_demo = bool(payload.get("enabled"))
+        persist = getattr(gateway, "persist_robot", None)
+        if callable(persist):
+            try:
+                persist(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_LIVE_MODE_PERSIST_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        publish = getattr(gateway, "publish_robot_control_snapshot", None)
+        if callable(publish):
+            try:
+                publish(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_LIVE_MODE_SNAPSHOT_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        logger.warning(
+            "[ROBOT_RUNTIME_CMD] action=live_mode user_id=%s enabled=%s",
+            user_id,
+            state.live_demo,
+        )
+    elif action == "apply_score":
+        # Shift+O atualiza o placar no gateway; o publisher do runtime
+        # republicaria 0-0 a cada 1s se a memória daqui não acompanhar.
+        from backend.auto_trader import set_display_score
+
+        state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
+        try:
+            # Placar do Shift+O é vitrine: a diferença vai para
+            # `stop_offset_*` e o stop segue contando só ordem real. Sem isso
+            # um "gerar placar" 8x2 disparava STOP_WIN_HIT (10/09 19:53).
+            set_display_score(
+                state,
+                int(payload.get("wins") or 0),
+                int(payload.get("losses") or 0),
+                float(payload.get("profit") or 0),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "[ROBOT_RUNTIME_APPLY_SCORE_INVALID] user_id=%s payload=%s",
+                user_id,
+                payload,
+            )
+            return
+        # Marca a baixa também aqui: o `_snapshot_publisher` roda 1x/s e
+        # republicaria o placar antigo se um restore/reconcile promovesse a
+        # persistência atrasada antes do próximo comando.
+        mark_authority = getattr(gateway, "mark_session_score_authority", None)
+        if callable(mark_authority):
+            try:
+                mark_authority(user_id, state.wins, state.losses, state.profit)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_APPLY_SCORE_AUTHORITY_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        persist = getattr(gateway, "persist_robot", None)
+        if callable(persist):
+            try:
+                persist(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_APPLY_SCORE_PERSIST_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        publish = getattr(gateway, "publish_robot_control_snapshot", None)
+        if callable(publish):
+            try:
+                # Não reconciliar com Redis antigo: senão a baixa de exclusão
+                # marketing (5x3 → 4x3) era desfeita no snapshot do runtime.
+                publish(user_id, trust_local_score=True)
+            except TypeError:
+                try:
+                    publish(user_id)
+                except Exception:
+                    logger.warning(
+                        "[ROBOT_RUNTIME_APPLY_SCORE_SNAPSHOT_FAILED] user_id=%s",
+                        user_id,
+                        exc_info=True,
+                    )
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_APPLY_SCORE_SNAPSHOT_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        logger.info(
+            "[ROBOT_RUNTIME_CMD] action=apply_score user_id=%s wins=%s losses=%s profit=%s",
+            user_id,
+            state.wins,
+            state.losses,
+            state.profit,
+        )
 
 
 async def _cmd_listener(gateway: object, stop: asyncio.Event) -> None:
@@ -205,9 +496,20 @@ async def amain() -> None:
 
     listener = asyncio.create_task(_cmd_listener(gateway, stop), name="robot-cmd-listener")
     publisher = asyncio.create_task(_snapshot_publisher(gateway, stop), name="robot-snapshot")
+    # Denuncia no log qualquer chamada síncrona que trave o loop (ver
+    # backend/loop_watchdog.py — incidente de entradas atrasadas de 10/09).
+    from backend.loop_watchdog import EVENT_LOOP_WATCHDOG_ENABLED, EventLoopWatchdog
+
+    watchdog = (
+        asyncio.create_task(EventLoopWatchdog(logger).run(stop), name="event-loop-watchdog")
+        if EVENT_LOOP_WATCHDOG_ENABLED
+        else None
+    )
     await stop.wait()
     listener.cancel()
     publisher.cancel()
+    if watchdog is not None:
+        watchdog.cancel()
     await gateway.shutdown_robot_workers()
     bus.close()
     logger.info("[ROBOT_RUNTIME_STOP]")

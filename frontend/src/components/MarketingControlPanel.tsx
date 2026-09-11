@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
+import { ChevronDown, Loader2, Pencil, Plus, Radio, Sparkles, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import {
   ApiError,
@@ -10,6 +10,7 @@ import {
   marketingSimulateTrade,
   marketingSimulationHistory,
   marketingUpdateTrade,
+  robotLiveMode,
   type MarketingSimulationTrade,
   type MarketingSimulationTradeUpdate,
 } from "@/lib/api";
@@ -26,8 +27,14 @@ import {
 import {
   MARKETING_HISTORY_QUERY_KEY,
   MARKETING_STATS_QUERY_KEY,
+  overlayScoreFromTrades,
 } from "@/lib/marketingSimulation";
-import { ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
+import {
+  MARKETING_PANEL_TABS,
+  tabAfterMarketingHistoryMutation,
+  type MarketingPanelTab,
+} from "@/lib/marketingPanelTabs";
+import { applyRobotSessionScoreToCache, ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
 import { ROBOT_HISTORY_QUERY_KEY, ROBOT_STATS_QUERY_KEY } from "@/hooks/useRobotHistory";
 
 interface MarketingControlPanelProps {
@@ -36,6 +43,7 @@ interface MarketingControlPanelProps {
   settings: MarketingDemoSettings;
   onSettingsChange: (partial: Partial<MarketingDemoSettings>) => void;
   targetWinRate?: number | null;
+  userId?: string | null;
 }
 
 type EditForm = {
@@ -58,6 +66,8 @@ type ScoreDraft = {
 /**
  * Painel flutuante oculto da conta marketing (Shift+O).
  * Não usa backdrop bloqueante para a operação continuar em paralelo.
+ * Abas Manual / Placar / Histórico: a seta ↓ na aba Histórico abre a
+ * lista com lixeira sem precisar rolar os formulários.
  */
 export function MarketingControlPanel({
   open,
@@ -65,8 +75,10 @@ export function MarketingControlPanel({
   settings,
   onSettingsChange,
   targetWinRate,
+  userId,
 }: MarketingControlPanelProps) {
   const queryClient = useQueryClient();
+  const [activeTab, setActiveTab] = useState<MarketingPanelTab>("manual");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<EditForm | null>(null);
   const [draft, setDraft] = useState(settings);
@@ -77,7 +89,7 @@ export function MarketingControlPanel({
     losses: 2,
     amount: settings.amount,
     asset: settings.asset,
-    period: "M1",
+    period: "M5",
   }));
 
   useEffect(() => {
@@ -90,6 +102,10 @@ export function MarketingControlPanel({
         amount: settings.amount,
         asset: settings.asset,
       }));
+    } else {
+      setActiveTab("manual");
+      setEditingId(null);
+      setForm(null);
     }
   }, [open, settings]);
 
@@ -188,6 +204,46 @@ export function MarketingControlPanel({
     ]);
   }
 
+  // Modo LIVE: cadência de demonstração. Afrouxa o portão em OTC para o robô
+  // entrar com mais frequência durante a transmissão. NÃO melhora o resultado
+  // — em OTC o acerto é ~50% medido, então mais entradas é perder mais rápido.
+  // O aviso abaixo do botão existe para isso não ser esquecido numa live.
+  const [liveOn, setLiveOn] = useState(false);
+  // O botão nascia sempre apagado: `useState(false)` e nada consultava o
+  // servidor. Fechar e reabrir o Shift+O (ou recarregar a página) mostrava LIVE
+  // desligado com o modo ligado no servidor, e o clique seguinte remandava
+  // `true` — sem desligar nada. Medido em 07/09 23:44 e 08/09 00:13: dois
+  // cliques, dois `enabled=True` no log. O estado do robô é a fonte da verdade.
+  useEffect(() => {
+    if (!open) return;
+    const estadoRobo = queryClient.getQueryData<{ live_demo?: boolean }>([
+      ...ROBOT_STATE_QUERY_KEY,
+      userId,
+    ]);
+    if (typeof estadoRobo?.live_demo === "boolean") {
+      setLiveOn(estadoRobo.live_demo);
+    }
+  }, [open, queryClient, userId]);
+  const liveMode = useMutation({
+    mutationFn: (enabled: boolean) => robotLiveMode(enabled),
+    onSuccess: (_data, enabled) => {
+      setLiveOn(enabled);
+      toast.success(
+        enabled
+          ? "Modo LIVE ligado — o robô vai pegar muito mais operações em OTC"
+          : "Modo LIVE desligado — o robô voltou ao portão normal",
+      );
+    },
+    onError: (error: unknown) => {
+      const detalhe = error instanceof ApiError ? error.message : String(error);
+      toast.error(
+        detalhe.includes("SOMENTE_MARKETING")
+          ? "Modo LIVE é exclusivo de conta de marketing"
+          : `Não deu para mudar o modo LIVE: ${detalhe}`,
+      );
+    },
+  });
+
   const createTrade = useMutation({
     mutationFn: async () => {
       let createdAt: string | undefined;
@@ -209,8 +265,15 @@ export function MarketingControlPanel({
       if (!response.ok) throw new ApiError(response.error, response.code, response.status);
       return response.data;
     },
-    onSuccess: async () => {
+    onSuccess: async (data) => {
+      if (userId) {
+        applyRobotSessionScoreToCache(queryClient, userId, overlayScoreFromTrades(data ? [data] : []), {
+          accumulate: true,
+        });
+      }
       await invalidateAll();
+      const nextTab = tabAfterMarketingHistoryMutation(true);
+      if (nextTab) setActiveTab(nextTab);
       toast.success("Operação adicionada");
     },
     onError: (error) => {
@@ -231,7 +294,12 @@ export function MarketingControlPanel({
       return response.data;
     },
     onSuccess: async (data) => {
+      if (userId) {
+        applyRobotSessionScoreToCache(queryClient, userId, overlayScoreFromTrades(data));
+      }
       await invalidateAll();
+      const nextTab = tabAfterMarketingHistoryMutation(true);
+      if (nextTab) setActiveTab(nextTab);
       toast.success(`Histórico gerado: ${data?.length ?? 0} operações`);
     },
     onError: (error) => {
@@ -260,8 +328,20 @@ export function MarketingControlPanel({
     mutationFn: async (tradeId: string) => {
       const response = await marketingDeleteTrade(tradeId);
       if (!response.ok) throw new ApiError(response.error, response.code, response.status);
+      return tradeId;
     },
-    onSuccess: async () => {
+    onSuccess: async (tradeId) => {
+      if (userId) {
+        const removed = history.data?.find((trade) => trade.id === tradeId);
+        if (removed) {
+          applyRobotSessionScoreToCache(
+            queryClient,
+            userId,
+            overlayScoreFromTrades([removed]),
+            { subtract: true },
+          );
+        }
+      }
       await invalidateAll();
       toast.success("Operação excluída");
     },
@@ -347,7 +427,7 @@ export function MarketingControlPanel({
     }
     if (
       !window.confirm(
-        `Substituir o histórico atual por ${wins} WIN e ${losses} LOSS? Esta ação não pode ser desfeita.`,
+        `Gerar ${wins} WIN e ${losses} LOSS e atualizar o placar do El Capo? As operações entram no histórico sem apagar as antigas.`,
       )
     ) {
       return;
@@ -357,7 +437,7 @@ export function MarketingControlPanel({
 
   return (
     <aside
-      className="fixed bottom-4 right-4 z-[80] flex h-[min(92vh,920px)] w-[min(440px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-2xl backdrop-blur"
+      className="fixed bottom-3 right-3 z-[80] flex h-[min(94vh,920px)] max-h-[calc(100dvh-1.5rem)] w-[min(440px,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-2xl backdrop-blur sm:bottom-4 sm:right-4"
       role="dialog"
       aria-label="Painel de configuração"
       onPointerDown={(event) => event.stopPropagation()}
@@ -377,8 +457,48 @@ export function MarketingControlPanel({
         </button>
       </header>
 
-      <div className="min-h-0 flex-1 space-y-0 overflow-y-auto overscroll-contain">
-        <div className="space-y-3 border-b border-border px-4 py-3">
+      <nav
+        className="flex shrink-0 gap-1 border-b border-border bg-muted/30 p-1.5"
+        aria-label="Seções do painel marketing"
+        role="tablist"
+      >
+        {MARKETING_PANEL_TABS.map((tab) => {
+          const selected = activeTab === tab.id;
+          const countLabel =
+            tab.id === "history" && trades.length > 0 ? ` (${trades.length})` : "";
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              id={`marketing-panel-tab-${tab.id}`}
+              aria-selected={selected}
+              aria-controls={`marketing-panel-panel-${tab.id}`}
+              onClick={() => setActiveTab(tab.id)}
+              className={`inline-flex flex-1 items-center justify-center gap-1 rounded-lg px-2 py-2 text-xs font-semibold transition sm:text-sm ${
+                selected
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
+              }`}
+            >
+              {tab.id === "history" ? (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden />
+              ) : null}
+              {tab.label}
+              {countLabel}
+            </button>
+          );
+        })}
+      </nav>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        {activeTab === "manual" ? (
+        <div
+          className="space-y-3 px-4 py-3"
+          role="tabpanel"
+          id="marketing-panel-panel-manual"
+          aria-labelledby="marketing-panel-tab-manual"
+        >
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Operação manual (Shift+O)
@@ -525,9 +645,50 @@ export function MarketingControlPanel({
             {createTrade.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
             Nova operação
           </button>
+          <button
+            type="button"
+            disabled={liveMode.isPending}
+            onClick={() => liveMode.mutate(!liveOn)}
+            aria-pressed={liveOn}
+            className={
+              "inline-flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold disabled:opacity-50 " +
+              (liveOn
+                ? "bg-red-600 text-white hover:bg-red-700"
+                : "border border-border text-muted-foreground hover:bg-accent hover:text-foreground")
+            }
+          >
+            {liveMode.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Radio className={"h-4 w-4" + (liveOn ? " animate-pulse" : "")} />
+            )}
+            {liveOn ? "LIVE ligado — desligar" : "LIVE — mais operações em OTC"}
+          </button>
+          {liveOn ? (
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              O robô vai entrar muito mais vezes em OTC. O acerto continua o
+              mesmo (~50%), então o placar da live anda mais rápido para os
+              dois lados.
+            </p>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => setActiveTab("history")}
+            className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-semibold text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            <ChevronDown className="h-4 w-4" />
+            Ir para histórico — editar / excluir
+          </button>
         </div>
+        ) : null}
 
-        <div className="space-y-3 border-b border-border px-4 py-3">
+        {activeTab === "score" ? (
+        <div
+          className="space-y-3 px-4 py-3"
+          role="tabpanel"
+          id="marketing-panel-panel-score"
+          aria-labelledby="marketing-panel-tab-score"
+        >
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Gerar placar automático
@@ -647,9 +808,28 @@ export function MarketingControlPanel({
             )}
             Gerar histórico do placar
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("history")}
+            className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-semibold text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            <ChevronDown className="h-4 w-4" />
+            Ir para histórico — editar / excluir
+          </button>
         </div>
+        ) : null}
 
-        <div className="px-3 py-3">
+        {activeTab === "history" ? (
+        <div
+          className="px-3 py-3"
+          role="tabpanel"
+          id="marketing-panel-panel-history"
+          aria-labelledby="marketing-panel-tab-history"
+        >
+          <p className="mb-3 px-1 text-xs text-muted-foreground">
+            Use a lixeira para excluir operações do histórico com tranquilidade —
+            sem rolar pelos formulários de Manual ou Placar.
+          </p>
           {history.isLoading ? (
             <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" /> Carregando...
@@ -832,6 +1012,7 @@ export function MarketingControlPanel({
             </ul>
           )}
         </div>
+        ) : null}
       </div>
     </aside>
   );

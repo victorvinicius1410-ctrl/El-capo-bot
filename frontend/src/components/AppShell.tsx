@@ -32,7 +32,13 @@ import {
   robotStop,
   type BullExAccount,
 } from "@/lib/api";
-import { impersonationAllowedPaths, isAdminAccessSectionPath } from "@/lib/adminPresentation";
+import {
+  impersonationAllowedPaths,
+  isAdminAccessSectionPath,
+  shouldMountLiveTradingProvider,
+  shouldShowRobotOverlay,
+  shouldTreatSessionAsInactive,
+} from "@/lib/adminPresentation";
 import { isBullExConnected, canStartRobotOperation } from "@/lib/bullexConnection";
 import { scheduleDialogOpen } from "@/lib/scheduleDialogOpen";
 import { completeBullExLogin, useBullExLoginState } from "@/lib/bullexLoginState";
@@ -49,13 +55,15 @@ import {
 } from "@/lib/marketingDemoSettings";
 import { isMarketingSimulationAccount } from "@/lib/marketingSimulation";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
+import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { prefetchAdminClientsSegment } from "@/lib/adminClientsQuery";
 import { resetBullExAccountState } from "@/hooks/useBullExAccount";
 import { resetRobotSettingsForUser } from "@/lib/robotSettings";
-import type { RobotState } from "@/lib/robotState";
-import { TRIAL_DISCOUNT, formatRemaining } from "@/lib/trial";
+import { isRobotOperationRunning, type RobotState } from "@/lib/robotState";
+import { TRIAL_DISCOUNT, formatTrialRemaining, remainingMs } from "@/lib/trial";
 import { useAuth, type AuthUser } from "@/lib/useAuth";
 import {
+  applyRobotMutationToCache,
   LiveTradingDataProvider,
   useLiveTradingData,
 } from "@/hooks/useLiveTradingData";
@@ -131,7 +139,9 @@ function TrialBanner({ expiresAt }: { expiresAt: string }) {
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <Clock className="h-3.5 w-3.5" />
             Tempo restante:{" "}
-            <span className="font-mono font-semibold text-foreground">{formatRemaining(remaining)}</span>
+            <span className="font-mono font-semibold text-foreground">
+              {formatTrialRemaining(remaining)}
+            </span>
           </div>
         </div>
       </div>
@@ -141,10 +151,6 @@ function TrialBanner({ expiresAt }: { expiresAt: string }) {
       </Link>
     </div>
   );
-}
-
-function remainingMs(expiresAt: string): number {
-  return Math.max(0, new Date(expiresAt).getTime() - Date.now());
 }
 
 const ADMIN_MODEL_CYCLE_MS = 45_000;
@@ -192,7 +198,7 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
     cachedGrace,
     pendingConnect: loginState.isPending,
   });
-  const operationRunning = Boolean(displayState?.enabled || displayState?.worker_running);
+  const operationRunning = isRobotOperationRunning(displayState);
   // Mesma regra prática do painel Configurações: conta conectada + saldo ok.
   // Não usar loginState.isPending como bloqueio — o auto-reconnect pode deixar
   // isPending preso quando o effect é cancelado após a sessão já ter voltado.
@@ -250,7 +256,11 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
     try {
       const response = await robotStop();
       if (!response.ok) throw new ApiError(response.error, response.code);
-      await robotState.refetch();
+      if (userId && response.data) {
+        applyRobotMutationToCache(queryClient, userId, response.data);
+      }
+      // Refetch em background — não bloquear o botão no RTT de /robot/state.
+      void robotState.refetch();
       toast.success("Operações automáticas paradas");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Não foi possível parar a operação.";
@@ -266,8 +276,14 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
     try {
       const response = await robotResetScore();
       if (!response.ok) throw new ApiError(response.error, response.code);
-      // Só o placar da sessão muda; histórico/stats persistidos permanecem.
-      await robotState.refetch();
+      // Aplica o payload da mutação na hora (como start/stop). Em mode=external
+      // um await refetch lia o snapshot Redis ainda com wins/losses antigos.
+      if (userId && response.data) {
+        applyRobotMutationToCache(queryClient, userId, response.data, {
+          allowBlankOverwrite: true,
+        });
+      }
+      void robotState.refetch();
       toast.success("Placar reiniciado");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Não foi possível reiniciar o placar.";
@@ -348,8 +364,11 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
           robotRunning={operationRunning}
           accountBalance={account.data?.balance ?? null}
           accountCurrency={account.data?.currency ?? null}
-          onStarted={async () => {
-            await robotState.refetch();
+          onStarted={(startedPayload) => {
+            if (userId && startedPayload) {
+              applyRobotMutationToCache(queryClient, userId, startedPayload);
+            }
+            void robotState.refetch();
           }}
         />
       )}
@@ -421,6 +440,10 @@ function buildAdminModelState(
     result_waiting: false,
     operation_message: null,
     result_display_until: showingResult ? new Date(now + 2_000).toISOString() : null,
+    // Estado de demonstracao do modelo no admin: `stop_reset_at` e
+    // obrigatorio em RobotState e nunca foi preenchido aqui. Nao ha placar
+    // real para preservar nesta tela, entao null e o valor correto.
+    stop_reset_at: null,
     unseen_result: false,
     result_voice: null,
     pending_signal: null,
@@ -506,17 +529,30 @@ function AppShellContent({ children }: { children: ReactNode }) {
   // Enquanto /me/access carrega, NÃO mostrar o overlay do robô (evita lead
   // pendente clicando Iniciar). O provider de dados, porém, precisa montar
   // nesse intervalo — dashboard/configurações usam useLiveTradingData().
-  const inactive = accessReady && !hasOperationalAccess;
+  // Sessão de suporte também monta o provider: o dashboard do lead chama o
+  // hook, mesmo com overlay e controles bloqueados.
   const marketingSimulation = isMarketingSimulationAccount(access.data);
   const [marketingSettings, setMarketingSettings] = useState<MarketingDemoSettings>(() =>
     loadMarketingDemoSettings(user?.id),
   );
   const impersonating = access.data?.impersonating === true;
   const isAdminRoute = pathname.startsWith("/admin");
-  // Polling BullEx/robô: ativo com acesso (ou enquanto o acesso ainda carrega).
-  const mountLiveTrading = !impersonating && !isAdminRoute && (!accessReady || hasOperationalAccess);
-  // Overlay flutuante só com acesso operacional confirmado.
-  const showRobot = hasOperationalAccess && !impersonating && !isAdminRoute;
+  const inactive = shouldTreatSessionAsInactive({
+    impersonating,
+    accessReady,
+    hasOperationalAccess,
+  });
+  const mountLiveTrading = shouldMountLiveTradingProvider({
+    impersonating,
+    isAdminRoute,
+    accessReady,
+    hasOperationalAccess,
+  });
+  const showRobot = shouldShowRobotOverlay({
+    impersonating,
+    isAdminRoute,
+    hasOperationalAccess,
+  });
   const initials = userInitials(user?.email);
   const endImpersonationMutation = useMutation({
     mutationFn: async () => {
@@ -711,21 +747,26 @@ function AppShellContent({ children }: { children: ReactNode }) {
       </aside>
       <div className="shell-content shell-content-fx relative min-w-0 flex-1">
         <div className="shell-content-glow" aria-hidden="true" />
-        <div className="shell-fx-backdrop" aria-hidden="true">
-          <span className="shell-fx-aurora shell-fx-aurora-a" />
-          <span className="shell-fx-aurora shell-fx-aurora-b" />
-          <span className="shell-fx-mesh" />
-          <span className="shell-fx-scan" />
-          <span className="shell-fx-noise" />
-          <span className="shell-fx-sparks">
-            <i />
-            <i />
-            <i />
-            <i />
-            <i />
-            <i />
-          </span>
-        </div>
+        {/* Em /chart a atmosfera sai: blur(64px) + mix-blend-mode animados por
+            baixo do traderoom estouram a GPU do WebKit (mesmo motivo do
+            config-atmosphere-lite — ver docs/CONFIGURACOES.md). */}
+        {pathname !== "/chart" ? (
+          <div className="shell-fx-backdrop" aria-hidden="true">
+            <span className="shell-fx-aurora shell-fx-aurora-a" />
+            <span className="shell-fx-aurora shell-fx-aurora-b" />
+            <span className="shell-fx-mesh" />
+            <span className="shell-fx-scan" />
+            <span className="shell-fx-noise" />
+            <span className="shell-fx-sparks">
+              <i />
+              <i />
+              <i />
+              <i />
+              <i />
+              <i />
+            </span>
+          </div>
+        ) : null}
         <main
           className={`relative z-10 ${
             pathname === "/chart"
@@ -738,7 +779,7 @@ function AppShellContent({ children }: { children: ReactNode }) {
               <span>
                 Acesso temporário de suporte à conta <strong>{access.data.user_id}</strong>
                 {access.data.impersonation_expires_at
-                  ? ` até ${new Date(access.data.impersonation_expires_at).toLocaleTimeString("pt-BR")}`
+                  ? ` até ${formatBrasiliaDateTime(access.data.impersonation_expires_at)}`
                   : ""}
                 . Operações, Corretora e controles do ElCapo estão bloqueados.
               </span>
@@ -769,6 +810,7 @@ function AppShellContent({ children }: { children: ReactNode }) {
             setMarketingSettings(saveMarketingDemoSettings(user.id, partial));
           }}
           targetWinRate={access.data?.marketing_win_rate}
+          userId={user?.id}
         />
       ) : null}
       {inactive && pathname !== "/payments" && pathname !== "/feedbacks" ? (

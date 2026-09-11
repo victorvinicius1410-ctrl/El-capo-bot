@@ -67,6 +67,11 @@ CATALOG = (
         {"first_access_url": "https://app.example.com/primeiro-acesso?token=uso-unico"},
     ),
     EventCatalogItem(
+        DomainEventType.PURCHASE_EXISTING_ACCOUNT,
+        "Compra aprovada para quem já tinha conta no painel.",
+        {"login_url": "https://app.example.com/login"},
+    ),
+    EventCatalogItem(
         DomainEventType.SUBSCRIPTION_CANCELED,
         "Assinatura cancelada e acesso removido.",
         {"reason": "customer_request"},

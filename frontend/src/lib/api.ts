@@ -1,3 +1,4 @@
+import { resolveApiBaseUrl } from "./apiBaseUrl";
 import { withAuthRefreshRetry } from "./authSessionKeepAlive";
 import {
   clearSessionIdentityCache,
@@ -6,24 +7,6 @@ import {
   writeSessionIdentityCache,
 } from "./sessionIdentityCache";
 import { clearAuthSnapshot, refreshAuthSession, renewAuthSessionCookies } from "./useAuth";
-
-const PRODUCTION_API_BASE_URL = "https://api.elcapobot.online";
-
-function resolveApiBaseUrl(configured: string | undefined): string {
-  const normalized = configured?.trim().replace(/\/+$/, "");
-  if (!normalized) return PRODUCTION_API_BASE_URL;
-  try {
-    const url = new URL(normalized);
-    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if ((local && ["http:", "https:"].includes(url.protocol)) ||
-        (url.protocol === "https:" && url.hostname === "api.elcapobot.online")) {
-      return normalized;
-    }
-  } catch {
-    // A configuração inválida é substituída pelo endpoint oficial.
-  }
-  return PRODUCTION_API_BASE_URL;
-}
 
 export const apiConfig = {
   BASE_URL: resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL),
@@ -121,7 +104,7 @@ export interface AdminClient {
   payment_status?: PaymentStatus;
   plan_id?: string | null;
   active?: boolean;
-  trial_ends_at?: string | null;
+  expires_at?: string | null;
   created_at: string;
   phone?: string | null;
   trader_id?: string | null;
@@ -187,6 +170,24 @@ export interface AdminDashboardUserRanking {
   profit: number;
 }
 
+export interface AdminDashboardHourlyResult {
+  hour: number;
+  hour_label: string;
+  operations: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  profit: number;
+}
+
+export interface AdminDashboardOperations {
+  total: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  profit: number;
+}
+
 export interface AdminDashboardData {
   active_clients: number;
   inactive_clients: number;
@@ -196,6 +197,8 @@ export interface AdminDashboardData {
   revenue_by_currency: Record<string, number>;
   new_client_revenue: number;
   new_client_revenue_by_currency: Record<string, number>;
+  operations: AdminDashboardOperations;
+  hourly_results: AdminDashboardHourlyResult[];
   top_winners: AdminDashboardUserRanking[];
   top_losers: AdminDashboardUserRanking[];
   most_accurate_assets: AdminDashboardAssetRanking[];
@@ -265,6 +268,8 @@ export interface EmailDelivery {
   status: string;
   created_at: string;
   error?: string | null;
+  attempt_count?: number;
+  last_error_code?: string | null;
 }
 
 export interface WebhookDelivery {
@@ -322,7 +327,10 @@ const KNOWN_ERROR_MESSAGES: Record<string, string> = {
   REAL_MODE_NOT_CONFIRMED: "Não foi possível confirmar a conta REAL. Tente reconectar a Bullex.",
   REAL_BALANCE_NOT_DETECTED:
     "Não foi possível confirmar o saldo REAL agora. Aguarde alguns segundos e tente de novo, ou reconecte a Bullex.",
-  INSUFFICIENT_BALANCE: "Você está sem saldo para iniciar. Faça um depósito na BullEx.",
+  INSUFFICIENT_BALANCE:
+    "Saldo insuficiente. Faça um depósito na BullEx ou reduza o valor da entrada.",
+  INSUFFICIENT_FUNDS:
+    "Saldo insuficiente para a entrada. Deposite na BullEx ou reduza o valor da entrada.",
   RESET_CYCLE_REQUIRED:
     "Stop Win ou Stop Loss atingido. Clique em Reiniciar placar e depois em Iniciar Operação.",
   STOP_WIN_HIT:
@@ -671,6 +679,8 @@ export interface MyAccessData {
   role?: string;
   is_admin?: boolean;
   manageable_roles?: Array<{ id: string; name: string }>;
+  /** `/me/access` devolve booleano (o handler converte "true" antes). */
+  grant_access?: boolean;
   access_status?: "active" | "inactive" | "pending_approval" | string;
   approval_status?: ApprovalStatus | string;
   account_type?: AccountType | string;
@@ -750,7 +760,13 @@ export const adminEmailSettings = () => apiRequest<EmailSettings>("/admin/emails
 export const adminListEmailTemplates = () => apiRequest<EmailTemplate[]>("/admin/emails/templates");
 export const adminUpdateEmailTemplate = (event: EmailEventType, payload: Partial<EmailTemplate>) => apiRequest<EmailTemplate>(`/admin/emails/templates/${event}`, { method: "PATCH", body: JSON.stringify(payload) });
 export const adminPreviewEmailTemplate = (event: EmailEventType, payload?: Record<string, unknown>) => apiRequest<{ subject: string; html_body: string }>(`/admin/emails/templates/${event}/preview`, { method: "POST", body: JSON.stringify(payload ?? {}) });
-export const adminSendTestEmail = (event: EmailEventType) => apiRequest(`/admin/emails/templates/${event}/test`, { method: "POST" });
+export const adminSendTestEmail = (event: EmailEventType, recipientEmail?: string) =>
+  apiRequest(`/admin/emails/templates/${event}/test`, {
+    method: "POST",
+    body: JSON.stringify(
+      recipientEmail?.trim() ? { recipient_email: recipientEmail.trim() } : {},
+    ),
+  });
 export const adminEmailDeliveries = (offset = 0, limit = 20) => apiRequest<EmailDelivery[]>(`/admin/emails/deliveries?offset=${offset}&limit=${limit}`);
 
 export const bullexApi = {
@@ -782,7 +798,8 @@ export interface BullExAccount {
   connected: boolean;
   balance: number | null;
   currency: string | null;
-  mode: "REAL" | null;
+  /** A corretora tambem devolve PRACTICE; o painel opera so em REAL. */
+  mode: "REAL" | "PRACTICE" | null;
   email: string | null;
   requires_2fa: boolean;
   status: "connected" | "disconnected";
@@ -803,6 +820,15 @@ export interface MarketingSimulationTrade {
   source?: string;
   account_mode?: string;
   disclaimer?: string;
+  strategy_name?: string;
+  strategy_key?: string;
+  strategy_summary?: string;
+  analysis_detail?: string;
+  /** Vem nas operacoes reais espelhadas no painel de marketing. */
+  speech_preview?: string;
+  used_strategies?: string[];
+  timeframe?: string;
+  period?: string;
 }
 
 export interface MarketingSimulationStats {
@@ -874,6 +900,17 @@ export const robotState = (userId: string) =>
 export const robotConfig = (payload: Record<string, unknown>) => apiRequest("/robot/config", { method: "POST", body: JSON.stringify(payload) });
 export const robotStart = () => apiRequest("/robot/start", { method: "POST" });
 export const robotStop = () => apiRequest("/robot/stop", { method: "POST" });
+/**
+ * Liga/desliga o modo LIVE — cadência de demonstração para transmissão.
+ *
+ * Só conta de marketing consegue: o backend devolve 403
+ * `LIVE_MODE_SOMENTE_MARKETING` para as demais. O modo afrouxa o portão de
+ * qualidade em OTC para o robô entrar com mais frequência. Não melhora o
+ * resultado — os ativos OTC são ruído medido, então mais entradas significam
+ * perder mais rápido, na mesma proporção.
+ */
+export const robotLiveMode = (enabled: boolean) =>
+  apiRequest("/robot/live-mode", { method: "POST", body: JSON.stringify({ enabled }) });
 export const robotResetCycle = () => apiRequest("/robot/reset-cycle", { method: "POST" });
 export const robotResetScore = () => apiRequest("/robot/reset-score", { method: "POST" });
 export const robotSyncConnection = () => apiRequest("/robot/sync-connection", { method: "POST" });

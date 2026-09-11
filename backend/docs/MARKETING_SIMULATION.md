@@ -107,13 +107,14 @@ Shift+O history ← espelho da mesma operação
 1. Conta marketing autenticada → **Shift+O**.
 2. Painel flutuante alto (`h ≈ 94vh`, até 920px; `100dvh` em mobile) com
    **abas** e scroll interno na aba ativa (sem backdrop).
-3. Abas fixas no topo do painel:
+3. Abas fixas no topo do painel (seta **↓** na aba Histórico):
    - **Manual** — criar operação e salvar valores
    - **Placar** — gerar histórico pelo placar desejado
-   - **Histórico (N)** — listar, editar (lápis) e **excluir (lixeira)**
+   - **↓ Histórico (N)** — listar, editar (lápis) e **excluir (lixeira)**
 4. Em telas baixas/estreitas a aba **Histórico** deixa a lixeira sempre
    acessível (antes as ações ficavam no fim de um scroll longo atrás dos
-   formulários). Atalhos na Manual/Placar: “Ver histórico / Ir para histórico”.
+   formulários). Atalhos na Manual/Placar: botão **↓ Ir para histórico —
+   editar / excluir** (mesma seta do menu lateral).
 5. Após **Nova operação** ou **Gerar histórico do placar**, o painel abre a
    aba Histórico automaticamente.
 6. **Esc** ou novo **Shift+O** fecha; a operação da tela continua.
@@ -142,35 +143,68 @@ grava o instante atual em UTC — comportamento anterior mantido.
 
 1. Informe **Wins**, **Loss** e o **Valor de entrada** (único para todas as
    operações).
-2. Escolha **Período** (M1/M5/M15) — define a janela de horários.
+2. Escolha **Período** (M1/M5/M15) — define o timeframe exibido no histórico
+   e a janela de horários. **Padrão: M5**.
 3. Escolha o **ativo** (ou Aleatório).
 4. O **payout** é consultado na Bullex por ativo (sem campo manual). Se a
    corretora não responder, usa payout típico OTC (**85%**) para não bloquear
    a geração.
-5. Clique em **Gerar histórico do placar**.
+5. Clique em **Gerar histórico do placar**. O overlay do El Capo (WIN / LOSS /
+   resultado) atualiza na hora para o lote gerado.
 
 Ativos do seletor/pool aleatório: apenas **forex OTC** permitidos no robô
 binário (ex.: EURUSD-OTC). Cripto (BTC/ETH) não entra — não há payout digital
 nesse catálogo e quebrava a geração.
 
-O backend **substitui** o histórico, embaralha WIN/LOSS, atribui `created_at`
-espaçados pela cadência do período com jitter leve (±20%) e sincroniza o robô.
-Limite: 100 operações por geração.
+O backend **acrescenta** as operações geradas ao histórico existente (não
+apaga linhas antigas de `/history` nem de `marketing_simulated_trades`),
+embaralha WIN/LOSS do lote novo, atribui `created_at` com **intervalos
+irregulares** (o robô não opera a cada minuto — gaps variam em múltiplos da
+vela, com segundos não redondos) e atualiza só o **placar do overlay** para
+o lote gerado. Cada operação recebe **estratégia simulada** (nome, resumo e
+detalhe) compatível com o histórico real do cliente. Limite: 100 operações
+por geração.
 
-Depois de gerar o placar no Shift+O, novas operações ao vivo **somam** o
-resultado real em cima desse placar (não substituem o histórico editável até
-um novo “Gerar” ou edição manual).
+### Por que o placar não aparecia no El Capo (2026-08-18)
+
+Sintoma: conta marketing gerava o placar no Shift+O (histórico do painel
+enchia, toast de sucesso) e o robô flutuante **continuava 0-0**.
+
+Em produção o painel lê `robot:snapshot` no Redis (publicado pelo
+`robot-runtime`). `sync_marketing_display_to_robot` só atualizava a memória
+do **gateway** + `persist_robot`. No gateway (`ROBOT_RUNTIME_MODE=external`)
+`persist_robot` **não grava Redis**. O runtime seguia com 0-0 e o publisher
+de 1s republicava isso por cima. O front só fazia `invalidateQueries` do
+`/robot/state`, que preferia o Redis zerado.
+
+Correção:
+
+1. Gateway: `publish_marketing_score_to_overlay` grava Redis imediatamente e
+   manda `robot:cmd` `apply_score` (wins/losses/profit) ao runtime.
+2. Runtime: aplica o placar na memória e republica o snapshot — o overlay
+   deixa de ser sobrescrito com 0-0.
+3. Front: `applyRobotSessionScoreToCache` grava WIN/LOSS/lucro no React Query
+   na hora (generate substitui o placar do lote; “Nova operação” soma).
+
+Logs: `[MARKETING_SCORE_DELEGATED]`, `[ROBOT_RUNTIME_CMD] action=apply_score`.
+
+Operações ao vivo continuam **somando** o resultado real em cima do placar
+atual. “Nova operação” no Shift+O também só cria a linha e soma no placar —
+nunca zera o histórico persistido.
 
 ## Arquivos principais
 
 - Frontend: `AppShell.tsx`, `MarketingControlPanel.tsx`, `marketingHotkey.ts`,
-  `marketingPanelContext.tsx`, `marketingSimulation.ts`,
-  `marketingDemoSettings.ts`, `history.tsx`
+  `marketingPanelContext.tsx`, `marketingPanelTabs.ts`, `marketingSimulation.ts`,
+  `marketingDemoSettings.ts`, `history.tsx`, `useLiveTradingData.tsx`,
+  `robotState.ts`
 - Backend: `main.py` (`apply_marketing_result_override`,
-  `resolve_marketing_asset_payout`), `marketing_simulation_service.py`,
+  `publish_marketing_score_to_overlay`, `resolve_marketing_asset_payout`),
+  `robot_runtime_main.py` (`apply_score`), `marketing_simulation_service.py`,
   `admin_router.py`
 - Testes: `tests/test_marketing_real_operation_results.py`,
-  `tests/test_marketing_simulation_management.py`
+  `tests/test_marketing_simulation_management.py`,
+  `tests/test_robot_control_snapshot.py`
 
 ## Autenticação e isolamento
 
@@ -182,7 +216,8 @@ Endpoints `/marketing-simulation/*` exigem sessão marketing. `company_id` e
 - `POST /marketing-simulation/trades` — gera trade (`201`); body opcional:
   `amount`, `payout`, `asset`, `direction`, `result`, `created_at` (ISO8601;
   se omitido, usa o instante atual)
-- `POST /marketing-simulation/generate-history` — substitui o histórico (`201`);
+- `POST /marketing-simulation/generate-history` — **acrescenta** operações (`201`)
+  e aplica um placar novo no overlay; **não** apaga o histórico antigo.
   body: `wins`, `losses`, `amount` (valor de entrada), `period` (`M1`|`M5`|`M15`),
   `asset` opcional; `payout` opcional (se omitido, consulta Bullex)
 - `GET /marketing-simulation/history` — lista (`200`)
@@ -193,9 +228,14 @@ Endpoints `/marketing-simulation/*` exigem sessão marketing. `company_id` e
   O `{trade_id}` aceita UUID de `marketing_simulated_trades` **ou** o
   `order_id` da Bullex presente em `/robot/history`. IDs não-UUID não consultam
   a coluna UUID do Supabase (evita 400/500): a busca usa `broker_order_id` e,
-  sem espelho correspondente, remove a operação das três fontes do histórico
-  do robô (`robot_trade_history`, `robot_trades` e a memória do `auto_trader`)
-  e ajusta o placar. Ver `HISTORICO.md` §“As três fontes do histórico”.
+  sem espelho correspondente, remove a operação das fontes do histórico
+  do robô (`robot_trade_history`, `robot_trades` e a memória do `auto_trader`).
+  Em todo caso o placar da sessão é ajustado **uma vez** via
+  `apply_marketing_score_removal` (adota o placar vivo do Redis antes de
+  decrementar — mode=external; depois persiste e publica com
+  `trust_local_score=True` para o reconcile não restaurar o Redis antigo).
+  O front também subtrai no cache (`subtract: true`). Ver `HISTORICO.md` e
+  `PLACAR_OVERLAY.md`.
   Se a operação já não existir, responde `204` (idempotente) — não devolve
   mais `SIMULATED_TRADE_NOT_FOUND` nesse fluxo.
 
@@ -213,6 +253,46 @@ npm test
 
 ## Histórico
 
+- **2026-09-03** — Exclusão de operação ao vivo tirava a linha do Histórico mas
+  **não baixava o placar**, sem log nenhum. Duas causas: (1) quando a operação
+  só existia no espelho `robot_trades`, `delete_trade` devolve só `bool` e o
+  `trade_meta` saía sem `result` — `apply_marketing_score_removal` descartava
+  em silêncio; agora a linha é lida antes de apagar e os descartes viraram
+  `warning`. (2) **A migration `broker_order_id` nunca rodou em produção** —
+  `delete_simulated_trade` sempre devolvia `None` para ordens ao vivo —
+  **aplicada em produção em 03/09**; staging (`/opt/elcapo2`, outro projeto
+  Supabase) ainda pendente. Toda degradação por schema antigo agora loga
+  `[MARKETING_BROKER_COLUMN_MISSING]`. Ver `PLACAR_OVERLAY.md`.
+- **2026-09-01** — Exclusão marketing: a operação **voltava ao placar** no poll
+  seguinte. `persist_robot` grava o Supabase em background e o reconcile
+  "nunca rebaixa" reelevava a memória do gateway pela DB atrasada (e regravava
+  o placar antigo). Agora a baixa publica uma marca de placar autoritativo
+  (`robot:score_authority:{user_id}`, TTL 120s) respeitada por todos os
+  caminhos de leitura. Ver `PLACAR_OVERLAY.md`.
+- **2026-08-27** — Painel Shift+O volta a ter abas **Manual / Placar / ↓ Histórico**
+  (a seta no menu lateral e o atalho “Ir para histórico” abrem a lista com
+  lixeira sem scroll pelos formulários). Helper: `marketingPanelTabs.ts`.
+- **2026-08-26** — Exclusão no histórico/Shift+O volta a baixar o overlay:
+  `trust_local_score` no publish pós-`apply_marketing_score_removal` (o
+  reconcile “nunca rebaixa” de 08-24 desfazia a baixa). Ver
+  `PLACAR_OVERLAY.md`.
+- **2026-08-24** — Operações simuladas passam a exibir **estratégia** no
+  `/history` (coluna Estratégia + modal Análise). Horários deixam de parecer
+  “1 operação por minuto”: gaps irregulares entre entradas; período padrão
+  do placar automático = **M5**. Sync preserva estratégia real em operações
+  ao vivo espelhadas (`broker_order_id`).
+- **2026-08-21** — Exclusão marketing passa a baixar o placar do overlay
+  (UUID + `broker_order_id`, `apply_marketing_score_removal`, subtract no
+  front). Start/stop deixa de republicar placar 0-0 do gateway
+  (`adopt_live_session_score_if_blank`). Ver `PLACAR_OVERLAY.md`.
+- **2026-08-18** — Gerar placar no Shift+O passa a atualizar o overlay do
+  El Capo em produção (`apply_score` no runtime + Redis + cache do painel).
+  Incidente: conta marketing gerava o histórico e o robô flutuante ficava 0-0.
+- **2026-08-16** — Simular operação / gerar placar **não apaga** o histórico
+  antigo (`robot_trade_history`). O sync faz upsert das linhas novas e o
+  overlay recebe o placar do lote (gerar) ou soma a operação avulsa (criar).
+  A exclusão continua pontual. Incidente: conta Sergio Romero ficou só com
+  operações de 16/08 após um generate que fazia `clear_trade_history`.
 - **2026-08-07** — `POST /robot/start` em conta marketing auto-zera o placar
   (`reset_score` / `stop_reset_at`) quando Stop Win/Loss (placar ou histórico
   do Shift+O) bloquearia o start — corrige 403 `STOP_*_HIT`. Teste:

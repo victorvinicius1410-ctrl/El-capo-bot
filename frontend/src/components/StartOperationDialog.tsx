@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { History, Loader2, Lock, Play } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -10,18 +11,20 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError, apiConfig, robotConfig, robotStart } from "@/lib/api";
+import { ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
 import { entryValueBalanceError, formatBullExBalance } from "@/lib/bullexConnection";
 import {
   DEFAULT_ROBOT_SETTINGS,
-  ENTRY_VALUE_MAX,
-  ENTRY_VALUE_MIN,
   ENTRY_VALUE_STEP,
   ROBOT_TIMEFRAME_OPTIONS,
   STOP_MONEY_MIN,
   STOP_OPERATIONS_MAX,
   STOP_OPERATIONS_MIN,
+  clampEntryValueForCurrency,
   coerceSelectableMarketMode,
   cycleMinutesForTimeframe,
+  entryLimitsForCurrency,
+  entryValueHelperText,
   formatForexOpenCountdown,
   isForexOpenMarketAvailable,
   markRobotSettingsSynced,
@@ -36,6 +39,11 @@ import {
   type RobotStopMode,
 } from "@/lib/robotSettings";
 import { MoneyInput } from "./MoneyInput";
+import { MarketModeLockPopover } from "@/components/MarketModeLockPopover";
+import {
+  OPEN_MARKET_MAINTENANCE_SHORT,
+  resolveMarketModeLock,
+} from "@/lib/openMarketMaintenance";
 
 /** Janela em ms para ignorar dismiss acidental ao abrir (toque residual no mobile). */
 const OPEN_DISMISS_GRACE_MS = 450;
@@ -113,7 +121,7 @@ export interface StartOperationDialogProps {
   robotRunning: boolean;
   accountBalance?: number | null;
   accountCurrency?: string | null;
-  onStarted?: () => void | Promise<void>;
+  onStarted?: (startedPayload?: unknown) => void | Promise<void>;
 }
 
 /**
@@ -151,6 +159,7 @@ export function StartOperationDialog({
     const base = pickOperationConfig(settings);
     setDraft({
       ...base,
+      entryValue: clampEntryValueForCurrency(base.entryValue, accountCurrency),
       marketMode: coerceSelectableMarketMode(base.marketMode),
     });
     setError(null);
@@ -159,7 +168,19 @@ export function StartOperationDialog({
 
   const marketModeOptions = useMemo(() => visibleRobotMarketModeOptions(), [open]);
   const [nowTick, setNowTick] = useState(() => Date.now());
-  const openMarketAvailable = isForexOpenMarketAvailable(new Date(nowTick));
+  // O relógio do navegador só conhece a janela semanal do forex — e erra em
+  // FERIADO, que foi o que enganou a medição de 07/09/2026. O servidor cruza
+  // essa janela com o que a corretora responde por ativo, então sabe mais.
+  // Lido do cache (e não por hook de contexto) para o diálogo não passar a
+  // depender do provider de dados ao vivo. Sem resposta ainda, vale o relógio.
+  const queryClient = useQueryClient();
+  const openMarketDoServidor = queryClient.getQueryData<{
+    open_market_available?: boolean;
+  }>([...ROBOT_STATE_QUERY_KEY, userId])?.open_market_available;
+  const openMarketAvailable =
+    typeof openMarketDoServidor === "boolean"
+      ? openMarketDoServidor
+      : isForexOpenMarketAvailable(new Date(nowTick));
   const openMarketCountdown = formatForexOpenCountdown(new Date(nowTick));
 
   useEffect(() => {
@@ -183,7 +204,10 @@ export function StartOperationDialog({
       toast.info("Nenhuma configuração anterior encontrada.");
       return;
     }
-    setDraft(saved);
+    setDraft({
+      ...saved,
+      entryValue: clampEntryValueForCurrency(saved.entryValue, accountCurrency),
+    });
     toast.success("Últimas configurações aplicadas.");
   }
 
@@ -220,6 +244,7 @@ export function StartOperationDialog({
     try {
       const safeDraft: OperationConfig = {
         ...draft,
+        entryValue: clampEntryValueForCurrency(draft.entryValue, accountCurrency),
         marketMode: coerceSelectableMarketMode(draft.marketMode),
       };
       const nextSettings = mergeOperationConfig(safeDraft, settings);
@@ -269,7 +294,7 @@ export function StartOperationDialog({
           status || "START_NOT_ENABLED",
         );
       }
-      await onStarted?.();
+      await onStarted?.(startResponse.data);
       toast.success(
         `Operação iniciada em ${timeframeLabel(safeDraft.timeframe)} · ${marketModeLabel(safeDraft.marketMode)}`,
       );
@@ -330,36 +355,49 @@ export function StartOperationDialog({
             <p className="text-sm font-medium">Mercado analisado</p>
             <div className="mt-2 grid gap-2 sm:grid-cols-3">
               {marketModeOptions.map((option) => {
-                const locked = option.value === "OPEN" && !openMarketAvailable;
-                const selected = draft.marketMode === option.value && !locked;
-                return (
+                const lock = resolveMarketModeLock(option.value, {
+                  openMarketAvailable,
+                  forexClosedMessage: openMarketCountdown,
+                });
+                const selected = draft.marketMode === option.value && !lock;
+                const optionButton = (
                   <button
                     key={option.value}
                     type="button"
-                    disabled={starting || locked}
+                    // `aria-disabled` em vez de `disabled`: elemento desabilitado
+                    // não dispara hover nem clique, e o cadeado precisa explicar.
+                    disabled={!lock && starting}
+                    aria-disabled={lock ? true : undefined}
                     onClick={() => {
-                      if (locked) return;
+                      if (lock) return;
                       patchDraft({ marketMode: option.value });
                     }}
-                    title={locked ? (openMarketCountdown ?? "Mercado aberto fechado") : undefined}
                     className={`rounded-xl border px-3 py-3 text-left transition disabled:opacity-50 ${
-                      locked
-                        ? "cursor-not-allowed border-border/60 bg-background/20 text-muted-foreground"
+                      lock
+                        ? "cursor-not-allowed border-border/60 bg-background/20 text-muted-foreground opacity-60"
                         : selected
                           ? "border-primary bg-primary/15 text-foreground"
                           : "border-border bg-background/40 text-muted-foreground hover:bg-accent"
                     }`}
                   >
                     <span className="flex items-center gap-1.5 text-sm font-semibold">
-                      {locked ? <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden /> : null}
+                      {lock ? <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden /> : null}
                       {option.label}
                     </span>
                     <span className="mt-1 block text-xs opacity-80">
-                      {locked
-                        ? (openMarketCountdown ?? "Fechado até a sessão forex")
+                      {lock
+                        ? lock.reason === "maintenance"
+                          ? OPEN_MARKET_MAINTENANCE_SHORT
+                          : (openMarketCountdown ?? "Fechado até a sessão forex")
                         : option.description}
                     </span>
                   </button>
+                );
+                if (!lock) return optionButton;
+                return (
+                  <MarketModeLockPopover key={option.value} lock={lock}>
+                    {optionButton}
+                  </MarketModeLockPopover>
                 );
               })}
             </div>
@@ -368,14 +406,13 @@ export function StartOperationDialog({
             <MoneyInput
               label="Valor por entrada"
               currency={accountCurrency}
-              min={ENTRY_VALUE_MIN}
-              max={ENTRY_VALUE_MAX}
+              min={entryLimitsForCurrency(accountCurrency).min}
               step={ENTRY_VALUE_STEP}
               value={draft.entryValue}
               disabled={starting}
-              helperText="Mínimo R$ 5"
+              helperText={entryValueHelperText(accountCurrency)}
               onChange={(value) => {
-                const parsed = parseEntryValueInput(value, draft.entryValue);
+                const parsed = parseEntryValueInput(value, draft.entryValue, accountCurrency);
                 if (parsed == null) return;
                 patchDraft({ entryValue: parsed });
               }}
@@ -598,7 +635,7 @@ function StopField({
           step="any"
           value={moneyValue}
           disabled={disabled}
-          helperText="Mínimo R$ 5"
+          helperText={`Mínimo ${formatBullExBalance(STOP_MONEY_MIN, currency)}`}
           onChange={onMoneyChange}
         />
       ) : (

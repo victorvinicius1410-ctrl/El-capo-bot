@@ -57,6 +57,14 @@ Ao atingir o stop:
 2. Worker pausa (`pause_by_stop` / `ROBOT_PAUSED_BY_STOP`)
 3. Overlay mostra a mensagem de stop; o robô fica parado (`enabled=false`)
 
+**Atenção (mode=external, 2026-08-13):** o pause acontece no
+`robot-runtime` (Redis + persistência). A memória do `backend-gateway`
+podia ficar com `enabled=true` fantasma — o painel parecia parado, mas
+`POST /robot/config` respondia "Pare o robô antes de alterar
+configurações.". Corrigido por
+`reconcile_gateway_enabled_from_runtime_snapshot`. Ver
+[`INICIAR_PARAR_OPERACAO.md`](./INICIAR_PARAR_OPERACAO.md).
+
 ### Como religar depois do stop
 
 1. Clique em **Reiniciar placar** (`POST /robot/reset-score`) — zera
@@ -119,6 +127,9 @@ modo correspondente é `money`.
 
 ## Histórico
 
+- **2026-08-13 (reiniciar placar em mode=external)** — Snapshot Redis + cmd
+  `reset_score` ao runtime + cache do painel; evita placar “voltar” após
+  o clique. Ver `REINICIAR_PLACAR.md`.
 - **2026-08-07 (noite+ — Confirmar e iniciar)** — Start com saldo
   desconhecido (`balance=None` / sessão Bullex morta) deixa de fingir
   `INSUFFICIENT_BALANCE` e pede reconexão (`BULLEX_NOT_CONNECTED`). Botão

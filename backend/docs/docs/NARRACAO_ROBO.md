@@ -197,6 +197,7 @@ Valores restaurados ao comportamento original (não alterar):
 | Constante | Valor | Por quê |
 |---|---|---|
 | `result_display_until` | **5s** | Bloqueia `prepare_cycle`; esticar atrasa a análise na vela |
+| Overlay WIN/LOSS + ativo | **60s** | Só UI (`RESULT_OVERLAY_DISPLAY_MS`); não bloqueia o ciclo |
 | `acknowledge_unseen_result(hold_seconds)` | **8s** | Só overlay de tela fechada |
 | `unseen_result` no fechamento | só com painel **offline** | Online, o payload não deve mascarar o ciclo |
 

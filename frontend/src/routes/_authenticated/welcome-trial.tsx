@@ -1,7 +1,14 @@
 ﻿import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { CheckCircle2, Sparkles } from "lucide-react";
-import { initTrial, TRIAL_DAYS, TRIAL_DISCOUNT } from "@/lib/trial";
+import { ApiError, getMyAccess } from "@/lib/api";
+import {
+  initTrial,
+  remainingDaysFromExpiresAt,
+  TRIAL_DAYS,
+  TRIAL_DISCOUNT,
+} from "@/lib/trial";
 
 export const Route = createFileRoute("/_authenticated/welcome-trial")({
   ssr: false,
@@ -11,10 +18,23 @@ export const Route = createFileRoute("/_authenticated/welcome-trial")({
 
 function WelcomeTrial() {
   const navigate = useNavigate();
+  const access = useQuery({
+    queryKey: ["me", "access"],
+    queryFn: async () => {
+      const response = await getMyAccess();
+      if (!response.ok) throw new ApiError(response.error, response.code, response.status);
+      return response.data;
+    },
+  });
 
   useEffect(() => {
     initTrial();
   }, []);
+
+  const trialDays =
+    access.data?.expires_at != null
+      ? remainingDaysFromExpiresAt(access.data.expires_at)
+      : TRIAL_DAYS;
 
   return (
     <div className="min-h-[70vh] flex items-center justify-center">
@@ -24,7 +44,7 @@ function WelcomeTrial() {
         </div>
         <h1 className="mb-2 text-2xl font-bold">Seu teste gratis comecou!</h1>
         <p className="mb-6 text-muted-foreground">
-          Voce tem <strong>{TRIAL_DAYS} dias</strong> de acesso total ao ElCapo AutoBot, sem
+          Voce tem <strong>{trialDays} dias</strong> de acesso total ao ElCapo AutoBot, sem
           compromisso.
         </p>
 

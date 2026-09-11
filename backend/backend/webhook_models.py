@@ -12,6 +12,7 @@ class DomainEventType(StrEnum):
     """Eventos públicos e versionados disponíveis para assinatura."""
 
     PURCHASE_COMPLETED = "purchase.completed"
+    PURCHASE_EXISTING_ACCOUNT = "purchase.existing_account"
     SUBSCRIPTION_CANCELED = "subscription.canceled"
     SUBSCRIPTION_RENEWED = "subscription.renewed"
     PAYMENT_REFUNDED = "payment.refunded"

@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { DashboardDateFilter } from "@/components/DashboardDateFilter";
+import { formatBrasiliaDate, formatBrasiliaDateTime } from "@/lib/brasiliaTime";
+import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
 import {
   ADMIN_FIELD_CLASS,
   AdminFormActions,
@@ -120,6 +122,9 @@ function AdminFinancePage() {
 
 function FinanceDashboard() {
   const [days, setDays] = useState(30);
+  const [range, setRange] = useState<DateRangeValue>(() =>
+    rangeFromPreset("last_30", new Date(), 365),
+  );
   const metrics = useQuery({
     queryKey: ["admin", "finance", "metrics", days],
     queryFn: async () => {
@@ -140,7 +145,16 @@ function FinanceDashboard() {
             Valores confirmados no período selecionado.
           </p>
         </div>
-        <DashboardDateFilter days={days} onChange={setDays} isFetching={metrics.isFetching} />
+        <DashboardDateFilter
+          days={days}
+          value={range}
+          maxDays={365}
+          onChange={(nextDays, nextRange) => {
+            setDays(nextDays);
+            setRange(nextRange);
+          }}
+          isFetching={metrics.isFetching}
+        />
       </div>
 
       {metrics.isLoading ? (
@@ -998,14 +1012,12 @@ function formatPercent(value: number) {
 
 function formatDate(value: string) {
   if (!value) return "—";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleDateString("pt-BR");
+  return formatBrasiliaDate(value) || value;
 }
 
 function formatDateTime(value: string | null) {
   if (!value) return "Ainda não registrado";
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("pt-BR");
+  return formatBrasiliaDateTime(value) || value;
 }
 
 function humanize(value: string) {

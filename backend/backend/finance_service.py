@@ -7,7 +7,7 @@ import logging
 import re
 import uuid
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse
@@ -19,6 +19,7 @@ from backend.admin_models import (
     AdminPermission,
     PaymentStatus,
 )
+from backend.brasilia_time import brasilia_today, history_cutoff, to_brasilia_date
 from backend.cakto_service import CaktoService
 from backend.finance_models import (
     BillingPlan,
@@ -68,6 +69,33 @@ OUTGOING_EVENT_MAP = {
     "subscription_renewed": DomainEventType.SUBSCRIPTION_RENEWED,
     "subscription_renewal_refused": DomainEventType.SUBSCRIPTION_PAYMENT_FAILED,
 }
+
+
+def resolve_outgoing_event_type(
+    event_name: str,
+    *,
+    first_access_url: str | None,
+) -> DomainEventType | None:
+    """
+    Escolhe o evento de e-mail/webhook a partir do fato Cakto.
+
+    Compra aprovada com link de 1º acesso (conta nova) usa
+    ``purchase.completed``. Compra de quem já tinha perfil usa
+    ``purchase.existing_account``. Renovação continua em
+    ``subscription.renewed``.
+
+    Args:
+        event_name: Nome normalizado do evento Cakto.
+        first_access_url: Link de definição de senha, se a conta foi criada agora.
+
+    Returns:
+        Tipo canônico ou None quando o evento não gera e-mail/webhook.
+    """
+    if event_name == "purchase_approved":
+        if str(first_access_url or "").strip():
+            return DomainEventType.PURCHASE_COMPLETED
+        return DomainEventType.PURCHASE_EXISTING_ACCOUNT
+    return OUTGOING_EVENT_MAP.get(event_name)
 
 
 class FinanceError(Exception):
@@ -294,6 +322,7 @@ class FinanceService:
         occurred_at = _event_datetime(data, payload)
         provider_reference = _provider_reference(data)
         subscription_reference = _subscription_reference(data)
+        currency, amount = _validated_event_monetary(data)
         customer_email = _customer_email(data)
         customer = (
             await self.repository.find_customer_by_email(plan.company_id, customer_email)
@@ -339,6 +368,12 @@ class FinanceService:
                 )
                 raise FinanceValidationError("PURCHASE_ACCOUNT_PROVISIONING_FAILED") from exc
             first_access_url = account_link.action_link
+            await self._ensure_customer_access_from_event(
+                event_name=event_name,
+                company_id=plan.company_id,
+                customer=customer,
+                plan=plan,
+            )
         if customer is None:
             customer = await self.repository.find_customer_by_billing_reference(
                 plan.company_id,
@@ -352,9 +387,6 @@ class FinanceService:
             subscription_reference,
             occurred_at,
         )
-        currency = str(data.get("currency") or "BRL").upper()
-        if currency != "BRL":
-            raise FinanceValidationError("ONLY_BRL_SUPPORTED")
         event = FinanceEvent(
             id=str(uuid.uuid4()),
             company_id=plan.company_id,
@@ -366,7 +398,7 @@ class FinanceService:
             user_id=user_id,
             provider_reference=provider_reference,
             subscription_reference=subscription_reference,
-            amount=_event_amount(data),
+            amount=amount,
             currency=currency,
             occurred_at=occurred_at,
             received_at=datetime.now(timezone.utc),
@@ -380,6 +412,12 @@ class FinanceService:
         )
         inserted = await self.repository.append_event(event)
         if not inserted:
+            await self._ensure_customer_access_from_event(
+                event_name=event_name,
+                company_id=plan.company_id,
+                customer=customer,
+                plan=plan,
+            )
             await self._emit_outgoing_event(
                 event,
                 plan,
@@ -394,18 +432,12 @@ class FinanceService:
                 event_name=event_name,
             )
 
-        if customer:
-            access_rule = _access_rule(event_name)
-            if access_rule is not None:
-                payment_status, grant_access = access_rule
-                if _customer_can_be_changed(customer, grants_access=grant_access):
-                    await self.repository.apply_customer_access(
-                        plan.company_id,
-                        user_id,
-                        payment_status=payment_status,
-                        grant_access=grant_access,
-                        plan=plan,
-                    )
+        await self._ensure_customer_access_from_event(
+            event_name=event_name,
+            company_id=plan.company_id,
+            customer=customer,
+            plan=plan,
+        )
         if event_name in APPROVED_EVENTS:
             await self.repository.append_revenue_event(event)
         await self.repository.touch_config_state(
@@ -426,6 +458,49 @@ class FinanceService:
             event_name=event_name,
         )
 
+    async def _ensure_customer_access_from_event(
+        self,
+        *,
+        event_name: str,
+        company_id: str,
+        customer: dict[str, Any] | None,
+        plan: BillingPlan,
+    ) -> None:
+        """
+        Aplica regra de acesso do evento quando permitido.
+
+        Chamado logo após provisionar conta nova (antes do ledger) para evitar
+        perfil inativo quando ``append_event`` ou passos posteriores falham, e
+        também em reprocessamentos idempotentes que chegam com o cliente ainda
+        pendente.
+        """
+        if customer is None:
+            return
+        access_rule = _access_rule(event_name)
+        if access_rule is None:
+            return
+        payment_status, grant_access = access_rule
+        user_id = str(customer.get("user_id") or "")
+        if not user_id:
+            return
+        if not _customer_can_be_changed(customer, grants_access=grant_access):
+            return
+        if _is_regressive_pending_transition(
+            customer,
+            payment_status=payment_status,
+            grant_access=grant_access,
+        ):
+            return
+        await self.repository.apply_customer_access(
+            company_id,
+            user_id,
+            payment_status=payment_status,
+            grant_access=grant_access,
+            plan=plan,
+        )
+        customer["payment_status"] = payment_status
+        customer["grant_access"] = grant_access
+
     async def _emit_outgoing_event(
         self,
         event: FinanceEvent,
@@ -436,7 +511,10 @@ class FinanceService:
         first_access_url: str | None,
     ) -> None:
         """Registra e agenda o evento público sem expor segredos em logs."""
-        event_type = OUTGOING_EVENT_MAP.get(event.event_name)
+        event_type = resolve_outgoing_event_type(
+            event.event_name,
+            first_access_url=first_access_url,
+        )
         if self.webhooks is None or event_type is None:
             return
         data: dict[str, Any] = {
@@ -487,7 +565,7 @@ class FinanceService:
         if not 1 <= days <= 3660:
             raise FinanceValidationError("INVALID_METRICS_PERIOD")
         end_at = datetime.now(timezone.utc)
-        start_at = end_at - timedelta(days=days)
+        start_at = history_cutoff(days, end_at)
         events = await self.repository.list_events(
             actor.company_id,
             start_at=start_at,
@@ -818,6 +896,22 @@ def _provider_event_key(
     return hashlib.sha256(stable.encode()).hexdigest()
 
 
+def _validated_event_monetary(data: dict[str, Any]) -> tuple[str, Decimal]:
+    """
+    Valida moeda e valor antes de efeitos colaterais irreversíveis (Auth/perfil).
+
+    Returns:
+        Tupla ``(currency, amount)`` normalizada.
+
+    Raises:
+        FinanceValidationError: Moeda não suportada ou valor inválido.
+    """
+    currency = str(data.get("currency") or "BRL").upper()
+    if currency != "BRL":
+        raise FinanceValidationError("ONLY_BRL_SUPPORTED")
+    return currency, _event_amount(data)
+
+
 def _event_amount(data: dict[str, Any]) -> Decimal:
     """Normaliza valor monetário para Decimal."""
     value = data.get("amount") or data.get("price") or 0
@@ -850,7 +944,15 @@ def _event_status(event_name: str) -> FinanceEventStatus:
 
 
 def _access_rule(event_name: str) -> tuple[PaymentStatus, bool] | None:
-    """Retorna transição conservadora de pagamento e acesso."""
+    """
+    Retorna transição conservadora de pagamento e acesso.
+
+    ``subscription_created`` NÃO altera acesso: na Cakto ele costuma chegar
+    milissegundos depois de ``purchase_approved``. Tratar como ``pending``
+    rebaixava clientes já pagos para \"Ainda não pagou\" e revogava
+    ``grant_access`` — enquanto a notificação de venda (ledger/outbox) já
+    tinha sido emitida pelo evento aprovado.
+    """
     if event_name in APPROVED_EVENTS:
         return PaymentStatus.PAID, True
     if event_name == "refund":
@@ -861,9 +963,39 @@ def _access_rule(event_name: str) -> tuple[PaymentStatus, bool] | None:
         return PaymentStatus.CANCELED, False
     if event_name in {"purchase_refused", "subscription_renewal_refused"}:
         return PaymentStatus.REFUSED, False
-    if event_name in GENERATED_EVENTS or event_name == "subscription_created":
+    if event_name in GENERATED_EVENTS:
         return PaymentStatus.PENDING, False
     return None
+
+
+def _payment_status_value(customer: dict[str, Any]) -> str:
+    """Normaliza ``payment_status`` do perfil para string comparável."""
+    status = customer.get("payment_status")
+    if isinstance(status, PaymentStatus):
+        return status.value
+    return str(status or "")
+
+
+def _is_regressive_pending_transition(
+    customer: dict[str, Any],
+    *,
+    payment_status: PaymentStatus,
+    grant_access: bool,
+) -> bool:
+    """
+    Bloqueia rebaixamento de cliente já pago por eventos soft (ex.: pix_gerado).
+
+    Args:
+        customer: Perfil atual.
+        payment_status: Status proposto pela regra do evento.
+        grant_access: Acesso proposto pela regra do evento.
+
+    Returns:
+        True se a transição deve ser ignorada (regressiva).
+    """
+    if grant_access or payment_status != PaymentStatus.PENDING:
+        return False
+    return _payment_status_value(customer) == PaymentStatus.PAID.value
 
 
 def _customer_can_be_changed(customer: dict[str, Any], *, grants_access: bool) -> bool:
@@ -891,9 +1023,11 @@ def _customer_can_be_changed(customer: dict[str, Any], *, grants_access: bool) -
         return False
     if grants_access:
         return True
-    status = customer.get("payment_status")
-    status_value = status.value if isinstance(status, PaymentStatus) else str(status or "")
-    return status_value not in {PaymentStatus.NOT_REQUIRED.value, PaymentStatus.NOT_APPLICABLE.value}
+    status_value = _payment_status_value(customer)
+    return status_value not in {
+        PaymentStatus.NOT_REQUIRED.value,
+        PaymentStatus.NOT_APPLICABLE.value,
+    }
 
 
 def _calculate_metrics(
@@ -947,7 +1081,7 @@ def _calculate_metrics(
         }
     )
     for event in events:
-        day = event.occurred_at.astimezone(timezone.utc).date().isoformat()
+        day = to_brasilia_date(event.occurred_at).isoformat()
         if event.status == FinanceEventStatus.APPROVED:
             daily[day]["gross_revenue"] += event.amount  # type: ignore[operator]
             daily[day]["approved_payments"] += 1  # type: ignore[operator]
@@ -959,7 +1093,7 @@ def _calculate_metrics(
             daily[day]["refused_payments"] += 1  # type: ignore[operator]
     return {
         "currency": "BRL",
-        "period_days": max(1, (end_at.date() - start_at.date()).days),
+        "period_days": max(1, (brasilia_today(end_at) - to_brasilia_date(start_at)).days + 1),
         "period_start": _iso(start_at),
         "period_end": _iso(end_at),
         "period": {"start_at": _iso(start_at), "end_at": _iso(end_at)},

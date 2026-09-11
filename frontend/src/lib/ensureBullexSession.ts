@@ -23,6 +23,8 @@ export interface EnsureBullexSessionInput {
   connected: boolean;
   /** Há email/senha criptografados no servidor. */
   credentialsSaved: boolean;
+  /** Robô ligado — só então a sessão é condição para operar. */
+  robotEnabled: boolean;
   /** Já tentamos reconectar nesta visita (evita loop). */
   alreadyAttempted: boolean;
   /** Login/reconnect já em andamento (UI). */
@@ -33,12 +35,21 @@ export interface EnsureBullexSessionInput {
 
 /**
  * Retorna true quando devemos chamar POST /bullex/reconnect automaticamente.
+ *
+ * Espelha `panel_auto_reconnect_allowed` no gateway. O servidor é a
+ * autoridade (recusa com `[BULLEX_RECONNECT_BLOCKED]`), mas checar aqui
+ * também evita que o painel mostre "Reconectando..." e depois um erro para
+ * quem só abriu a página com o robô desligado.
  */
 export function shouldAutoReconnectBullex(input: EnsureBullexSessionInput): boolean {
   if (isManualBullexDisconnectActive()) return false;
   if (input.stillLoading) return false;
   if (input.connected) return false;
   if (!input.credentialsSaved) return false;
+  // Abrir a página não pode logar na corretora. Só o robô ligado justifica
+  // reconexão sem clique: aí a queda foi da corretora e ele precisa da sessão
+  // para operar. Relato do dono em 09/08 e 10/08 — ver PanelAutoReconnectTests.
+  if (!input.robotEnabled) return false;
   if (input.alreadyAttempted) return false;
   if (input.pendingConnect) return false;
   return true;

@@ -4,7 +4,7 @@ Use este documento como **prompt completo** em qualquer IA (ChatGPT, Claude, Cur
 para ela criar/refinar os e-mails do painel **Admin → E-mails**.
 
 Cole o bloco abaixo (ou o arquivo inteiro) e peça:  
-**“Gere os 9 templates seguindo este brief.”**
+**“Gere os 10 templates seguindo este brief.”**
 
 ---
 
@@ -78,17 +78,24 @@ Eu vou colar o resultado no Admin → E-mails do ElCapo (campos Assunto e HTML).
    - 1 ação principal (CTA) quando fizer sentido
    - rodapé: “Este e-mail foi enviado automaticamente. Não compartilhe links de acesso.”
 
-### Os 9 eventos (gere todos)
+### Os 10 eventos (gere todos)
 
-1) purchase.completed — Compra / boas-vindas
-   Objetivo: confirmar pagamento e dar acesso ao painel.
-   Variáveis fortes: customer_name, plan_name, amount, currency, first_access_url, login_url
-   CTA: definir senha ({{first_access_url}}) e/ou entrar ({{login_url}})
-   Assunto exemplo de referência: "Bem-vindo ao ElCapo AutoBot"
+1) purchase.completed — Compra / boas-vindas (conta nova)
+   Objetivo: confirmar pagamento e dar primeiro acesso (definir senha).
+   Variáveis fortes: customer_name, plan_name, amount, currency, first_access_url, first_access_block, login_url
+   CTA: definir senha ({{first_access_url}}) e entrar ({{login_url}})
+   Assunto exemplo: "Bem-vindo ao ElCapo AutoBot"
+
+1b) purchase.existing_account — Compra de quem já tinha conta
+   Objetivo: confirmar pagamento sem trocar senha; orientar a entrar com a conta atual.
+   Variáveis: customer_name, plan_name, amount, currency, login_url
+   CTA: {{login_url}} — não usar first_access_url
+   Assunto exemplo: "Compra confirmada — sua conta já está liberada"
 
 2) subscription.renewed — Assinatura renovada
-   Objetivo: confirmar renovação e valor.
+   Objetivo: confirmar renovação e valor; dizer que o acesso continua.
    Variáveis: customer_name, plan_name, amount, currency, login_url
+   CTA: {{login_url}}
 
 3) subscription.canceled — Assinatura cancelada
    Objetivo: informar cancelamento sem drama; oferecer retorno.
@@ -136,8 +143,8 @@ texto do assunto com {{variaveis}} se útil
 ```
 
 No final, entregue um checklist curto:
-- [ ] 9 assuntos
-- [ ] 9 HTMLs completos
+- [ ] 10 assuntos
+- [ ] 10 HTMLs completos
 - [ ] só variáveis oficiais
 - [ ] CTAs corretos por evento
 ```
@@ -152,7 +159,8 @@ No final, entregue um checklist curto:
 4. Cole o **HTML** completo
 5. Marque **Enviar este email** nos que devem sair de verdade
 6. Clique **Salvar**
-7. (Opcional) **Enviar teste** — exige SMTP ligado no servidor
+7. (Opcional) **Enviar teste** — preencha o e-mail de destino e clique em
+   Enviar teste (exige SMTP ligado no servidor)
 
 ## Checklist rápido para você revisar o que a IA gerou
 

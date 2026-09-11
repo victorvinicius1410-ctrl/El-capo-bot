@@ -1,7 +1,24 @@
 import unittest
 
+from backend import signal_engine
 from backend.auto_trader import AutoTrader
 from backend.signal_engine import analyze_signal
+
+_VERTEX_ORIGINAL = signal_engine.VERTEX_ENABLED
+
+
+def setUpModule() -> None:
+    """Desliga a Vertex: aqui se testa a leitura de velas do motor clássico.
+
+    `VERTEX_ENABLED` vem do ambiente na importação; com ela ligada o override
+    devolve WAIT sempre que o indicador não está no extremo, e todo teste de
+    setup clássico falharia por um motivo que não é o dele.
+    """
+    signal_engine.VERTEX_ENABLED = False
+
+
+def tearDownModule() -> None:
+    signal_engine.VERTEX_ENABLED = _VERTEX_ORIGINAL
 
 
 def make_candles(count: int = 40) -> list[dict[str, float]]:
@@ -140,8 +157,14 @@ class CandleAnalysisTests(unittest.TestCase):
         self.assertIn("rsi14", signal["metrics"])
         self.assertIn("price_action_setup", signal["metrics"])
 
-    def test_support_reversal_setup_is_blocked_inside_sr_zone(self) -> None:
-        """Reversão no suporte é lida, mas a zona de nível barra a entrada."""
+    def test_support_reversal_setup_passa_a_regiao_com_rejeicao(self) -> None:
+        """Reversão no suporte é lida E deixa de ser barrada pela própria zona.
+
+        Até 2026-09-09 o ``SR_ZONE`` era veto cego e recusava exatamente este
+        caso: a rejeição confirmada no nível, que é a entrada que a leitura de
+        suporte e resistência existe para produzir. O filtro agora recusa
+        entrada CONTRA o nível e entrada na região sem rejeição — não esta.
+        """
         signal = analyze_signal(
             "EURUSD-OTC",
             make_support_reversal_candles(),
@@ -156,8 +179,8 @@ class CandleAnalysisTests(unittest.TestCase):
         self.assertTrue(signal["level_rejection_confirmed"])
         self.assertTrue(signal["zigzag_reversal"])
         self.assertTrue(signal["in_support_resistance_zone"])
-        self.assertIn("SR_ZONE", signal["blocked_filters"])
-        self.assertFalse(signal["trade_allowed"])
+        self.assertEqual(signal["sr_respect_reason"], "OK_REJEICAO_NO_NIVEL")
+        self.assertNotIn("SR_ZONE", signal["blocked_filters"])
 
     def test_call_into_resistance_without_rejection_is_blocked(self) -> None:
         signal = analyze_signal(

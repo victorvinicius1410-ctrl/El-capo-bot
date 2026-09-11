@@ -1,3 +1,6 @@
+import { formatBullExBalance, normalizeAccountCurrency } from "./bullexConnection.ts";
+import { OPEN_MARKET_UNDER_MAINTENANCE } from "./openMarketMaintenance.ts";
+
 export type RobotTimeframe = "M1" | "M5" | "M15";
 export type RobotMarketMode = "OTC" | "OPEN" | "BOTH";
 /** Como o Stop Win/Loss é avaliado: valor em R$ ou quantidade de WINs/LOSSes. */
@@ -22,14 +25,60 @@ export interface RobotSettings {
   narratorEnabled: boolean;
 }
 
-/** Mínimo operacional: entrada, stop win e stop loss ≥ R$ 5. */
-export const ENTRY_VALUE_MIN = 5;
+/** Mínimo operacional de stop win/loss por valor. */
 export const STOP_MONEY_MIN = 5;
 export const STOP_OPERATIONS_MIN = 1;
 export const STOP_OPERATIONS_MAX = 500;
-export const ENTRY_VALUE_MAX = 1_000;
+/** Entrada em BRL: mínimo R$ 5, sem teto. */
+export const ENTRY_VALUE_MIN_BRL = 5;
+/** Entrada em USD: mínimo US$ 1, sem teto. */
+export const ENTRY_VALUE_MIN_USD = 1;
+export const ENTRY_VALUE_MIN = ENTRY_VALUE_MIN_BRL;
 export const ENTRY_VALUE_STEP = 0.01;
-export const DEFAULT_ENTRY_VALUE = 5;
+export const DEFAULT_ENTRY_VALUE = ENTRY_VALUE_MIN_BRL;
+
+export interface EntryValueLimits {
+  min: number;
+  defaultValue: number;
+}
+
+/**
+ * Mínimo de valor de entrada na moeda do saldo da corretora.
+ *
+ * Args:
+ *   currency: Código da conta conectada (BRL ou USD). Vazio/nulo não assume BRL,
+ *     para não subir US$ 1 para 5 enquanto o snapshot ainda não chegou.
+ *
+ * Returns:
+ *   Mínimo e default (R$ 5 ou US$ 1). Não há máximo.
+ */
+export function entryLimitsForCurrency(currency?: string | null): EntryValueLimits {
+  const raw = String(currency ?? "").trim();
+  if (!raw) {
+    return { min: ENTRY_VALUE_MIN_USD, defaultValue: DEFAULT_ENTRY_VALUE };
+  }
+  if (normalizeAccountCurrency(raw) === "USD") {
+    return { min: ENTRY_VALUE_MIN_USD, defaultValue: ENTRY_VALUE_MIN_USD };
+  }
+  return { min: ENTRY_VALUE_MIN_BRL, defaultValue: ENTRY_VALUE_MIN_BRL };
+}
+
+/**
+ * Garante o mínimo da moeda; valores acima do mínimo são aceitos sem teto.
+ */
+export function clampEntryValueForCurrency(value: number, currency?: string | null): number {
+  const limits = entryLimitsForCurrency(currency);
+  if (!Number.isFinite(value) || value <= 0) return limits.defaultValue;
+  return Math.max(limits.min, value);
+}
+
+/**
+ * Texto de ajuda do campo de entrada, já na moeda da conta.
+ */
+export function entryValueHelperText(currency?: string | null): string {
+  const limits = entryLimitsForCurrency(currency);
+  return `Mínimo ${formatBullExBalance(limits.min, currency)}`;
+}
 
 export const ROBOT_TIMEFRAME_OPTIONS = [
   { value: "M1" as const, label: "1 minuto", description: "Expira em 1m · monitora a cada vela" },
@@ -47,7 +96,7 @@ export const ROBOT_MARKET_MODE_OPTIONS = [
   {
     value: "BOTH" as const,
     label: "Ambos",
-    description: "Opção disponível; as operações são sempre em OTC",
+    description: "Com forex aberto, varre OTC e mercado aberto; com forex fechado, só OTC",
   },
 ];
 
@@ -124,15 +173,20 @@ export function visibleRobotMarketModeOptions(
 }
 
 /**
- * Garante modo selecionável: com forex fechado, OPEN vira OTC.
- * BOTH permanece (backend opera só OTC).
+ * Garante modo selecionável: OPEN vira OTC quando está travado.
+ *
+ * Trava por manutenção (a corretora não oferece opção fora de OTC) ou por
+ * sessão forex fechada. BOTH permanece; com sessão aberta o backend varre
+ * OTC + aberto.
  */
 export function coerceSelectableMarketMode(
   value?: string | null,
   now: Date = new Date(),
 ): RobotMarketMode {
   const normalized = normalizeMarketMode(value);
-  if (normalized === "OPEN" && !isForexOpenMarketAvailable(now)) return "OTC";
+  if (normalized !== "OPEN") return normalized;
+  if (OPEN_MARKET_UNDER_MAINTENANCE) return "OTC";
+  if (!isForexOpenMarketAvailable(now)) return "OTC";
   return normalized;
 }
 
@@ -208,7 +262,7 @@ type RawSettings = Partial<Record<keyof RobotSettings, unknown>> & { g1?: unknow
 export function normalizeRobotSettings(input?: RawSettings | null): RobotSettings {
   const defaults = DEFAULT_ROBOT_SETTINGS;
   return {
-    entryValue: clampNumber(input?.entryValue, defaults.entryValue, ENTRY_VALUE_MIN, ENTRY_VALUE_MAX),
+    entryValue: moneyAtLeast(input?.entryValue, defaults.entryValue, ENTRY_VALUE_MIN_USD),
     stopWin: moneyAtLeast(input?.stopWin, defaults.stopWin, STOP_MONEY_MIN),
     stopLoss: moneyAtLeast(input?.stopLoss, defaults.stopLoss, STOP_MONEY_MIN),
     stopWinMode: normalizeStopMode(input?.stopWinMode as string | undefined),
@@ -272,15 +326,19 @@ export function parseStopOperationsInput(raw: string, fallback: number): number 
 
 /**
  * Interpreta o texto digitado no valor de entrada.
- * Mínimo R$ 5; valores abaixo são elevados ao mínimo.
+ * BRL mínimo R$ 5; USD mínimo US$ 1. Sem teto.
  */
-export function parseEntryValueInput(raw: string, fallback: number): number | null {
+export function parseEntryValueInput(
+  raw: string,
+  fallback: number,
+  currency?: string | null,
+): number | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const parsed = Number(trimmed.replace(",", "."));
   if (!Number.isFinite(parsed)) return null;
   if (parsed <= 0) return fallback;
-  return Math.min(ENTRY_VALUE_MAX, Math.max(ENTRY_VALUE_MIN, parsed));
+  return clampEntryValueForCurrency(parsed, currency);
 }
 
 function positiveNumber(value: unknown, fallback: number): number {
@@ -295,13 +353,6 @@ function moneyAtLeast(value: unknown, fallback: number, minimum: number): number
     return Math.max(minimum, fallback);
   }
   return Math.max(minimum, parsed);
-}
-
-function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
-  if (value == null || value === "") return fallback;
-  const parsed = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return min;
-  return Math.min(max, Math.max(min, parsed));
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
@@ -387,7 +438,7 @@ function pickPresentRobotSettings(input?: RawSettings | null): Partial<RobotSett
   if (!input) return {};
   const present: Partial<RobotSettings> = {};
   if (input.entryValue != null && input.entryValue !== "") {
-    present.entryValue = clampNumber(input.entryValue, DEFAULT_ENTRY_VALUE, ENTRY_VALUE_MIN, ENTRY_VALUE_MAX);
+    present.entryValue = moneyAtLeast(input.entryValue, DEFAULT_ENTRY_VALUE, ENTRY_VALUE_MIN_USD);
   }
   if (input.stopWin != null && input.stopWin !== "") {
     present.stopWin = moneyAtLeast(input.stopWin, DEFAULT_ROBOT_SETTINGS.stopWin, STOP_MONEY_MIN);

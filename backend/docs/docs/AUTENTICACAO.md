@@ -215,6 +215,16 @@ Arquivos: `backend/auth_router.py`, `backend/auth_session_service.py`
 (`extract_refresh_token_from_request`), `Frontend/src/lib/useAuth.ts`,
 `Frontend/src/lib/authSessionKeepAlive.ts`, `Frontend/src/lib/api.ts`.
 
+### Console: `[AUTH_VISIBILITY_REFRESH_ERROR]` / “access control” em `/auth/refresh`
+
+Ao voltar para a aba, o frontend chama `refreshAuthSession(true)`. Se o
+`backend-gateway` estiver reiniciando (deploy), o Nginx devolve **502 sem
+CORS** e o Safari/Chrome rotulam como falha de access control / `Load failed`.
+
+Não é lista de `CORS_ORIGINS` errada. Após `/health` = 200, um reload limpa o
+erro. Ver também `DEPLOY_VPS.md` (janela de 502) e o incidente de email/saldo
+em `BULLEX_CREDENCIAIS.md`.
+
 ### Sintoma antigo (corrigido)
 
 1. Usuário deixa o painel aberto / muda de aba por mais de ~1h.

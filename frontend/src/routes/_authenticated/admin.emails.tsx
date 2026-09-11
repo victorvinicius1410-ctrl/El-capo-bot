@@ -25,12 +25,14 @@ import {
 import {
   EMAIL_EVENT_LABELS,
   EMAIL_TEMPLATE_VARIABLES,
+  emailDeliveryErrorLabel,
   emailDeliveryStatusLabel,
   emailEventLabel,
   renderEmailPreview,
   sampleEmailVariables,
   validateEmailTemplateDraft,
 } from "@/lib/emailPresentation";
+import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
 
 const ALL_EMAIL_EVENTS = Object.keys(EMAIL_EVENT_LABELS) as EmailEventType[];
@@ -70,6 +72,7 @@ function EmailsAdminPage() {
   const [subject, setSubject] = useState("");
   const [htmlBody, setHtmlBody] = useState("");
   const [enabled, setEnabled] = useState(false);
+  const [testRecipient, setTestRecipient] = useState("");
   const [feedback, setFeedback] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -186,12 +189,21 @@ function EmailsAdminPage() {
 
   const testMutation = useMutation({
     mutationFn: async () => {
-      const response = await adminSendTestEmail(selected);
+      const recipient = testRecipient.trim();
+      if (!recipient || !recipient.includes("@")) {
+        throw new ApiError("Informe um e-mail válido para o teste.", "VALIDATION_ERROR", 400);
+      }
+      const response = await adminSendTestEmail(selected, recipient);
       if (!response.ok) throw new ApiError(response.error, response.code, response.status);
-      return response.data;
+      return response.data as { status?: string } | undefined;
     },
-    onSuccess: () => {
-      setFeedback("Email de teste enfileirado para o seu endereço.");
+    onSuccess: (data) => {
+      const status = data?.status ?? "delivered";
+      setFeedback(
+        status === "delivered" || status === "sent"
+          ? `Email de teste enviado para ${testRecipient.trim()}.`
+          : `Email de teste processado (${status}) para ${testRecipient.trim()}.`,
+      );
       setError(null);
       void queryClient.invalidateQueries({ queryKey: ["admin", "emails", "deliveries"] });
     },
@@ -403,41 +415,58 @@ function EmailsAdminPage() {
             )}
 
             {canManage && (
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => saveMutation.mutate()}
-                  disabled={saveMutation.isPending}
-                  className="page-cta inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold"
-                >
-                  {saveMutation.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Save className="h-4 w-4" />
-                  )}
-                  Salvar
-                </button>
-                <button
-                  type="button"
-                  onClick={() => testMutation.mutate()}
-                  disabled={testMutation.isPending || !settings.data?.enabled}
-                  className="inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2 text-sm font-semibold hover:bg-accent"
-                >
-                  {testMutation.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Send className="h-4 w-4" />
-                  )}
-                  Enviar teste
-                </button>
-                <button
-                  type="button"
-                  onClick={() => serverPreview.mutate()}
-                  disabled={serverPreview.isPending}
-                  className="inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2 text-sm font-semibold hover:bg-accent"
-                >
-                  Preview no servidor
-                </button>
+              <div className="space-y-3">
+                <label className="block max-w-md space-y-1.5">
+                  <span className="text-sm font-medium">E-mail para teste</span>
+                  <input
+                    type="email"
+                    value={testRecipient}
+                    onChange={(event) => setTestRecipient(event.target.value)}
+                    placeholder="ex.: voce@empresa.com"
+                    autoComplete="email"
+                    className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm outline-none ring-primary/30 focus:ring-2"
+                  />
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => saveMutation.mutate()}
+                    disabled={saveMutation.isPending}
+                    className="page-cta inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold"
+                  >
+                    {saveMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Save className="h-4 w-4" />
+                    )}
+                    Salvar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => testMutation.mutate()}
+                    disabled={
+                      testMutation.isPending ||
+                      !settings.data?.enabled ||
+                      !testRecipient.trim()
+                    }
+                    className="inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2 text-sm font-semibold hover:bg-accent disabled:opacity-50"
+                  >
+                    {testMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Send className="h-4 w-4" />
+                    )}
+                    Enviar teste
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => serverPreview.mutate()}
+                    disabled={serverPreview.isPending}
+                    className="inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2 text-sm font-semibold hover:bg-accent"
+                  >
+                    Preview no servidor
+                  </button>
+                </div>
               </div>
             )}
 
@@ -529,9 +558,18 @@ function DeliveriesPanel({
             <tr key={item.id} className="border-b border-border/60 last:border-0">
               <td className="px-4 py-3">{emailEventLabel(item.event_type)}</td>
               <td className="px-4 py-3">{item.subject}</td>
-              <td className="px-4 py-3">{emailDeliveryStatusLabel(item.status)}</td>
+              <td className="px-4 py-3">
+                <div className="flex flex-col gap-0.5">
+                  <span>{emailDeliveryStatusLabel(item.status)}</span>
+                  {emailDeliveryErrorLabel(item.last_error_code ?? item.error) ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      {emailDeliveryErrorLabel(item.last_error_code ?? item.error)}
+                    </span>
+                  ) : null}
+                </div>
+              </td>
               <td className="px-4 py-3 text-muted-foreground">
-                {new Date(item.created_at).toLocaleString("pt-BR")}
+                {formatBrasiliaDateTime(item.created_at) || item.created_at}
               </td>
             </tr>
           ))}

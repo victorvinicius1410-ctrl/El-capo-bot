@@ -10,15 +10,26 @@ import {
   TrendingUp,
   UserRoundCheck,
   UserRoundX,
+  Activity,
 } from "lucide-react";
 import { useState } from "react";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import {
   ApiError,
   adminDashboard,
   type AdminDashboardAssetRanking,
+  type AdminDashboardHourlyResult,
   type AdminDashboardUserRanking,
 } from "@/lib/api";
 import { DashboardDateFilter } from "@/components/DashboardDateFilter";
+import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
 
 export const Route = createFileRoute("/_authenticated/admin/dashboard")({
   head: () => ({ meta: [{ title: "Dashboard — Administração ElCapo" }] }),
@@ -27,6 +38,9 @@ export const Route = createFileRoute("/_authenticated/admin/dashboard")({
 
 function AdminDashboardPage() {
   const [days, setDays] = useState(30);
+  const [range, setRange] = useState<DateRangeValue>(() =>
+    rangeFromPreset("last_30", new Date(), 365),
+  );
   const dashboard = useQuery({
     queryKey: ["admin", "dashboard", days],
     queryFn: async () => {
@@ -46,7 +60,16 @@ function AdminDashboardPage() {
             Visão consolidada dos clientes e das operações reais no período.
           </p>
         </div>
-        <DashboardDateFilter days={days} onChange={setDays} isFetching={dashboard.isFetching} />
+        <DashboardDateFilter
+          days={days}
+          value={range}
+          maxDays={365}
+          onChange={(nextDays, nextRange) => {
+            setDays(nextDays);
+            setRange(nextRange);
+          }}
+          isFetching={dashboard.isFetching}
+        />
       </header>
 
       {dashboard.isLoading ? (
@@ -92,15 +115,57 @@ function AdminDashboardPage() {
             />
           </section>
 
+          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            <MetricCard
+              label="Win Rate El Capo"
+              value={formatPercent(dashboard.data.operations.win_rate)}
+              detail={`${dashboard.data.operations.total} operações reais no período`}
+              Icon={Activity}
+              tone={
+                dashboard.data.operations.win_rate >= 50
+                  ? "positive"
+                  : dashboard.data.operations.total
+                    ? "negative"
+                    : "neutral"
+              }
+            />
+            <MetricCard
+              label="Wins"
+              value={String(dashboard.data.operations.wins)}
+              Icon={ArrowUpRight}
+              tone="positive"
+            />
+            <MetricCard
+              label="Loss"
+              value={String(dashboard.data.operations.losses)}
+              Icon={ArrowDownRight}
+              tone="negative"
+            />
+            <MetricCard
+              label="Operações"
+              value={String(dashboard.data.operations.total)}
+              Icon={Target}
+              tone="neutral"
+            />
+            <MetricCard
+              label="Lucro das operações"
+              value={formatMoney(dashboard.data.operations.profit)}
+              Icon={TrendingUp}
+              tone={dashboard.data.operations.profit < 0 ? "negative" : "positive"}
+            />
+          </section>
+
+          <HourlyResultsPanel items={dashboard.data.hourly_results} />
+
           <section className="grid gap-4 xl:grid-cols-2">
             <UserRanking
-              title="Maiores ganhadores"
+              title="Top 10 ganhadores"
               items={dashboard.data.top_winners}
               Icon={ArrowUpRight}
               positive
             />
             <UserRanking
-              title="Quem mais perdeu"
+              title="Top 10 perdedores"
               items={dashboard.data.top_losers}
               Icon={ArrowDownRight}
             />
@@ -172,7 +237,7 @@ function UserRanking({
         <Icon className={`h-5 w-5 ${positive ? "text-emerald-400" : "text-rose-400"}`} />
         {title}
       </h2>
-      <div className="mt-4 space-y-2">
+      <div className="mt-4 max-h-[32rem] space-y-2 overflow-y-auto pr-1">
         {items.length ? (
           items.map((item, index) => (
             <div
@@ -248,6 +313,74 @@ function EmptyRanking() {
     <p className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
       Sem operações reais concluídas neste período.
     </p>
+  );
+}
+
+function HourlyResultsPanel({ items }: { items: AdminDashboardHourlyResult[] }) {
+  const maxOperations = Math.max(...items.map((row) => row.operations), 1);
+  const hasOperations = items.some((row) => row.operations > 0);
+
+  return (
+    <article className="page-surface overflow-hidden p-5">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="font-semibold">Resultados por horário</h2>
+          <p className="text-xs text-muted-foreground">
+            Distribuição das operações reais nas 24 horas do dia (horário de Brasília) no
+            período selecionado.
+          </p>
+        </div>
+        <p className="text-xs text-muted-foreground">Fuso: Brasília (UTC−3)</p>
+      </div>
+
+      {!hasOperations ? (
+        <div className="mt-4">
+          <EmptyRanking />
+        </div>
+      ) : (
+        <div className="mt-4 overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Horário</TableHead>
+                <TableHead>Operações</TableHead>
+                <TableHead>Wins</TableHead>
+                <TableHead>Loss</TableHead>
+                <TableHead>Win Rate</TableHead>
+                <TableHead>Lucro</TableHead>
+                <TableHead className="w-[140px]">Volume</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {items.map((row) => (
+                <TableRow key={row.hour} className={row.operations === 0 ? "opacity-45" : undefined}>
+                  <TableCell className="font-medium">{row.hour_label}</TableCell>
+                  <TableCell>{row.operations}</TableCell>
+                  <TableCell className="font-semibold text-emerald-400">{row.wins}</TableCell>
+                  <TableCell className="font-semibold text-rose-400">{row.losses}</TableCell>
+                  <TableCell>{row.operations ? formatPercent(row.win_rate) : "-"}</TableCell>
+                  <TableCell
+                    className={`font-semibold ${
+                      row.profit < 0 ? "text-rose-400" : row.profit > 0 ? "text-emerald-400" : ""
+                    }`}
+                  >
+                    {row.operations ? formatMoney(row.profit) : "-"}
+                  </TableCell>
+                  <TableCell>
+                    <div className="admin-hour-bar" aria-hidden={row.operations === 0}>
+                      <span
+                        className="admin-hour-bar-fill"
+                        style={{ width: `${(row.operations / maxOperations) * 100}%` }}
+                      />
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </article>
   );
 }
 

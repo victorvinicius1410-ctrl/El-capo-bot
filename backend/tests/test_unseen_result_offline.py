@@ -80,6 +80,33 @@ class UnseenResultOfflineTests(unittest.TestCase):
         self.assertFalse(cleared.unseen_result)
         self.assertIsNone(cleared.result_client_seen_at)
 
+    def test_to_dict_does_not_refresh_win_forever(self) -> None:
+        trader = AutoTrader()
+        user_id = "user-unseen-expired"
+        state = trader.start(user_id)
+        state.last_trade = {
+            "order_id": "ord-4",
+            "active": "EURUSD-OTC",
+            "direction": "CALL",
+            "amount": 50.0,
+            "result": "PENDING_RESULT",
+        }
+        state.operation_in_progress = True
+        trader.finish_trade(user_id, "ord-4", "LOSS", -50.0)
+
+        state = trader.get(user_id)
+        stale = (utc_now() - timedelta(seconds=61)).isoformat()
+        state.last_trade["finished_at"] = stale
+        state.result_received_at = utc_now() - timedelta(seconds=61)
+        state.result_display_until = utc_now() - timedelta(seconds=1)
+        state.status = STATUS_WAITING_NEXT_CYCLE
+        state.unseen_result = True
+        state.cycle_result = "LOSS"
+
+        payload = state.to_dict()
+        self.assertEqual(payload["status"], STATUS_WAITING_NEXT_CYCLE)
+        self.assertNotEqual(payload["status"], "LOSS")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,8 @@
+import { cleanAnalysisForSpeech } from "./analysisSpeech";
 import { formatMoneyForSpeech } from "./bullexConnection";
 import { humanizeRobotReason } from "./robotPresentation";
 import type { RobotResultVoice, RobotSignal, RobotState, RobotTrade } from "./robotState";
+export { SPEECH_CHUNK_MAX_CHARS, splitSpeechChunks } from "./speechChunks";
 
 const GALE_WIN_SPEECH = "Gale 1 fechou no win. Recuperação concluída.";
 const GALE_LOSS_SPEECH = "Gale 1 fechou no los. Ciclo finalizado. Mantém o gerenciamento.";
@@ -133,25 +135,21 @@ export function buildRobotNarrationEvents(
       text: ROBOT_START_NARRATION_TEXT,
     });
   }
+  // A fala não nomeia a estratégia: era sempre a mesma lista do motor. Leva
+  // só os detalhes da análise (ver `analysisSpeech.ts`).
   if (signal && (status === "SIGNAL_FOUND" || status === "WAITING_ENTRY_WINDOW")) {
-    const strategySpeech = signal.speech_preview
-      ? ` ${sanitizeForSpeech(signal.speech_preview)}`
-      : "";
     events.push({
       key: signalFoundKey(signal),
-      text: `Melhor ativo encontrado. Ativo: ${speakSymbol(signal.symbol)}. Direção: ${speakDirection(signal.direction)}. Confiança: ${speakPercent(signal.confidence)} por cento. Payout: ${speakPercent(signal.payout)} por cento. Valor da entrada: ${speakMoney(state.entry_value)}. Estratégia utilizada: ${strategyLabel(signal)}. Motivo: ${entryReasonForSpeech(signal)}.${strategySpeech} Aguardando janela de entrada.`,
+      text: `Melhor ativo encontrado. Ativo: ${speakSymbol(signal.symbol)}. Direção: ${speakDirection(signal.direction)}. Confiança: ${speakPercent(signal.confidence)} por cento. Payout: ${speakPercent(signal.payout)} por cento. Valor da entrada: ${speakMoney(state.entry_value)}.${analysisSentence(signal)} Aguardando janela de entrada.`,
     });
   }
   if (signal && (status === "WAITING_ENTRY" || status === "WAITING_NEXT_CANDLE_ENTRY")) {
     if (ai?.voiceText) {
       events.push({ key: aiVoiceKey(state, signal), text: sanitizeForSpeech(ai.voiceText) });
     } else {
-      const preview = signal.speech_preview
-        ? ` ${sanitizeForSpeech(signal.speech_preview)}`
-        : "";
       events.push({
         key: statusKey(status, signal, state.cycle_id),
-        text: `Entrada preparada. Ativo: ${speakSymbol(signal.symbol)}. Direção: ${speakDirection(signal.direction)}. Estratégia confirmada: ${strategyLabel(signal)}. Motivo: ${entryReasonForSpeech(signal)}.${preview} Entrada no início da próxima vela.`,
+        text: `Entrada preparada. Ativo: ${speakSymbol(signal.symbol)}. Direção: ${speakDirection(signal.direction)}.${analysisSentence(signal)} Entrada no início da próxima vela.`,
       });
     }
   }
@@ -497,21 +495,26 @@ function speakPercent(value?: number | null): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(0);
 }
 
-function strategyLabel(signal: RobotSignal): string {
-  const strategies = signal.used_strategies?.filter(Boolean) ?? [];
-  if (strategies.length > 0) return strategies.join(", ");
-  return signal.strategy_name?.trim() || "estratégia de maior confluência";
-}
-
-function entryReasonForSpeech(signal: RobotSignal): string {
-  const reason =
-    signal.strategy_summary ||
-    signal.speech_preview ||
-    signal.ai_entry_reason ||
-    signal.strategy_reason ||
-    signal.reason ||
-    "leitura técnica confirmada";
-  return reasonForSpeech(reason);
+/**
+ * Frase " Análise: ..." da entrada, ou vazio quando nenhum texto tem medida.
+ *
+ * Usa o primeiro campo que ainda tenha conteúdo depois da limpeza. Antes, o
+ * `speech_preview` era falado também depois do motivo — quando os dois eram a
+ * mesma narrativa, a análise saía duas vezes seguidas.
+ */
+function analysisSentence(signal: RobotSignal): string {
+  const sources = [
+    signal.strategy_summary,
+    signal.speech_preview,
+    signal.ai_entry_reason,
+    signal.strategy_reason,
+    signal.reason,
+  ];
+  for (const source of sources) {
+    const cleaned = cleanAnalysisForSpeech(source);
+    if (cleaned) return ` Análise: ${reasonForSpeech(cleaned)}.`;
+  }
+  return "";
 }
 
 /**

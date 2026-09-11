@@ -56,15 +56,9 @@ describe("marketingDemoSettings", () => {
     assert.ok(!MARKETING_ASSET_OPTIONS.includes("BTCUSD-OTC" as (typeof MARKETING_ASSET_OPTIONS)[number]));
   });
 
-  it("converte datetime-local local para ISO8601", () => {
+  it("converte datetime-local de Brasília para ISO8601 UTC", () => {
     const iso = localDateTimeInputToIso("2026-07-20T14:30");
-    assert.ok(iso);
-    const parsed = new Date(iso);
-    assert.equal(parsed.getFullYear(), 2026);
-    assert.equal(parsed.getMonth(), 6);
-    assert.equal(parsed.getDate(), 20);
-    assert.equal(parsed.getHours(), 14);
-    assert.equal(parsed.getMinutes(), 30);
+    assert.equal(iso, "2026-07-20T17:30:00.000Z");
   });
 
   it("rejeita datetime-local inválido", () => {
@@ -73,16 +67,16 @@ describe("marketingDemoSettings", () => {
     assert.equal(localDateTimeInputToIso("2026-02-31T10:00"), null);
   });
 
-  it("formata created_at para exibição pt-BR", () => {
+  it("formata created_at para exibição pt-BR em Brasília", () => {
     const formatted = formatMarketingTradeDateTime("2026-07-20T17:30:00.000Z");
-    assert.ok(formatted.includes("20"));
-    assert.ok(formatted.includes("2026"));
+    assert.match(formatted, /20\/07\/2026/);
+    assert.match(formatted, /14:30/);
     assert.equal(formatMarketingTradeDateTime(null), "");
     assert.equal(formatMarketingTradeDateTime("nao-data"), "");
   });
 
-  it("gera valor inicial para datetime-local", () => {
-    const value = toLocalDateTimeInputValue(new Date(2026, 6, 20, 14, 5));
+  it("gera valor inicial para datetime-local em Brasília", () => {
+    const value = toLocalDateTimeInputValue(new Date("2026-07-20T17:05:00.000Z"));
     assert.equal(value, "2026-07-20T14:05");
   });
 });

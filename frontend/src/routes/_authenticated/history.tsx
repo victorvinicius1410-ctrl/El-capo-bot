@@ -13,12 +13,11 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
+import { DashboardDateFilter } from "@/components/DashboardDateFilter";
 import {
-  getEmptyRobotStats,
   ROBOT_HISTORY_QUERY_KEY,
   ROBOT_STATS_QUERY_KEY,
   useRobotHistory,
-  useRobotStats,
   type RobotHistoryDays,
   type RobotHistoryItem,
 } from "@/hooks/useRobotHistory";
@@ -34,36 +33,36 @@ import {
   ApiError,
   marketingDeleteTrade,
 } from "@/lib/api";
-import { ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
+import { applyRobotSessionScoreToCache, ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
 import { useMarketingPanel } from "@/lib/marketingPanelContext";
 import {
   isMarketingSimulationAccount,
   MARKETING_HISTORY_QUERY_KEY,
   MARKETING_STATS_QUERY_KEY,
+  overlayScoreFromTrades,
 } from "@/lib/marketingSimulation";
 import { useAuth } from "@/lib/useAuth";
+import { computeRobotStatsFromItems, filterHistoryByRange } from "@/lib/dashboardDailyStats";
+import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
+import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
 
 export const Route = createFileRoute("/_authenticated/history")({
   head: () => ({ meta: [{ title: "Histórico - ElCapo AutoBot" }] }),
   component: HistoryPage,
 });
 
-const FILTERS: Array<{ days: RobotHistoryDays; label: string }> = [
-  { days: 1, label: "Hoje" },
-  { days: 7, label: "7 dias" },
-  { days: 30, label: "30 dias" },
-];
-
 function HistoryPage() {
   const [days, setDays] = useState<RobotHistoryDays>(1);
+  const [range, setRange] = useState<DateRangeValue>(() =>
+    rangeFromPreset("today", new Date(), 90),
+  );
   const [analysisItem, setAnalysisItem] = useState<RobotHistoryItem | null>(null);
   const history = useRobotHistory(days);
-  const statsQuery = useRobotStats(days);
-  const items = history.data ?? [];
-  const stats = statsQuery.data ?? getEmptyRobotStats();
-  const error = history.error ?? statsQuery.error;
-  const isRefreshing = history.isFetching || statsQuery.isFetching;
+  const items = filterHistoryByRange(history.data ?? [], range.start, range.end);
+  const stats = computeRobotStatsFromItems(items);
+  const error = history.error;
+  const isRefreshing = history.isFetching;
   const { open: marketingPanelOpen } = useMarketingPanel();
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -75,11 +74,20 @@ function HistoryPage() {
     marketingPanelOpen && isMarketingSimulationAccount(access.data);
 
   const deleteTrade = useMutation({
-    mutationFn: async (tradeId: string) => {
-      const response = await marketingDeleteTrade(tradeId);
+    mutationFn: async (payload: { tradeId: string; result?: string; profit?: number }) => {
+      const response = await marketingDeleteTrade(payload.tradeId);
       if (!response.ok) throw new ApiError(response.error, response.code, response.status);
+      return payload;
     },
-    onSuccess: async () => {
+    onSuccess: async (payload) => {
+      if (user?.id) {
+        applyRobotSessionScoreToCache(
+          queryClient,
+          user.id,
+          overlayScoreFromTrades([{ result: payload.result, profit: payload.profit }]),
+          { subtract: true },
+        );
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ROBOT_HISTORY_QUERY_KEY }),
         queryClient.invalidateQueries({ queryKey: ROBOT_STATS_QUERY_KEY }),
@@ -108,21 +116,16 @@ function HistoryPage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {FILTERS.map((filter) => (
-            <button
-              key={filter.days}
-              type="button"
-              onClick={() => setDays(filter.days)}
-              className={`rounded-lg border px-4 py-2 text-sm font-medium transition ${
-                days === filter.days
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "border-border bg-card hover:bg-accent"
-              }`}
-            >
-              {filter.label}
-            </button>
-          ))}
-          {isRefreshing ? <Loader2 className="ml-1 h-4 w-4 animate-spin text-primary" /> : null}
+          <DashboardDateFilter
+            days={days}
+            value={range}
+            maxDays={90}
+            onChange={(nextDays, nextRange) => {
+              setDays(nextDays);
+              setRange(nextRange);
+            }}
+            isFetching={isRefreshing}
+          />
         </div>
       </header>
 
@@ -203,7 +206,11 @@ function HistoryPage() {
                       return;
                     }
                     if (window.confirm("Excluir esta operação do histórico?")) {
-                      deleteTrade.mutate(tradeId);
+                      deleteTrade.mutate({
+                        tradeId,
+                        result: item.result,
+                        profit: item.profit,
+                      });
                     }
                   }}
                 />
@@ -266,7 +273,14 @@ function HistoryRow({
   onOpenAnalysis: () => void;
 }) {
   const isWin = item.result === "WIN";
-  const resultClass = isWin ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground";
+  // Empate tem rotulo proprio: pintado como os demais nao-WIN ele parecia
+  // derrota, e o cliente cobrava uma perda que nao existiu.
+  const isDraw = item.result === "DRAW";
+  const resultClass = isWin
+    ? "bg-primary/15 text-primary"
+    : isDraw
+      ? "bg-muted text-foreground"
+      : "bg-muted text-muted-foreground";
   const directionClass = item.direction === "CALL" ? "text-primary" : "text-muted-foreground";
   const galeClass =
     item.badge === "NORMAL"
@@ -317,7 +331,7 @@ function HistoryRow({
       <TableCell>{formatMoney(item.amount)}</TableCell>
       <TableCell>
         <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ${resultClass}`}>
-          {item.result}
+          {isDraw ? "EMPATE" : item.result}
         </span>
       </TableCell>
       <TableCell className={`font-semibold ${isWin ? "text-primary" : "text-muted-foreground"}`}>
@@ -437,10 +451,7 @@ function formatDate(value: string | null) {
   if (!value) return "-";
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return "-";
-  return new Intl.DateTimeFormat("pt-BR", {
-    dateStyle: "short",
-    timeStyle: "short",
-  }).format(parsed);
+  return formatBrasiliaDateTime(parsed);
 }
 
 function formatMoney(value: number) {

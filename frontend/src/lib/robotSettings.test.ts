@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it, beforeEach } from "node:test";
 import {
   DEFAULT_ENTRY_VALUE,
-  ENTRY_VALUE_MAX,
   ENTRY_VALUE_MIN,
+  ENTRY_VALUE_MIN_USD,
   STOP_MONEY_MIN,
   STOP_OPERATIONS_MIN,
+  clampEntryValueForCurrency,
   coerceSelectableMarketMode,
   formatForexOpenCountdown,
   getRobotSettingsSnapshot,
@@ -22,6 +23,7 @@ import {
   setRobotSettingsForUser,
   visibleRobotMarketModeOptions,
 } from "./robotSettings.ts";
+import { OPEN_MARKET_UNDER_MAINTENANCE } from "./openMarketMaintenance.ts";
 
 describe("robotSettings money parsing", () => {
   it("exige mínimo de 5 em stop win/loss", () => {
@@ -43,32 +45,62 @@ describe("robotSettings money parsing", () => {
     assert.equal(parseStopMoneyInput("abc", 50), null);
   });
 
-  it("exige mínimo de 5 no valor de entrada", () => {
+  it("exige mínimo de 5 no valor de entrada em BRL, sem teto", () => {
     assert.equal(ENTRY_VALUE_MIN, 5);
     assert.equal(DEFAULT_ENTRY_VALUE, 5);
-    assert.equal(parseEntryValueInput("5", 5), 5);
-    assert.equal(parseEntryValueInput("5.01", 5), 5.01);
-    assert.equal(parseEntryValueInput("4.99", 5), 5);
-    assert.equal(parseEntryValueInput("1", 5), 5);
+    assert.equal(parseEntryValueInput("5", 5, "BRL"), 5);
+    assert.equal(parseEntryValueInput("4.99", 5, "BRL"), 5);
+    assert.equal(parseEntryValueInput("1", 5, "BRL"), 5);
+    assert.equal(parseEntryValueInput("6", 5, "BRL"), 6);
+    assert.equal(parseEntryValueInput("250", 5, "BRL"), 250);
     assert.equal(normalizeRobotSettings({ entryValue: 5 }).entryValue, 5);
-    assert.equal(normalizeRobotSettings({ entryValue: 1 }).entryValue, ENTRY_VALUE_MIN);
+    assert.equal(normalizeRobotSettings({ entryValue: 80 }).entryValue, 80);
   });
 
   it("bloqueia valor de entrada zero ou negativo", () => {
-    assert.equal(parseEntryValueInput("0", 5), 5);
-    assert.equal(parseEntryValueInput("-1", 5), 5);
-    assert.equal(normalizeRobotSettings({ entryValue: 0 }).entryValue, ENTRY_VALUE_MIN);
-    assert.equal(normalizeRobotSettings({ entryValue: -5 }).entryValue, ENTRY_VALUE_MIN);
+    assert.equal(parseEntryValueInput("0", 5, "BRL"), 5);
+    assert.equal(parseEntryValueInput("-1", 5, "BRL"), 5);
+    assert.equal(normalizeRobotSettings({ entryValue: 0 }).entryValue, DEFAULT_ENTRY_VALUE);
+    assert.equal(normalizeRobotSettings({ entryValue: -5 }).entryValue, DEFAULT_ENTRY_VALUE);
   });
 
-  it("respeita o teto máximo da entrada", () => {
-    assert.equal(parseEntryValueInput(String(ENTRY_VALUE_MAX + 1), 5), ENTRY_VALUE_MAX);
-    assert.equal(normalizeRobotSettings({ entryValue: ENTRY_VALUE_MAX + 50 }).entryValue, ENTRY_VALUE_MAX);
+  it("usa mínimo de 1 dólar quando o saldo está em USD, sem teto", () => {
+    assert.equal(parseEntryValueInput("1", 1, "USD"), 1);
+    assert.equal(parseEntryValueInput("0.5", 1, "USD"), 1);
+    assert.equal(parseEntryValueInput("2", 1, "USD"), 2);
+    assert.equal(clampEntryValueForCurrency(5, "USD"), 5);
+    assert.equal(clampEntryValueForCurrency(1, "BRL"), 5);
+    assert.equal(normalizeRobotSettings({ entryValue: 1 }).entryValue, 1);
+    assert.equal(ENTRY_VALUE_MIN_USD, 1);
+  });
+
+  it("não sobe US$ 1 para 5 quando a moeda ainda é desconhecida", () => {
+    assert.equal(clampEntryValueForCurrency(1, null), 1);
+    assert.equal(clampEntryValueForCurrency(1, undefined), 1);
+    assert.equal(parseEntryValueInput("1", 5), 1);
   });
 
   it("permite string vazia durante a digitação sem resetar para o default", () => {
     assert.equal(parseStopMoneyInput("", 50), null);
     assert.equal(parseEntryValueInput("", 5), null);
+  });
+});
+
+describe("robotSettings preserva entrada de 1 dólar", () => {
+  beforeEach(() => {
+    resetRobotSettingsState();
+  });
+
+  it("setRobotSettingsForUser não sobe 1 para 5", () => {
+    setRobotSettingsForUser("u-usd", { entryValue: 1 });
+    assert.equal(getRobotSettingsSnapshot("u-usd").entryValue, 1);
+  });
+
+  it("hidratação do backend preserva entry_value 1", () => {
+    setRobotSettingsForUser("u-usd", { entryValue: 1 });
+    markRobotSettingsSynced("u-usd", { entryValue: 1 });
+    rememberRobotSettingsFromState("u-usd", { entryValue: 1 });
+    assert.equal(getRobotSettingsSnapshot("u-usd").entryValue, 1);
   });
 });
 
@@ -102,7 +134,7 @@ describe("rememberRobotSettingsFromState preserva escolha do usuário", () => {
     setRobotSettingsForUser("u1", {
       timeframe: "M5",
       marketMode: "OPEN",
-      entryValue: 12,
+      entryValue: 5,
       stopWin: 80,
       stopLoss: 40,
     });
@@ -118,7 +150,7 @@ describe("rememberRobotSettingsFromState preserva escolha do usuário", () => {
     const snapshot = getRobotSettingsSnapshot("u1");
     assert.equal(snapshot.timeframe, "M5");
     assert.equal(snapshot.marketMode, "OPEN");
-    assert.equal(snapshot.entryValue, 12);
+    assert.equal(snapshot.entryValue, 5);
     assert.equal(snapshot.stopWin, 80);
     assert.equal(snapshot.stopLoss, 40);
   });
@@ -134,7 +166,7 @@ describe("rememberRobotSettingsFromState preserva escolha do usuário", () => {
     setRobotSettingsForUser("u1", {
       timeframe: "M15",
       marketMode: "BOTH",
-      entryValue: 25,
+      entryValue: 5,
       stopWin: 120,
       stopLoss: 60,
       martingaleEnabled: true,
@@ -154,7 +186,7 @@ describe("rememberRobotSettingsFromState preserva escolha do usuário", () => {
     const snapshot = getRobotSettingsSnapshot("u1");
     assert.equal(snapshot.timeframe, "M15");
     assert.equal(snapshot.marketMode, "BOTH");
-    assert.equal(snapshot.entryValue, 25);
+    assert.equal(snapshot.entryValue, 5);
     assert.equal(snapshot.stopWin, 120);
     assert.equal(snapshot.stopLoss, 60);
     assert.equal(snapshot.martingaleEnabled, true);
@@ -173,7 +205,7 @@ describe("rememberRobotSettingsFromState preserva escolha do usuário", () => {
     rememberRobotSettingsFromState("u1", {
       timeframe: "M5",
       marketMode: "OPEN",
-      entryValue: 9,
+      entryValue: 5,
       stopWin: 70,
       stopLoss: 35,
     });
@@ -181,7 +213,7 @@ describe("rememberRobotSettingsFromState preserva escolha do usuário", () => {
     const snapshot = getRobotSettingsSnapshot("u1");
     assert.equal(snapshot.timeframe, "M5");
     assert.equal(snapshot.marketMode, "OPEN");
-    assert.equal(snapshot.entryValue, 9);
+    assert.equal(snapshot.entryValue, 5);
     assert.equal(snapshot.stopWin, 70);
     assert.equal(snapshot.stopLoss, 35);
   });
@@ -202,12 +234,25 @@ describe("robotSettings mercado aberto / OTC", () => {
     assert.ok(label && /Abre em/.test(label));
   });
 
-  it("mantém OPEN liberado na quarta-feira UTC", () => {
+  it("na quarta-feira UTC a sessão forex está aberta", () => {
     const wednesday = new Date(Date.UTC(2026, 6, 22, 12, 0, 0));
     assert.equal(isForexOpenMarketAvailable(wednesday), true);
-    assert.equal(coerceSelectableMarketMode("OPEN", wednesday), "OPEN");
     assert.equal(visibleRobotMarketModeOptions(wednesday).length, 3);
     assert.equal(hoursUntilForexOpenMarket(wednesday), null);
     assert.equal(formatForexOpenCountdown(wednesday), null);
+  });
+
+  it("com a manutenção ligada, OPEN cai para OTC mesmo com forex aberto", () => {
+    // Enquanto `OPEN_MARKET_UNDER_MAINTENANCE` for true, nem sessão aberta
+    // libera: a corretora não tem canal de opção fora de OTC.
+    const wednesday = new Date(Date.UTC(2026, 6, 22, 12, 0, 0));
+    const esperado = OPEN_MARKET_UNDER_MAINTENANCE ? "OTC" : "OPEN";
+    assert.equal(coerceSelectableMarketMode("OPEN", wednesday), esperado);
+  });
+
+  it("OTC e BOTH nunca são travados pela manutenção", () => {
+    const wednesday = new Date(Date.UTC(2026, 6, 22, 12, 0, 0));
+    assert.equal(coerceSelectableMarketMode("OTC", wednesday), "OTC");
+    assert.equal(coerceSelectableMarketMode("BOTH", wednesday), "BOTH");
   });
 });

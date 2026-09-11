@@ -87,7 +87,11 @@ corpo). Resolução de tenant pela **oferta** (`cakto_offer_id`), nunca por
 3. Se o e-mail ainda não tem perfil → cria usuário Auth + linha em
    `user_access_profiles` + link de primeiro acesso.
 4. Libera `grant_access=true` e `approval_status=approved`.
-5. Enfileira e-mail nativo `purchase.completed` (aba **E-mails → Entregas**).
+5. Enfileira e-mail nativo:
+   - conta nova → `purchase.completed` (link para definir senha);
+   - conta já existente (trial, cadastro prévio, etc.) → `purchase.existing_account`
+     (mesma senha; CTA de login);
+   - `subscription_renewed` → `subscription.renewed`.
 6. Responde **202** mesmo se destinos HTTP de saída falharem (a liberação já
    foi persistida).
 

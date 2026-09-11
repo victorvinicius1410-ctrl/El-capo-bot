@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Bot, Plug, Sparkles } from "lucide-react";
 import { BullexConnectionPanel } from "@/components/BullexConnectionPanel";
 import { RobotControlPanel } from "@/components/RobotControlPanel";
@@ -45,6 +45,34 @@ const SECOES = [
   },
 ] as const;
 
+const MOBILE_ATMOSPHERE_QUERY = "(max-width: 767px)";
+
+/**
+ * Em telas estreitas (Safari/iOS incluso) a atmosfera completa com blur +
+ * blend + perspective derruba o processo da aba. Preferimos o layout leve.
+ */
+function useLiteConfigAtmosphere(): boolean {
+  const [lite, setLite] = useState(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return true;
+    }
+    return window.matchMedia(MOBILE_ATMOSPHERE_QUERY).matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const media = window.matchMedia(MOBILE_ATMOSPHERE_QUERY);
+    const sync = () => setLite(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+
+  return lite;
+}
+
 /**
  * Aba única no menu; no cabeçalho separa Conta Corretora e Robô em opções.
  */
@@ -54,6 +82,7 @@ function ConfiguracoesPage() {
   const access = useQuery(meAccessQueryOptions());
   const supportSession = access.data?.impersonating === true;
   const robotControlsAllowed = canUseRobotControls(supportSession);
+  const liteAtmosphere = useLiteConfigAtmosphere();
   const visibleSections = robotControlsAllowed
     ? SECOES
     : SECOES.filter((section) => section.id === "conta");
@@ -70,27 +99,34 @@ function ConfiguracoesPage() {
 
   return (
     <div className="config-page mx-auto max-w-3xl">
-      <div className="config-atmosphere" aria-hidden="true">
+      <div
+        className={`config-atmosphere${liteAtmosphere ? " config-atmosphere-lite" : ""}`}
+        aria-hidden="true"
+      >
         <span className="config-bg-base" />
-        <span className="config-aurora config-aurora-a" />
-        <span className="config-aurora config-aurora-b" />
-        <span className="config-orb config-orb-a" />
-        <span className="config-orb config-orb-b" />
-        <span className="config-orb config-orb-c" />
-        <span className="config-beam" />
-        <span className="config-horizon" />
-        <span className="config-stars" />
-        <span className="config-grid" />
-        <span className="config-ring config-ring-a" />
-        <span className="config-ring config-ring-b" />
-        <span className="config-sparks">
-          <i />
-          <i />
-          <i />
-          <i />
-          <i />
-          <i />
-        </span>
+        {!liteAtmosphere ? (
+          <>
+            <span className="config-aurora config-aurora-a" />
+            <span className="config-aurora config-aurora-b" />
+            <span className="config-orb config-orb-a" />
+            <span className="config-orb config-orb-b" />
+            <span className="config-orb config-orb-c" />
+            <span className="config-beam" />
+            <span className="config-horizon" />
+            <span className="config-stars" />
+            <span className="config-grid" />
+            <span className="config-ring config-ring-a" />
+            <span className="config-ring config-ring-b" />
+            <span className="config-sparks">
+              <i />
+              <i />
+              <i />
+              <i />
+              <i />
+              <i />
+            </span>
+          </>
+        ) : null}
         <span className="config-vignette" />
       </div>
 

@@ -130,11 +130,14 @@ class ContinuousAutoTraderSchedulingTests(unittest.TestCase):
 
 
 class ContinuousEntryRulesPreservedTests(unittest.TestCase):
-    def test_entry_windows_remain_0_to_8_for_all_timeframes(self) -> None:
+    def test_entry_windows_remain_at_candle_open_for_all_timeframes(self) -> None:
+        # Apertada de 0-8s para 0-3s em 2026-08-30: a auditoria mediu que só
+        # 33,6% das ordens pegavam o início da vela e metade saía entre 9 e
+        # 20s. Ver tests/test_entry_candle_timing.py.
         for timeframe in ("M1", "M5", "M15"):
             start, end = main.ENTRY_WINDOWS[timeframe]
             self.assertEqual(start, 0)
-            self.assertEqual(end, 8)
+            self.assertEqual(end, 3)
 
     def test_order_expiration_still_matches_timeframe(self) -> None:
         self.assertEqual(main.TIMEFRAME_SECONDS["M1"], 60)
@@ -143,8 +146,8 @@ class ContinuousEntryRulesPreservedTests(unittest.TestCase):
 
     def test_get_entry_window_still_gates_buy_on_candle_open(self) -> None:
         open_window = main.get_entry_window("M1", 2.0)
-        late_ok = main.get_entry_window("M1", 7.0)
-        closed_window = main.get_entry_window("M1", 12.0)
+        late_ok = main.get_entry_window("M1", 3.0)
+        closed_window = main.get_entry_window("M1", 7.0)
         self.assertTrue(open_window["entry_window_open"])
         self.assertTrue(late_ok["entry_window_open"])
         self.assertFalse(closed_window["entry_window_open"])

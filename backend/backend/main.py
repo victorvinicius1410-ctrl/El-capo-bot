@@ -28,10 +28,13 @@ from backend.auto_trader import (
     RobotConfigUpdate,
     normalize_stop_mode,
     parse_datetime,
+    is_synthetic_trade,
     resolve_robot_stop_reason,
+    set_display_score,
     strip_ai_fields,
     utc_now,
 )
+from backend.brasilia_time import history_cutoff, is_brasilia_today
 from backend.status import (
     STATUS_ACCOUNT_DISCONNECTED,
     STATUS_ACTIVE_COOLDOWN,
@@ -75,22 +78,79 @@ from backend.pattern_memory import (
     PATTERN_MEMORY_BLOCK,
     create_pattern_memory_service,
 )
+from backend.reversion_strategy import (
+    REVZ_ENABLED,
+    REVZ_LOOKBACK,
+    REVZ_NON_WAIVABLE,
+    closes_of_closed_candles,
+    is_otc_symbol,
+    is_revz_candidate,
+    revz_confirm_at_entry,
+    revz_min_confidence,
+    revz_passa_portao,
+)
+from backend.live_demo_mode import (
+    LIVE_CONFIDENCE,
+    LIVE_NON_WAIVABLE,
+    is_live_demo,
+    live_demo_passa_portao,
+    live_demo_restaura,
+    live_min_confidence,
+)
+from backend.support_resistance_strategy import SR_CONFIDENCE_MAX
+from backend.sr_respect import build_zone, evaluate_respect
+from backend.wick_filter import evaluate_wicks
+from backend.vertex_strategy import vertex_min_confidence
 from backend.signal_engine import (
     ANALYSIS_TIMEFRAMES,
     CONTINUATION_DEAD_RSI_HARD_BLOCK,
     CONTINUATION_DEAD_RSI_MAX,
     CONTINUATION_DEAD_RSI_MIN,
     FREQUENCY_RECOVERY_AFTER_CYCLES,
+    FREQUENCY_RECOVERY_KEEP_SCORE_PENALTIES,
     FREQUENCY_RECOVERY_MIN_SCORE,
     FREQUENCY_RECOVERY_SOFT_BLOCKS,
     LAST_3_ALIGNMENT_HARD_BLOCK,
     MTF_VOTE_CONFIDENCE_MIN,
+    SR_ZONE_HARD_BLOCK,
     STRATEGY_PROFILES,
     TREND_CLEAR_HARD_BLOCK,
     WEAK_CONTINUATION_PUT_HARD_BLOCK,
+    WEAK_PUT_HARD_BLOCK,
+    CANDLE_WEAK_HARD_BLOCK,
+    CANDLE_MIN_BODY_RATIO,
+    DOJI_HARD_BLOCK,
+    PUT_BODY_HARD_BLOCK,
+    PUT_CHASE_HARD_BLOCK,
+    PUT_WICK_HARD_BLOCK,
+    CALL_CHASE_HARD_BLOCK,
+    CALL_GRG_HARD_BLOCK,
+    SEQ_GGG_HARD_BLOCK,
+    SEQ_GRR_HARD_BLOCK,
+    WEAK_SETUP_HARD_BLOCK,
+    TOXIC_HOUR_HARD_BLOCK,
+    ASSET_BAN_HARD_BLOCK,
+    TOXIC_WEAK_PAIR_HARD_BLOCK,
+    REPEAT_ENTRY_HARD_BLOCK,
     analyze_signal,
     cycle_minutes_for_timeframe,
+    is_rank_demotion_asset,
     is_weak_continuation_put_asset,
+    is_weak_put_setup,
+    is_weak_setup,
+    is_weak_candle_body,
+    is_put_thin_body,
+    is_put_against_wick,
+    is_chasing_continuation_put,
+    is_chasing_continuation_call,
+    is_call_green_red_green,
+    is_seq_green_green_green,
+    is_seq_green_red_red,
+    is_toxic_hour_brt,
+    is_banned_asset,
+    is_toxic_weak_pair,
+    extract_last_3_colors,
+    is_doji_body,
     merge_multi_timeframe_signals,
     minimum_operations_per_hour,
 )
@@ -186,11 +246,41 @@ ROBOT_CONFIG_DEFAULTS = {
     "martingale_multiplier": 2.0,
 }
 ROBOT_CONFIG_ALLOWED_FIELDS = set(ROBOT_CONFIG_DEFAULTS)
-# Qualquer valor estritamente positivo é válido; só 0/negativo são bloqueados.
-MIN_REAL_ENTRY = 5.0
+# Entrada segue a moeda do saldo: só há mínimo (BRL R$ 5, USD US$ 1). Sem teto.
+MIN_REAL_ENTRY_BRL = 5.0
+MIN_REAL_ENTRY_USD = 1.0
+MIN_REAL_ENTRY = MIN_REAL_ENTRY_BRL
 MIN_STOP_MONEY = 5.0
 MIN_STOP_OPERATIONS = 1
-MAX_REAL_ENTRY = 1000.0
+
+
+def normalize_account_currency(currency: str | None) -> str:
+    """Normaliza o código da moeda do saldo da corretora.
+
+    Args:
+        currency: Código bruto (ex.: ``usd``, ``US$``, ``BRL``).
+
+    Returns:
+        ``USD`` quando a conta está em dólar; qualquer outro valor vira ``BRL``.
+    """
+    code = str(currency or "").strip().upper()
+    if code in {"USD", "US$", "$"} or "USD" in code:
+        return "USD"
+    return "BRL"
+
+
+def min_real_entry_for_currency(currency: str | None) -> float:
+    """Retorna o valor mínimo de entrada na moeda do saldo (sem teto).
+
+    Args:
+        currency: Código da conta conectada (BRL ou USD).
+
+    Returns:
+        ``1.0`` para USD e ``5.0`` para BRL (e demais códigos).
+    """
+    if normalize_account_currency(currency) == "USD":
+        return MIN_REAL_ENTRY_USD
+    return MIN_REAL_ENTRY_BRL
 
 ASSET_NOT_ALLOWED = "ASSET_NOT_ALLOWED"
 SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
@@ -213,7 +303,7 @@ CRITICAL_TRADE_BLOCKS = {
     "GLOBAL_LOSS_COOLDOWN",
     "OPERATION_IN_PROGRESS",
     "CANDLES_UNAVAILABLE",
-    # CANDLE_STRENGTH / DOJI / SIDEWAYS / WICK / DEAD_RSI: soft.
+    # CANDLE_STRENGTH / DOJI / SIDEWAYS / WICK / DEAD_RSI: soft (estratégia 13–14/08).
     # Em frequency_recovery, TREND_CLEAR / PRICE_ACTION_SETUP / LEVEL_REJECTION
     # também saem do hard (ver signal_engine.FREQUENCY_RECOVERY_SOFT_BLOCKS).
     "PRICE_ACTION_SETUP",
@@ -221,9 +311,18 @@ CRITICAL_TRADE_BLOCKS = {
     "LEVEL_CONFLICT",
     "LEVEL_REJECTION",
     "SR_ZONE",
+    "WICK_EXCESS",
     "TREND_CLEAR",
     "LAST_3_ALIGNMENT",
     "WEAK_CONTINUATION_PUT",
+    "PUT_BODY",
+    "CALL_GRG",
+    "SEQ_GGG",
+    "SEQ_GRR",
+    "WEAK_SETUP",
+    "TOXIC_HOUR",
+    "ASSET_BAN",
+    "TOXIC_WEAK_PAIR",
     PATTERN_MEMORY_BLOCK,
 }
 RECOVERY_NON_RELAXABLE_TRADE_BLOCKS = {
@@ -242,9 +341,18 @@ RECOVERY_NON_RELAXABLE_TRADE_BLOCKS = {
     "ASSET_COOLDOWN",
     "GLOBAL_LOSS_COOLDOWN",
     "SR_ZONE",
+    "WICK_EXCESS",
     "TREND_CLEAR",
     "LAST_3_ALIGNMENT",
     "WEAK_CONTINUATION_PUT",
+    "PUT_BODY",
+    "CALL_GRG",
+    "SEQ_GGG",
+    "SEQ_GRR",
+    "WEAK_SETUP",
+    "TOXIC_HOUR",
+    "ASSET_BAN",
+    "TOXIC_WEAK_PAIR",
     PATTERN_MEMORY_BLOCK,
 }
 ANALYSIS_DETAIL_FIELDS = (
@@ -270,6 +378,10 @@ ANALYSIS_DETAIL_FIELDS = (
     "near_resistance",
     "support_level",
     "resistance_level",
+    "sr_zone_source",
+    "sr_respect_reason",
+    "wick_reason",
+    "vertex",
     "zigzag_reversal",
     "reversal_against",
     "sideways",
@@ -297,6 +409,22 @@ ANALYSIS_DETAIL_FIELDS = (
     "recovery_relaxed_filters",
     "normal_min_confidence",
     "effective_min_confidence",
+    # O candidato do ciclo e montado como dicionario de campos FIXOS a partir do
+    # sinal. Sem estes dois aqui, `live_demo` e `strategy_key` morriam na
+    # montagem: o portao nunca via a marca do modo LIVE (e reaplicava os filtros
+    # de qualidade que o motor tinha dispensado) e a operacao entrava no
+    # historico sem identificacao, sujando a medicao de estrategia.
+    "live_demo",
+    "strategy_key",
+    # Veredito da REV-Z (mercado aberto). Sem ele aqui o candidato chega ao
+    # portão sem a marca, cai no caminho do motor clássico e os filtros de
+    # tendência dele barram toda entrada de reversão — sem erro no log.
+    "revz",
+    # Veredito da reconferência de nível no disparo (o da análise já está
+    # acima, `sr_respect_reason`).
+    "sr_entry_recheck_reason",
+    # Veredito do filtro de pavio no disparo (11/09); o da análise é `wick_reason`.
+    "wick_entry_reason",
 )
 ORDER_AVAILABILITY_ERROR_TERMS = (
     "asset is not available",
@@ -336,8 +464,29 @@ BINARY_ALLOWED_ASSETS = [
     "EURAUD-OTC",
     "EURNZD-OTC",
     "AUDCHF-OTC",
+    "NZDUSD",
+    "AUDCAD",
+    "GBPCAD",
+    "GBPCHF",
+    "GBPAUD",
+    "EURCAD",
+    "CHFJPY",
+    "CADCHF",
+    "EURAUD",
+    "EURNZD",
+    "AUDCHF",
 ]
 BINARY_ALLOWED_ASSET_SET = set(BINARY_ALLOWED_ASSETS)
+# Sondados um a um no `/payouts` da corretora em 2026-09-04: os 11 de baixo
+# responderam abertos em turbo E binary, a maioria com payout **88** — melhor
+# que os 87 que a rotação atual pega na maior parte das ordens (empate 53,19%
+# contra 53,48%). Os pares que faltam (NZDJPY, CADJPY, AUDNZD, NZDCAD, NZDCHF,
+# EURCHF, GBPNZD, USDSGD, USDRUB) voltaram `ASSET_NOT_ALLOWED`, que é a nossa
+# própria allowlist recusando — não a corretora.
+#
+# O pool cresce, mas cada ciclo continua varrendo `ROBOT_ANALYSIS_MAX_ASSETS`
+# ativos a partir do cursor circular do usuário: cobertura maior sem ciclo mais
+# longo, que estouraria o orçamento de varredura de 45s.
 ANALYSIS_BASE_ASSETS = [
     "EURUSD",
     "GBPUSD",
@@ -349,13 +498,57 @@ ANALYSIS_BASE_ASSETS = [
     "USDCAD",
     "GBPJPY",
     "AUDJPY",
+    "NZDUSD",
+    "AUDCAD",
+    "GBPCAD",
+    "GBPCHF",
+    "GBPAUD",
+    "EURCAD",
+    "CHFJPY",
+    "CADCHF",
+    "EURAUD",
+    "EURNZD",
+    "AUDCHF",
 ]
 ANALYSIS_ASSETS_OTC = [f"{symbol}-OTC" for symbol in ANALYSIS_BASE_ASSETS]
-ANALYSIS_ASSETS_OPEN = list(ANALYSIS_BASE_ASSETS)
+# Pares que a corretora vende como OPCAO no mercado aberto — medido em
+# 08/09/2026 (terca, dia util) no dump de `get_all_init_v2`, canais turbo e
+# binary. Os outros 10 da base existem la SO como OTC sintetico: varre-los em
+# modo OPEN gastaria metade do orcamento do ciclo (ROBOT_ANALYSIS_MAX_ASSETS=10)
+# em ativos que nunca podem virar ordem.
+#
+# Esta lista decide apenas O QUE VARRER. Abertura e payout continuam vindo AO
+# VIVO da corretora a cada ciclo, entao par fechado ou com payout ruim e barrado
+# pelo portao de sempre — NZDUSD, por exemplo, abre com payout 30 e o
+# `min_payout` reprova sozinho.
+#
+# Para remedir: `GET /catalog/probe` no bullex-service e olhar `nao_otc_nomes`.
+OPEN_MARKET_OFFERED_ASSETS = frozenset(
+    {
+        "AUDCAD",
+        "AUDJPY",
+        "AUDUSD",
+        "EURGBP",
+        "EURJPY",
+        "EURUSD",
+        "GBPJPY",
+        "GBPUSD",
+        "NZDUSD",
+        "USDCAD",
+        "USDJPY",
+    }
+)
+ANALYSIS_ASSETS_OPEN = [
+    symbol for symbol in ANALYSIS_BASE_ASSETS if symbol in OPEN_MARKET_OFFERED_ASSETS
+]
 # Compat: lista histórica = OTC (10 ativos).
 ANALYSIS_ASSETS = list(ANALYSIS_ASSETS_OTC)
+# Ciclos OPEN sem payout (timeout/None) antes de cair para OTC no mesmo ciclo.
+OPEN_MARKET_PAYOUT_FALLBACK_AFTER_CYCLES = 3
 ROBOT_MAX_ASSETS_PER_CYCLE = len(ANALYSIS_BASE_ASSETS) * 2
-CHART_ALLOWED_ASSET_SET = set(ANALYSIS_ASSETS_OTC) | set(ANALYSIS_ASSETS_OPEN)
+# O grafico segue aceitando os 21 nomes: restringir a VARREDURA do modo OPEN
+# nao deve impedir o usuario de visualizar um ativo.
+CHART_ALLOWED_ASSET_SET = set(ANALYSIS_ASSETS_OTC) | set(ANALYSIS_BASE_ASSETS)
 SESSION_CACHE_TTL_SECONDS = 20
 SESSION_STATUS_THROTTLE_SECONDS = 20
 # HTTP /robot/state é fallback (WS é o canal primário). Poll lento = 30s.
@@ -364,6 +557,9 @@ ACCOUNT_MIN_POLL_SECONDS = 25
 SESSION_STATUS_MIN_POLL_SECONDS = 25
 ROBOT_SESSION_REFRESH_SECONDS = 25
 SESSION_OFFLINE_TTL_SECONDS = 60
+# Espera máxima pela gravação do estado antes de mandar `start` ao runtime.
+# Só no clique do cliente; o robô nem sobe sem isso, então vale o atraso.
+ROBOT_START_PERSIST_WAIT_SECONDS = 3.0
 OFFLINE_CONFIRMATION_FAILURES = 3
 SESSION_FAILURE_BACKOFF_SECONDS = (10, 30, 60, 300)
 SESSION_CACHEABLE_PATHS = {"/sessions/status", "/account"}
@@ -371,6 +567,11 @@ ACTIVE_USER_TTL_SECONDS = 300
 ACCOUNT_CACHE_TTL_SECONDS = 25
 ORDER_RESULT_CACHE_TTL_SECONDS = 1
 BULLEX_UPSTREAM_TIMEOUT_SECONDS = 5.0
+# Compra REAL: o hop runtime→bullex-service espera o _call_gate da corretora
+# (máx. 3 chamadas). Com o timeout curto, o POST concluía na BullEx e o
+# runtime marcava BULLEX_TEMPORARY_UNAVAILABLE (18/08 15:31 BRT: 4 order_id
+# criados, overlay em falha).
+BULLEX_BUY_TIMEOUT_SECONDS = 45.0
 # Candles/payouts: precisa cobrir fila do lock por usuário no bullex-service.
 # Com 2s, scan sequencial de 10–20 ativos estourava e OTC caía em CANDLES_TIMEOUT.
 BULLEX_MARKET_DATA_TIMEOUT_SECONDS = 8.0
@@ -410,8 +611,34 @@ BAD_GATEWAY_PROTECTED_PATHS = {
 }
 ASSETS_CACHE_TTL_SECONDS = 300
 ASSETS_RETRY_BACKOFF_SECONDS = (10, 30, 60)
-PAYOUT_CACHE_TTL_SECONDS = 60
+# Payout é o dado mais CARO da corretora: a lib faz busy-wait de ~4s por ativo
+# (`get_digital_payout(active, seconds=3)`) esperando o websocket. Com TTL de
+# 60s o cache morria antes da releitura do mesmo ativo no ciclo seguinte
+# (vela de 60s + até 45s de scan) e todo ciclo repagava os ~4s por ativo —
+# com o orçamento de scan em 45s, só 5–6 dos 10–20 ativos eram avaliados
+# (incidente 2026-08-18 ~23h30, frequência caiu de 12–34 para 1–8 ops/hora).
+# 180s cobre ~3 ciclos M1. Não afrouxa a compra: acima de
+# CHANNEL_CACHE_MAX_AGE_SECONDS (10s) o buy revalida o canal com dado fresco
+# (`refresh_candidate_execution_channel`). Valor do payout em par OTC é
+# estável (83–87%), então o filtro min_payout não sofre com 3 min de idade.
+PAYOUT_CACHE_TTL_SECONDS = 180
+# Candle FECHADO não muda — o cache_key inclui a vela, então releitura da
+# mesma vela é sempre idêntica; TTL só limita memória.
 CANDLES_CACHE_TTL_SECONDS = 60
+# Candles/payouts são iguais para todos os usuários. Sem cache de processo,
+# N robôs no mesmo fechamento de vela disparam N GETs e esgotam o pool httpx
+# (incidente 2026-08-11: 33 robôs, `total=100 ativas=100`, ANALYSIS_TIMEOUT).
+SHARED_MARKET_PATHS = frozenset({"/candles", "/payouts"})
+SHARED_MARKET_REFRESH_REMAINING_SECONDS = 20
+BULLEX_HTTP_MAX_INFLIGHT = 40
+# O pool httpx não pode ser maior que o semáforo: conexões canceladas pelo
+# wait_for vazavam como "ativas" até 100/100 (recorrência 2026-08-17/18).
+BULLEX_HTTP_MAX_CONNECTIONS = BULLEX_HTTP_MAX_INFLIGHT
+# POST de ordem tem pool próprio: 38 GETs de candle não podem ocupar as
+# conexões no instante 0–8s da vela, quando a compra precisa sair.
+BULLEX_ORDER_HTTP_MAX_CONNECTIONS = 8
+BULLEX_HTTP_RECYCLE_COOLDOWN_SECONDS = 15.0
+BULLEX_HTTP_RECYCLE_ACTIVE_THRESHOLD = 32
 CANDLES_REQUEST_TIMEOUT_SECONDS = 5.0
 ACTIVE_COOLDOWN_SECONDS = 15
 # Só o símbolo rejeitado pela corretora ("asset is not available") fica de fora
@@ -419,6 +646,22 @@ ACTIVE_COOLDOWN_SECONDS = 15
 # robô não "para 5 minutos". O importante é o skip duro (sem furar com cache)
 # + marcar o canal fechado; cooldown longo só atrasava oportunidades boas.
 UNAVAILABLE_ASSET_COOLDOWN_SECONDS = 60
+# ...mas isso valia quando a recusa era eventual. Medido em 08/09/2026: de 133
+# ordens reais, 94 foram recusadas com "asset is not available" e 89 delas eram
+# o MESMO par (EURJPY-OTC, 89/89 recusadas). O catálogo da corretora anunciava
+# `open_turbo=true` com payout 88 — o maior da roda — então o scorer reelegia o
+# par toda vela, o cooldown de 60s (exatamente uma vela M1) expirava, o catálogo
+# voltava a dizer "aberto" e o ciclo recomeçava. O cliente via "Entrada
+# rejeitada" sem parar, e a fala do placar/rejeição ainda cortava a explicação
+# da entrada por prioridade.
+#
+# A escada abaixo tira o par teimoso da roda em 2-3 tentativas em vez de 89,
+# sem punir o par que recusou uma vez por acaso: o 1º degrau continua sendo a
+# mesma vela M1 de antes.
+UNAVAILABLE_ASSET_COOLDOWN_LADDER_SECONDS = (60, 300, 900, 3600)
+# Sem NOVA recusa por este tempo, o par recomeça do primeiro degrau. Evita que
+# uma recusa isolada de manhã pese numa recusa isolada à tarde.
+UNAVAILABLE_ASSET_STRIKE_DECAY_SECONDS = 1800
 PAYOUT_COOLDOWN_SECONDS = 15
 # Revalidação do canal turbo/binary na hora da compra. O sinal fica travado a
 # vela inteira antes de entrar (M1: ~40-55s), então o cache de payout já pode
@@ -428,11 +671,79 @@ PAYOUT_COOLDOWN_SECONDS = 15
 # CHANNEL_REVALIDATION_TIMEOUT_SECONDS por ativo e CHANNEL_REVALIDATION_BUDGET_SECONDS
 # somando todos os candidatos. Estourou o orçamento → segue com o cache.
 CHANNEL_CACHE_MAX_AGE_SECONDS = 10.0
-CHANNEL_REVALIDATION_TIMEOUT_SECONDS = 1.2
-CHANNEL_REVALIDATION_BUDGET_SECONDS = 2.0
+# Apertados junto com a janela de compra (0-3s, envio até 6s): com 2,0s de
+# orçamento a revalidação sozinha consumia a janela inteira e a ordem caía no
+# meio da vela. Encolher aqui pode devolver alguns NO_AVAILABLE_ASSET — é a
+# troca aceita para não comprar fora do início da vela.
+CHANNEL_REVALIDATION_TIMEOUT_SECONDS = 0.9
+CHANNEL_REVALIDATION_BUDGET_SECONDS = 1.5
+
+# Reconferência do nível NO DISPARO. O veredito de suporte/resistência nasce em
+# `analyze_signal`, congela no candidato e a ordem só sai na abertura da vela
+# seguinte — até ~60s depois. Medido em 10/09 (GBPUSD-OTC PUT, R$ 200, LOSS):
+# na análise não havia suporte nenhum; na execução havia um pivô a 1.318665 com
+# o preço em 1.318725, ou seja CONTRA_O_NIVEL. Reconferir durante a espera não
+# resolve — o pivô só nasce quando a vela fecha, e isso acontece depois.
+# Custo medido do fetch: ~300ms a frio, ~2ms em cache; a janela de compra é
+# 0-3s, então cabe. `SR_ENTRY_RECHECK=false` desliga sem redeploy.
+SR_ENTRY_RECHECK = os.getenv("SR_ENTRY_RECHECK", "true").strip().lower() in {"1", "true", "yes"}
+SR_ENTRY_RECHECK_TIMEOUT_SECONDS = float(os.getenv("SR_ENTRY_RECHECK_TIMEOUT", "1.2"))
+# Sem dado para reconferir, a ordem NÃO sai (10/09/2026, decisão do dono: S/R
+# é prioridade sobre volume). Antes liberava: 26 timeouts em 4h, vários
+# seguidos de ordem sem verificação nenhuma — um deles uma compra de R$ 200 no
+# topo do gráfico. `SR_ENTRY_RECHECK_FAIL_CLOSED=false` volta a liberar.
+SR_ENTRY_RECHECK_FAIL_CLOSED = (
+    os.getenv("SR_ENTRY_RECHECK_FAIL_CLOSED", "true").strip().lower() in {"1", "true", "yes"}
+)
+# Quanto antes da abertura da vela o canal e pre-aquecido.
+#
+# A revalidacao acima e o unico I/O que sobrou DENTRO da janela de compra, e ela
+# quase sempre roda: o sinal fica travado a vela inteira esperando a entrada, o
+# cache de payout envelhece alem de CHANNEL_CACHE_MAX_AGE_SECONDS e a compra
+# refaz a consulta. Medido em 08/09/2026: 82 estouros de timeout em 6h, cada um
+# queimando 0,9s sem devolver resposta; das 107 ordens do periodo so 30 (28%)
+# sairam dentro de `window_end=3`, mediana no segundo 3,77.
+#
+# Pre-aquecer roda a MESMA consulta enquanto a vela ANTERIOR ainda corre, de
+# graca em termos de janela. Na compra o cache esta fresco, `cache_is_usable` da
+# True e o caminho critico fica sem rede. Nenhuma validacao e afrouxada: a
+# checagem da compra continua exatamente onde estava.
+#
+# 5s de antecedencia: o dado chega com ~5s de idade e e usado ~3s depois da
+# abertura, entao ainda cabe em CHANNEL_CACHE_MAX_AGE_SECONDS (10s) com folga.
+CHANNEL_PREWARM_LEAD_SECONDS = 5.0
+# Orcamento do pre-aquecimento. Deliberadamente MAIOR que o da compra: ele roda
+# fora da janela, onde tempo nao custa entrada — usar os mesmos 0,9s de la era
+# jogar fora justamente a vantagem que este caminho existe para ter.
+#
+# Medido em 08/09/2026 com 0,9s: 5 dos 9 pre-aquecimentos voltaram `open=None`
+# (estouro), o cache nao esquentava e a compra refazia a consulta DENTRO da
+# janela — a ordem saia no segundo 5,5. Continua limitado pelo tempo que falta
+# para a vela abrir, entao nunca atrasa a abertura.
+CHANNEL_PREWARM_TIMEOUT_SECONDS = 3.0
 STALE_MARKET_DATA_SECONDS = 120
 ROBOT_ASSET_QUEUE_SLEEP_SECONDS = 0.0
-ROBOT_CANDLE_COUNT = 100
+# 100 velas bastavam para EMA21/RSI14 do motor clássico, mas a SR-R monta os
+# níveis com 120 velas de lookback e precisa de 126 no total — com 100 ela
+# devolvia SR_VELAS_INSUFICIENTES em 100% das análises e não podia disparar
+# nunca. Achado em 2026-09-04, depois de ela já estar no código.
+ROBOT_CANDLE_COUNT = int(os.getenv("ROBOT_CANDLE_COUNT", "160"))
+# Ativos varridos por ciclo. O pool tem 21 (OTC) desde 04/09, mas varrer todos
+# estoura o orçamento de 45s — o cursor circular garante que, ao longo dos
+# ciclos, todos sejam cobertos.
+ROBOT_ANALYSIS_MAX_ASSETS = int(os.getenv("ROBOT_ANALYSIS_MAX_ASSETS", "10"))
+
+# Fallback para o canal DIGITAL quando o turbo/binary recusa o ativo por
+# indisponibilidade. Achado em 04/09: pares de mercado ABERTO (GBPUSD, EURUSD,
+# AUDUSD...) aparecem com payout 82–88, são aprovados na varredura e escolhidos
+# como melhor candidato do ciclo — e a ordem morre em "asset is not available
+# at the moment", porque `client.buy()` manda por turbo/binary, fechado neles.
+# Em 11.628 operações reais, ZERO caíram em ativo aberto por causa disso.
+DIGITAL_FALLBACK_ENABLED = os.getenv("DIGITAL_FALLBACK", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # Após 1 LOSS: 1 vela M1 (60s). 3 min matava a frequência (centenas de
 # [GLOBAL_LOSS_COOLDOWN] numa manhã) sem ganho claro vs. só pular a próxima.
 GLOBAL_LOSS_COOLDOWN_AFTER_ONE_SECONDS = 60
@@ -440,7 +751,24 @@ GLOBAL_LOSS_COOLDOWN_AFTER_ONE_SECONDS = 60
 GLOBAL_LOSS_COOLDOWN_AFTER_TWO_MINUTES = 10
 ACTIVE_DATA_TIMEOUT_SECONDS = 8.0
 # Por ativo no scan do robô (candles+payout). Sequencial: Bullex só aceita 1 call/user.
-ROBOT_ANALYSIS_ASSET_TIMEOUT_SECONDS = 18.0
+# 18s × 20 ativos (BOTH) estoura ROBOT_CYCLE_TIMEOUT_SECONDS=110 e descarta o sinal.
+# 5s × 20 ativos (BOTH) ainda passa de 110s. O loop também respeita
+# ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS para sobrar tempo de compra.
+ROBOT_ANALYSIS_ASSET_TIMEOUT_SECONDS = 5.0
+# 18/08 ~19h: orçamento de 85s foi calibrado contra o timeout do ciclo
+# (110s), não contra a janela real de entrada. A análise começa entre os
+# segundos 5–20 da vela (`ANALYSIS_WINDOWS`) e a compra só é aceita nos
+# primeiros 0–8s da vela SEGUINTE (`ENTRY_WINDOWS`). Pior caso: análise
+# iniciada no segundo 20 tem só (60-20)+8=48s até fechar a janela de
+# compra. Com 85s de orçamento o scan sempre terminava 25-40s DENTRO da
+# vela seguinte — `[ENTRY_WINDOW_MISSED]` em massa mesmo com sinal
+# encontrado (current_candle_seconds observado: 26, 27, 36, 48…).
+# 45s cabia no pior caso quando a janela de compra ia até o segundo 8.
+# Com a janela apertada para 0-3s (2026-08-30) o pior caso virou
+# (60-20)+3 = 43s, e 45s passou a estourar. 38s recupera a mesma folga de
+# ~5s para o cálculo do candidato e o disparo da compra.
+# Guardado por test_scan_budget_fits_inside_entry_window_worst_case.
+ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS = 38.0
 
 
 def build_success(data: Any) -> dict[str, Any]:
@@ -451,8 +779,15 @@ def build_error(message: str) -> dict[str, Any]:
     return {"ok": False, "data": None, "error": message}
 
 
-INSUFFICIENT_BALANCE_START_MESSAGE = "Você está sem saldo para iniciar. Faça um depósito na BullEx."
-ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE = "Seu saldo é menor que o valor da entrada."
+INSUFFICIENT_BALANCE_START_MESSAGE = (
+    "Saldo insuficiente. Faça um depósito na BullEx ou reduza o valor da entrada."
+)
+ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE = (
+    "Seu saldo é menor que o valor da entrada. Deposite ou diminua a entrada."
+)
+INSUFFICIENT_FUNDS_ORDER_MESSAGE = (
+    "Saldo insuficiente para a entrada. Deposite na BullEx ou reduza o valor da entrada."
+)
 
 
 def normalize_service_payload(
@@ -821,15 +1156,21 @@ def effective_market_mode(
     """
     Resolve o mercado efetivo da varredura/ordens.
 
-    - BOTH → sempre OTC (operação só em OTC).
+    - BOTH com sessão forex aberta → BOTH (OTC + pares sem ``-OTC``).
+    - BOTH com sessão fechada → OTC.
     - OPEN com sessão forex fechada → OTC (fallback seguro).
     - OPEN com sessão aberta → OPEN.
     - OTC → OTC.
+
+    A REV-Z NÃO troca mais o mercado (até 10/09/2026 ela promovia tudo para
+    OPEN com o forex aberto, porque recusava OTC). Hoje ela só age nos pares de
+    mercado aberto e o OTC segue com o motor dele — a escolha do usuário vale.
     """
     mode = normalize_market_mode(value)
+    forex_open = is_forex_open_market_open(now)
     if mode == "BOTH":
-        return "OTC"
-    if mode == "OPEN" and not is_forex_open_market_open(now):
+        return "BOTH" if forex_open else "OTC"
+    if mode == "OPEN" and not forex_open:
         return "OTC"
     return mode
 
@@ -843,7 +1184,7 @@ def coerce_selectable_market_mode(
     Normaliza a escolha do usuário para um modo ainda selecionável na UI.
 
     Com o mercado aberto fechado, OPEN deixa de existir e cai para OTC.
-    BOTH permanece selecionável (mas opera só OTC via ``effective_market_mode``).
+    BOTH permanece selecionável; com forex aberto a varredura inclui OTC+aberto.
     """
     mode = normalize_market_mode(value)
     if mode == "OPEN" and not is_forex_open_market_open(now):
@@ -859,8 +1200,10 @@ def resolve_analysis_assets(
     mode = effective_market_mode(market_mode, now=now)
     if mode == "OPEN":
         return list(ANALYSIS_ASSETS_OPEN)
-    # OTC e BOTH (efetivo): só pares *-OTC. BOTH nunca varre aberto —
-    # evita payout null, timeouts em cadeia e perda da janela 0–5s.
+    if mode == "BOTH":
+        # OTC primeiro (M1 turbo mais estável), depois mercado aberto.
+        return list(ANALYSIS_ASSETS_OTC) + list(ANALYSIS_ASSETS_OPEN)
+    # OTC (e OPEN/BOTH com sessão fechada, já resolvidos para OTC).
     return list(ANALYSIS_ASSETS)
 
 
@@ -868,11 +1211,64 @@ def is_binary_asset_allowed(active: str) -> bool:
     return normalize_binary_active(active) in BINARY_ALLOWED_ASSET_SET
 
 
+def open_market_fallback_otc_reason(
+    user_id: str,
+    *,
+    assets: list[str],
+    timeframe: str | None,
+    requested: str,
+    effective: str,
+) -> str | None:
+    """Decide se o ciclo OPEN deve varrer OTC para não ficar parado.
+
+    O fallback de canal (turbo/binary fechado) continua imediato. Timeout de
+    payout no aberto só cai para OTC depois de alguns ciclos sem entrada,
+    para o primeiro scan ainda tentar os pares reais.
+
+    Args:
+        user_id: Identificador autenticado do dono do ciclo.
+        assets: Pares OPEN resolvidos para a sessão forex atual.
+        timeframe: Timeframe operacional (turbo vs binary).
+        requested: Modo pedido pelo usuário (já normalizado).
+        effective: Modo efetivo (OPEN só com forex aberto).
+
+    Returns:
+        Motivo do fallback (`execution_channel_closed_on_all_open_assets` ou
+        `payout_unavailable_on_open_assets`), ou ``None`` para manter OPEN.
+    """
+    if requested != "OPEN" or effective != "OPEN" or not user_id or not timeframe:
+        return None
+    known = 0
+    channel_open = 0
+    for symbol in assets:
+        flag = cached_asset_open_for_active(user_id, symbol, timeframe)
+        if flag is None:
+            continue
+        known += 1
+        if flag:
+            channel_open += 1
+            break
+    if known > 0 and channel_open == 0:
+        return "execution_channel_closed_on_all_open_assets"
+    state = auto_trader.get(user_id)
+    consecutive = int(getattr(state, "consecutive_no_opportunity_cycles", 0) or 0)
+    blocked = {
+        str(item).strip().upper()
+        for item in (getattr(state, "blocked_filters", None) or [])
+    }
+    if consecutive < OPEN_MARKET_PAYOUT_FALLBACK_AFTER_CYCLES:
+        return None
+    if "PAYOUT_UNAVAILABLE" in blocked or known == 0:
+        return "payout_unavailable_on_open_assets"
+    return None
+
+
 def select_analysis_assets_for_cycle(
     user_id: str,
     *,
     max_assets: int | None,
     market_mode: str | None = None,
+    timeframe: str | None = None,
 ) -> list[str]:
     """Seleciona ativos a partir do primeiro item ainda não concluído.
 
@@ -880,11 +1276,80 @@ def select_analysis_assets_for_cycle(
         user_id: Identificador autenticado do dono do ciclo.
         max_assets: Quantidade máxima de ativos que o ciclo pode analisar.
         market_mode: Mercado OTC, aberto ou ambos.
+        timeframe: Timeframe operacional (turbo vs binary no fallback OPEN).
 
     Returns:
         Lista circular de ativos, iniciada no cursor persistido do usuário.
     """
     assets = resolve_analysis_assets(market_mode)
+    requested = normalize_market_mode(market_mode)
+    effective = effective_market_mode(market_mode)
+    if requested == "OPEN":
+        # `effective_market_mode` rebaixa OPEN para OTC com a sessao forex
+        # fechada ("fallback seguro"), e `resolve_analysis_assets` ja devolve a
+        # lista OTC aqui. Isso faz uma conta configurada para MERCADO ABERTO
+        # comprar OTC com dinheiro real — mercado que a pessoa nao escolheu, e
+        # o painel continua dizendo "mercado aberto".
+        #
+        # Quem escolheu OPEN so ve ativo de mercado aberto. Fora da sessao eles
+        # nao tem payout e o ciclo passa sem operar, que e o comportamento
+        # correto: o painel ja mostra o cadeado e a contagem para a abertura.
+        # BOTH nao entra aqui — la a pessoa escolheu os dois mercados.
+        assets = list(ANALYSIS_ASSETS_OPEN)
+    fallback_reason = open_market_fallback_otc_reason(
+        user_id,
+        assets=assets,
+        timeframe=timeframe,
+        requested=requested,
+        effective=effective,
+    )
+    if fallback_reason:
+        if requested == "OPEN":
+            # Conta configurada para MERCADO ABERTO nao opera OTC. Trocar a
+            # lista por baixo abria ordem com DINHEIRO REAL num mercado que a
+            # pessoa nao escolheu — e o painel seguia dizendo "mercado aberto",
+            # entao nao havia como ela perceber.
+            #
+            # Medido em 08/09/2026: conta ligada em OPEN comprou USDJPY-OTC
+            # porque o cache de payout ainda estava frio nos primeiros ciclos.
+            # A corretora recusou (turbo fechado nesse par) e por sorte nada
+            # saiu, mas a intencao era comprar.
+            #
+            # Ciclo sem oportunidade em mercado aberto e ciclo sem operacao. O
+            # BOTH continua caindo para OTC — la a pessoa escolheu os dois.
+            # `payout_unavailable_on_open_assets` NAO justifica pular o ciclo.
+            # Ele dispara quando `blocked_filters` do candidato anterior tem
+            # PAYOUT_UNAVAILABLE — e basta UM par fechado na fila para isso.
+            # Medido em 09/09/2026: AUDJPY fechado o dia todo e AUDCAD quase
+            # sempre; os dois envenenavam a marca e derrubavam o ciclo inteiro,
+            # com os outros 9 pares pagando 85. Foram 1.288 ciclos descartados
+            # em 4h — conta em OPEN passou 4 horas sem operar.
+            #
+            # Par fechado ja e barrado individualmente (payout None -> score 0),
+            # entao ele na fila nao gera ordem errada; o que impedia operar era
+            # descartar o ciclo.
+            #
+            # So o mercado inteiro fechado justifica pular, e ai a economia de
+            # chamadas a corretora e real.
+            if fallback_reason != "execution_channel_closed_on_all_open_assets":
+                return assets
+            logger.warning(
+                "[OPEN_MARKET_NO_TRADE] user_id=%s timeframe=%s reason=%s "
+                "acao=aguarda_proximo_ciclo",
+                user_id,
+                timeframe,
+                fallback_reason,
+            )
+            return []
+        logger.warning(
+            "[OPEN_MARKET_NO_CHANNEL_FALLBACK_OTC] user_id=%s timeframe=%s "
+            "reason=%s requested=%s",
+            user_id,
+            timeframe,
+            fallback_reason,
+            requested,
+        )
+        assets = list(ANALYSIS_ASSETS_OTC)
     if not assets:
         return []
     state = auto_trader.get(user_id)
@@ -983,6 +1448,12 @@ class BullexResponseCacheEntry:
     status_code: int
     payload: dict[str, Any]
     expires_at: datetime
+    # Instante real em que a resposta chegou da corretora. `expires_at` não
+    # serve para isso porque o TTL varia por rota. Sem esse campo o
+    # `/sessions/status` servido do cache (TTL/throttle de 20s) virava âncora
+    # de relógio carimbada como nova, e a janela de compra abria até 27s
+    # atrasada — auditoria de 2026-08-30.
+    received_at: datetime = field(default_factory=utc_now)
 
 
 @dataclass
@@ -1000,13 +1471,209 @@ class BullexUserSessionCache:
 session_response_cache: dict[str, BullexUserSessionCache] = {}
 active_cooldowns: dict[str, dict[str, datetime]] = {}
 payout_cooldowns: dict[str, dict[str, datetime]] = {}
+repeat_entry_cooldowns: dict[str, dict[str, datetime]] = {}
 active_users: dict[str, datetime] = {}
 analysis_asset_queue_offsets: dict[str, int] = {}
 background_refresh_tasks: set[tuple[str, str, str]] = set()
+_shared_market_cache: dict[str, BullexResponseCacheEntry] = {}
+_shared_market_locks: dict[str, asyncio.Lock] = {}
+_bullex_http_semaphore: asyncio.Semaphore | None = None
+_bullex_http_semaphore_loop: asyncio.AbstractEventLoop | None = None
 
 
 def get_session_cache(user_id: str) -> BullexUserSessionCache:
     return session_response_cache.setdefault(user_id, BullexUserSessionCache())
+
+
+def is_shared_market_path(path: str) -> bool:
+    """
+    Indica se o path é dado de mercado compartilhado entre usuários.
+
+    Args:
+        path: Caminho do bullex-service (ex.: ``/candles``).
+
+    Returns:
+        True para candles/payouts (idênticos para qualquer sessão).
+    """
+    return path in SHARED_MARKET_PATHS
+
+
+def reset_shared_market_cache() -> None:
+    """Zera cache e locks de mercado do processo (testes / shutdown)."""
+    global _bullex_http_semaphore, _bullex_http_semaphore_loop
+    global _bullex_http_last_recycle_at, _bullex_http_recycle_lock
+    _shared_market_cache.clear()
+    _shared_market_locks.clear()
+    _bullex_http_semaphore = None
+    _bullex_http_semaphore_loop = None
+    _bullex_http_last_recycle_at = 0.0
+    _bullex_http_recycle_lock = None
+
+
+def get_shared_market_cache_entry(cache_key: str) -> BullexResponseCacheEntry | None:
+    """
+    Lê o cache de mercado do processo se ainda estiver fresco.
+
+    Args:
+        cache_key: Chave normalizada (ativo/intervalo/vela).
+
+    Returns:
+        Entrada vigente ou ``None`` se ausente/expirada.
+    """
+    entry = _shared_market_cache.get(cache_key)
+    if entry is None:
+        return None
+    if utc_now() >= entry.expires_at:
+        return None
+    return entry
+
+
+def store_shared_market_cache(
+    cache_key: str,
+    status_code: int,
+    payload: dict[str, Any],
+    ttl_seconds: int,
+) -> None:
+    """
+    Grava candles/payouts no cache compartilhado do processo.
+
+    Args:
+        cache_key: Chave normalizada (ativo/intervalo/vela).
+        status_code: HTTP de origem.
+        payload: Corpo já no contrato ``{ok, data, error}``.
+        ttl_seconds: Validade da entrada.
+
+    Returns:
+        None.
+    """
+    _shared_market_cache[cache_key] = BullexResponseCacheEntry(
+        status_code=status_code,
+        payload=deepcopy(payload),
+        expires_at=utc_now() + timedelta(seconds=ttl_seconds),
+    )
+    logger.info(
+        "[SHARED_MARKET_CACHE_STORE] cache_key=%s ttl=%s",
+        cache_key,
+        ttl_seconds,
+    )
+
+
+def seed_user_cache_from_shared(
+    user_id: str,
+    cache_key: str,
+    entry: BullexResponseCacheEntry,
+) -> None:
+    """
+    Copia uma entrada compartilhada para o cache por usuário.
+
+    Args:
+        user_id: Dono do cache pessoal (fallback stale continua funcionando).
+        cache_key: Mesma chave usada no GET.
+        entry: Entrada compartilhada vigente.
+
+    Returns:
+        None.
+    """
+    cache = get_session_cache(user_id)
+    copied = deepcopy(entry)
+    cache.responses[cache_key] = copied
+    cache.last_successful_responses[cache_key] = deepcopy(entry)
+
+
+def shared_market_result_is_shareable(status_code: int, payload: dict[str, Any]) -> bool:
+    """
+    Diz se o resultado de mercado pode ser reutilizado por outro usuário.
+
+    Args:
+        status_code: HTTP da resposta.
+        payload: Corpo normalizado.
+
+    Returns:
+        False só para erro de sessão do usuário líder (os outros devem
+        tentar com a própria sessão). Infra (timeout/5xx) é compartilhada
+        para não repetir o stampede.
+    """
+    error = str((payload or {}).get("error") or "").strip().upper()
+    if error in {SESSION_DISCONNECTED, SESSION_NOT_FOUND, "INVALID_SESSION"}:
+        return False
+    if status_code in {401, 403, 409} and error:
+        return False
+    return True
+
+
+def stale_shared_market_response(
+    cache_key: str,
+    *,
+    max_age_seconds: int = STALE_MARKET_DATA_SECONDS,
+) -> BullexResponseCacheEntry | None:
+    """
+    Devolve cache compartilhado expirado ainda dentro da janela stale.
+
+    Args:
+        cache_key: Chave normalizada.
+        max_age_seconds: Folga após o TTL fresco.
+
+    Returns:
+        Entrada stale ou ``None``.
+    """
+    entry = _shared_market_cache.get(cache_key)
+    if entry is None:
+        return None
+    stale_until = entry.expires_at + timedelta(seconds=max_age_seconds)
+    return entry if utc_now() <= stale_until else None
+
+
+def stale_shared_or_user_market_response(
+    user_id: str,
+    cache_key: str,
+    *,
+    max_age_seconds: int = STALE_MARKET_DATA_SECONDS,
+) -> BullexResponseCacheEntry | None:
+    """
+    Prefere cache compartilhado (fresco ou stale) ao cache pessoal.
+
+    Args:
+        user_id: Usuário que sofreu timeout/erro.
+        cache_key: Chave do GET.
+        max_age_seconds: Janela stale.
+
+    Returns:
+        Melhor entrada disponível ou ``None``.
+    """
+    shared = stale_shared_market_response(cache_key, max_age_seconds=max_age_seconds)
+    if shared is not None:
+        return shared
+    return stale_successful_response(
+        user_id,
+        cache_key,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def _get_shared_market_lock(cache_key: str) -> asyncio.Lock:
+    """Lock por ativo/vela — serializa o GET e vira single-flight."""
+    lock = _shared_market_locks.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _shared_market_locks[cache_key] = lock
+    return lock
+
+
+def get_bullex_http_semaphore() -> asyncio.Semaphore:
+    """
+    Semáforo global do pool httpx → bullex-service.
+
+    Recria se o event loop mudou (cada teste IsolatedAsyncio sobe um loop).
+
+    Returns:
+        Semáforo limitado a ``BULLEX_HTTP_MAX_INFLIGHT``.
+    """
+    global _bullex_http_semaphore, _bullex_http_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _bullex_http_semaphore is None or _bullex_http_semaphore_loop is not loop:
+        _bullex_http_semaphore = asyncio.Semaphore(BULLEX_HTTP_MAX_INFLIGHT)
+        _bullex_http_semaphore_loop = loop
+    return _bullex_http_semaphore
 
 
 def schedule_background_refresh(
@@ -1016,10 +1683,17 @@ def schedule_background_refresh(
     *,
     params: dict[str, Any] | None = None,
 ) -> None:
-    if method != "GET" or path not in {"/candles", "/payouts"}:
+    if method != "GET" or path not in SHARED_MARKET_PATHS:
         return
     cache_key = build_cache_key(path, params)
-    task_key = (user_id, path, cache_key)
+    shared = _shared_market_cache.get(cache_key)
+    if shared is not None:
+        remaining = (shared.expires_at - utc_now()).total_seconds()
+        if remaining > SHARED_MARKET_REFRESH_REMAINING_SECONDS:
+            return
+    # Uma refresh por ativo/vela — não por usuário. 33 robôs no mesmo hit
+    # geravam 33 force_refresh e enchiam o pool httpx.
+    task_key = ("shared", path, cache_key)
     if task_key in background_refresh_tasks:
         return
     background_refresh_tasks.add(task_key)
@@ -1079,6 +1753,27 @@ def cache_bullex_response(user_id: str, path: str, status_code: int, payload: di
     cache.responses[path] = entry
     if payload.get("ok") and payload_connected_state(payload) is not False:
         cache.last_successful_responses[path] = deepcopy(entry)
+
+
+def cached_response_age_seconds(user_id: str, cache_key: str) -> float | None:
+    """
+    Há quanto tempo a resposta guardada para ``cache_key`` chegou da corretora.
+
+    Args:
+        user_id: Dono da sessão.
+        cache_key: Rota no cache (ex.: ``/sessions/status``).
+
+    Returns:
+        Idade em segundos, ou ``None`` se não há entrada cacheada.
+    """
+    cached = get_session_cache(user_id).responses.get(cache_key)
+    if cached is None:
+        return None
+    received_at = getattr(cached, "received_at", None)
+    if received_at is None:
+        return None
+    age = (utc_now() - received_at).total_seconds()
+    return age if age >= 0 else 0.0
 
 
 def cached_successful_response(
@@ -1497,6 +2192,61 @@ def cached_payout_for_active(user_id: str, symbol: str) -> float | None:
     return extract_payout(cached.payload, normalized_symbol) if cached is not None else None
 
 
+def resolve_analysis_timeout_cache(
+    user_id: str,
+    symbol: str,
+    timeframe: str,
+    *,
+    endtime: int | None = None,
+) -> tuple[list[dict[str, Any]], float | None, bool]:
+    """Resolve candles/payout em cache quando o ``analyze`` estoura o timeout.
+
+    Prefere o cache compartilhado ainda no TTL (o mesmo dado que outras
+    contas usam para comprar). Só então cai no cache pessoal, inclusive
+    na janela stale. ``is_fresh`` é True somente se as candles ainda não
+    expiraram — timeout de 5s com cache de 60s **não** é dado velho.
+
+    Args:
+        user_id: Usuário do worker.
+        symbol: Ativo em análise.
+        timeframe: Timeframe operacional.
+        endtime: Epoch alinhado da vela, se houver.
+
+    Returns:
+        ``(candles, payout, is_fresh)``. Lista vazia se não houver cache.
+    """
+    normalized = normalize_binary_active(symbol)
+    candle_params: dict[str, Any] = {
+        "active": normalized,
+        "interval": TIMEFRAME_SECONDS[timeframe],
+        "count": ROBOT_CANDLE_COUNT,
+    }
+    if endtime is not None:
+        candle_params["endtime"] = endtime
+    candle_key = build_cache_key("/candles", candle_params)
+    payout_key = build_cache_key("/payouts", {"active": normalized})
+    now = utc_now()
+
+    candle_entry = get_shared_market_cache_entry(candle_key)
+    candle_fresh = candle_entry is not None
+    if candle_entry is None:
+        candle_entry = cached_market_response(user_id, "/candles", candle_params)
+        if candle_entry is not None:
+            candle_fresh = now < candle_entry.expires_at
+    if candle_entry is None:
+        return [], None, False
+
+    payout_entry = get_shared_market_cache_entry(payout_key)
+    if payout_entry is None:
+        payout_entry = cached_market_response(user_id, "/payouts", {"active": normalized})
+    payout = (
+        extract_payout(payout_entry.payload, normalized)
+        if payout_entry is not None
+        else None
+    )
+    return extract_candles(candle_entry.payload), payout, candle_fresh
+
+
 def cached_payout_payload_for_active(user_id: str, symbol: str) -> dict[str, Any] | None:
     """Retorna o payload completo de ``/payouts`` em cache (inclui open_turbo/binary).
 
@@ -1550,12 +2300,87 @@ def execution_channel_flag_for_timeframe(timeframe: str) -> str:
     return "open_turbo" if 0 < minutes <= 5 else "open_binary"
 
 
+# Recusas seguidas POR ATIVO, somando todas as contas: {symbol: (strikes, quando)}.
+#
+# A contagem e global de proposito. "asset is not available" e uma condicao da
+# CORRETORA, nao da conta: quando o par cai, ele cai para todo mundo. Medido em
+# 08/09/2026 com a contagem por (usuario, ativo): o EURJPY-OTC ainda queimava um
+# ciclo em CADA conta antes de escalar — cinco contas diferentes registrando
+# `strikes=1` no mesmo par, na mesma janela.
+#
+# O que segue por usuario e a APLICACAO do cooldown (`active_cooldowns`), e isso
+# e deliberado: nenhuma conta e barrada pela recusa de outra. A conta so entra em
+# cooldown quando ela mesma bate no par — o que muda e o DEGRAU em que ela entra,
+# ja informado pelo que as outras descobriram.
+_unavailable_asset_strikes: dict[str, tuple[int, datetime]] = {}
+
+
+def register_unavailable_asset_strike(symbol: str) -> int:
+    """Conta mais uma recusa "asset is not available" do par, em qualquer conta.
+
+    Recusas separadas por mais de ``UNAVAILABLE_ASSET_STRIKE_DECAY_SECONDS``
+    não se somam — a contagem recomeça do zero.
+
+    Args:
+        symbol: Ativo recusado (nome interno).
+
+    Returns:
+        Número de recusas seguidas, começando em 1.
+    """
+    normalized = normalize_binary_active(symbol)
+    if not normalized:
+        return 1
+    now = utc_now()
+    anterior = _unavailable_asset_strikes.get(normalized)
+    if anterior is not None:
+        strikes, quando = anterior
+        if (now - quando).total_seconds() <= UNAVAILABLE_ASSET_STRIKE_DECAY_SECONDS:
+            strikes += 1
+        else:
+            strikes = 1
+    else:
+        strikes = 1
+    _unavailable_asset_strikes[normalized] = (strikes, now)
+    return strikes
+
+
+def clear_unavailable_asset_strikes(symbol: str) -> None:
+    """Zera a contagem do par depois de uma ordem aceita em qualquer conta.
+
+    Ordem aceita é a prova de que o par voltou — vale para todas as contas,
+    pela mesma razão que a contagem é global.
+
+    Args:
+        symbol: Ativo que acabou de entrar.
+
+    Returns:
+        None.
+    """
+    normalized = normalize_binary_active(symbol)
+    if normalized:
+        _unavailable_asset_strikes.pop(normalized, None)
+
+
+def unavailable_asset_cooldown_seconds(strikes: int) -> int:
+    """Degrau da escada de cooldown para o número de recusas seguidas.
+
+    Args:
+        strikes: Recusas seguidas, começando em 1.
+
+    Returns:
+        Segundos de cooldown; o último degrau vale para todas as recusas acima.
+    """
+    ladder = UNAVAILABLE_ASSET_COOLDOWN_LADDER_SECONDS
+    indice = min(max(int(strikes), 1), len(ladder)) - 1
+    return int(ladder[indice])
+
+
 def mark_execution_channel_unavailable(
     user_id: str,
     symbol: str,
     timeframe: str,
     *,
-    seconds: int = UNAVAILABLE_ASSET_COOLDOWN_SECONDS,
+    seconds: int | None = None,
 ) -> None:
     """Após rejeição da corretora, força cooldown e canal fechado no cache.
 
@@ -1575,11 +2400,15 @@ def mark_execution_channel_unavailable(
     normalized = normalize_binary_active(symbol)
     if not normalized:
         return
+    strikes = register_unavailable_asset_strike(normalized)
+    cooldown_seconds = (
+        int(seconds) if seconds is not None else unavailable_asset_cooldown_seconds(strikes)
+    )
     set_named_cooldown(
         active_cooldowns,
         user_id,
         normalized,
-        seconds=seconds,
+        seconds=cooldown_seconds,
         log_label="ACTIVE_COOLDOWN",
         status=STATUS_ACTIVE_COOLDOWN,
         reason="ACTIVE_COOLDOWN",
@@ -1615,11 +2444,12 @@ def mark_execution_channel_unavailable(
             patched += 1
     logger.warning(
         "[EXECUTION_CHANNEL_MARKED_UNAVAILABLE] user_id=%s symbol=%s channel=%s "
-        "cooldown=%ss cache_entries=%s",
+        "cooldown=%ss strikes=%s cache_entries=%s",
         user_id,
         normalized,
         channel_key,
-        seconds,
+        cooldown_seconds,
+        strikes,
         patched,
     )
 
@@ -1870,6 +2700,33 @@ def payout_cooldown_remaining(user_id: str, symbol: str) -> float | None:
     return get_named_cooldown(payout_cooldowns, user_id, normalize_binary_active(symbol))
 
 
+def repeat_entry_cooldown_remaining(user_id: str, symbol: str) -> float | None:
+    """Segundos restantes do cooldown de não repetir o mesmo par na vela seguinte."""
+    return get_named_cooldown(repeat_entry_cooldowns, user_id, normalize_binary_active(symbol))
+
+
+def mark_repeat_entry_cooldown(user_id: str, symbol: str, timeframe: str) -> None:
+    """Após uma ordem aceita, não reentrar no mesmo ativo na próxima vela.
+
+    Args:
+        user_id: Dono da conta.
+        symbol: Ativo que acabou de operar.
+        timeframe: M1/M5/M15 (duração do cooldown = 1 vela).
+    """
+    if not REPEAT_ENTRY_HARD_BLOCK:
+        return
+    seconds = int(TIMEFRAME_SECONDS.get(str(timeframe or "M1").strip().upper(), 60))
+    set_named_cooldown(
+        repeat_entry_cooldowns,
+        user_id,
+        normalize_binary_active(symbol),
+        seconds=seconds,
+        log_label="REPEAT_ENTRY_COOLDOWN",
+        status="REPEAT_ENTRY",
+        reason="REPEAT_ENTRY",
+    )
+
+
 class GatewayConfig:
     def __init__(self) -> None:
         self.bullex_service_url = os.getenv("BULLEX_SERVICE_URL", "http://bullex-service:8000").rstrip("/")
@@ -1902,7 +2759,6 @@ class GatewayConfig:
             os.getenv("AUTH_ALLOW_LEGACY_HEADERS", "").strip().lower() == "true"
             or (self.app_env != "production" and not self.supabase_url)
         )
-        self.robot_real_max_entry = float(os.getenv("ROBOT_REAL_MAX_ENTRY", str(MAX_REAL_ENTRY)))
         self.admin_emails = {
             email.strip().lower()
             for email in os.getenv("ADMIN_EMAILS", "").split(",")
@@ -2042,6 +2898,71 @@ bullex_ssid_reconnect_at: dict[str, datetime] = {}
 # segundos. Em 08/08 foram 356 cliques de 77 clientes — 76 deles clicando
 # repetido, um chegou a 25 vezes, achando que o botão estava quebrado.
 bullex_manual_disconnect: set[str] = set()
+
+
+def set_manual_disconnect(user_id: str, active: bool) -> None:
+    """Marca/limpa a desconexão manual nos DOIS processos.
+
+    O set vive na memória de cada processo, mas quem publica o snapshot que o
+    painel recebe por WS é o robot-runtime (``build_robot_state_snapshot_payload``
+    devolve ``robot_bus.get_snapshot`` em modo external). Sem propagar, o runtime
+    seguia mandando ``connected: true`` depois do clique e o painel voltava para
+    "Conectado" sozinho — era por isso que o cliente clicava em Desconectar duas
+    ou três vezes e ainda precisava recarregar a página.
+    """
+    if active:
+        bullex_manual_disconnect.add(user_id)
+    else:
+        bullex_manual_disconnect.discard(user_id)
+    # Durável: o set em memória sumia em todo restart do gateway e o poll
+    # seguinte reconectava com a senha salva.
+    robot_bus.set_manual_disconnect(user_id, active)
+    if robot_runtime_mode() == "external":
+        robot_bus.publish_command(user_id, "disconnect" if active else "reconnected")
+
+
+def is_manual_disconnect(user_id: str) -> bool:
+    """Diz se o cliente pediu desconexão e ainda não reconectou.
+
+    O Redis é a autoridade; o ``set`` local é só espelho (e fallback se o
+    Redis não responder). Ler do Redis também cura processo que subiu depois
+    do clique — caso do gateway recriado por deploy.
+    """
+    remote = robot_bus.is_manual_disconnect(user_id)
+    if remote is None:
+        return user_id in bullex_manual_disconnect
+    if remote:
+        bullex_manual_disconnect.add(user_id)
+    else:
+        bullex_manual_disconnect.discard(user_id)
+    return remote
+
+
+def panel_auto_reconnect_allowed(user_id: str) -> bool:
+    """Diz se o POLL DO PAINEL pode disparar reconexão automática.
+
+    Abrir uma página não pode logar na corretora sozinho. Relato do dono em
+    09/08 e de novo em 10/08: "entro no ElCapo, vou em configurações e mesmo
+    sem clicar em 'Entrar na Bullex' ele conecta sozinho depois de uns
+    segundos". A causa é o poll de ``/bullex/status`` e ``/bullex/account``
+    chamando ``try_auto_reconnect_with_saved_credentials``.
+
+    A regra: a sessão só volta sozinha quando o **robô está ligado** — aí ela
+    é condição para operar e a queda foi involuntária (corretora/SSID), que é
+    o caso do incidente de 07/08. Com o robô desligado, conectar é decisão
+    explícita do cliente, via ``POST /bullex/connect``.
+
+    A desconexão manual vence as duas coisas: nem robô ligado reconecta.
+    """
+    if is_manual_disconnect(user_id):
+        return False
+    try:
+        return bool(auto_trader.get(user_id).enabled)
+    except Exception:
+        logger.warning("[PANEL_AUTO_RECONNECT_STATE_FAILED] user_id=%s", user_id, exc_info=True)
+        return False
+
+
 # Gate global: após requests_limit_exceeded, ninguém tenta login até o TTL.
 bullex_login_rate_limited_until: datetime | None = None
 BULLEX_AUTO_RECONNECT_COOLDOWN_SECONDS = 60
@@ -2173,42 +3094,135 @@ async def apply_marketing_result_override(
     return normalized, real_profit
 
 
+def publish_marketing_score_to_overlay(
+    user_id: str,
+    *,
+    trust_local_score: bool = False,
+) -> dict[str, Any] | None:
+    """
+    Espelha o placar do gateway no Redis/WS e no robot-runtime.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` o overlay lê ``robot:snapshot``.
+    ``persist_robot`` no gateway não grava Redis; sem este publish o
+    Shift+O gerava o histórico e o El Capo visual ficava 0-0.
+
+    Args:
+        user_id: Conta marketing autenticada.
+        trust_local_score: Se True, publica o placar já em memória sem
+            reconciliar com Redis/DB (obrigatório após exclusão — o
+            reconcile “nunca rebaixa” desfazia a baixa de WIN/LOSS).
+
+    Returns:
+        Envelope publicado, ou None se o usuário estiver em branco.
+    """
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        return None
+    payload = publish_robot_control_snapshot(
+        normalized,
+        trust_local_score=trust_local_score,
+    )
+    if robot_runtime_mode() == "external":
+        state = auto_trader.get(normalized)
+        wins = max(0, int(state.wins or 0))
+        losses = max(0, int(state.losses or 0))
+        profit = round(float(state.profit or 0), 2)
+        robot_bus.publish_command(
+            normalized,
+            "apply_score",
+            wins=wins,
+            losses=losses,
+            profit=profit,
+        )
+        logger.info(
+            "[MARKETING_SCORE_DELEGATED] user_id=%s wins=%s losses=%s profit=%s",
+            normalized,
+            wins,
+            losses,
+            profit,
+        )
+    return payload
+
+
 def sync_marketing_display_to_robot(
     user_id: str,
     history: list[dict[str, Any]],
     stats: dict[str, Any],
 ) -> None:
     """
-    Alinha placar e histórico do robô ao histórico editável do Shift+O.
+    Alinha o placar do robô ao lote informado e faz upsert no histórico.
 
-    Mantém o visual da conta marketing idêntico ao do cliente: dashboard,
-    histórico e overlay leem os mesmos endpoints `/robot/*`.
+    Não apaga operações já persistidas: novas simulações entram como linhas
+    extras e o overlay recebe o placar do lote (ou acumula, se
+    ``stats['accumulate']``). A exclusão continua pontual via
+    ``delete_marketing_robot_history_item``.
     """
+    from backend.marketing_simulation_service import MarketingSimulationService
+    from backend.robot_persistence import TRADE_ANALYSIS_FIELDS
+
     if not user_id:
         return
     try:
         state = auto_trader.get(user_id)
-        state.wins = max(0, int(stats.get("wins") or 0))
-        state.losses = max(0, int(stats.get("losses") or 0))
-        state.profit = float(stats.get("profit") or 0)
-        persist_robot(user_id)
+        if not stats.get("skip_score"):
+            incoming_wins = max(0, int(stats.get("wins") or 0))
+            incoming_losses = max(0, int(stats.get("losses") or 0))
+            incoming_profit = float(stats.get("profit") or 0)
+            # Placar de vitrine: `set_display_score` joga a diferença em
+            # `stop_offset_*` para o stop seguir contando só ordem real.
+            if stats.get("accumulate"):
+                set_display_score(
+                    state,
+                    int(state.wins) + incoming_wins,
+                    int(state.losses) + incoming_losses,
+                    float(state.profit) + incoming_profit,
+                )
+            else:
+                set_display_score(state, incoming_wins, incoming_losses, incoming_profit)
+            # Confia no placar local: reconcile com Redis antigo desfazia
+            # exclusão/geração com total menor que o snapshot prévio.
+            # Persist antes do publish para o enrich do GET não reelevar pela DB.
+            mark_session_score_authority(
+                user_id,
+                state.wins,
+                state.losses,
+                state.profit,
+            )
+            persist_robot(user_id)
+            publish_marketing_score_to_overlay(user_id, trust_local_score=True)
     except Exception:
         logger.exception("[MARKETING_SCORE_SYNC_FAILED] user_id=%s", user_id)
         return
 
     try:
-        # As três fontes de `/robot/history` (banco, espelho de restauração e
-        # memória) precisam sair alinhadas, senão a exclusão volta no F5.
-        robot_persistence.clear_trade_history(user_id)
-        robot_persistence.clear_finished_trades(user_id)
+        # Upsert das operações novas/editadas. NÃO apaga o histórico antigo:
+        # "Simular operação" / gerar placar só cria linhas e atualiza o placar.
+        memory_by_id: dict[str, dict[str, Any]] = {}
+        for item in auto_trader.history(user_id).get("trades") or []:
+            order_id = str(item.get("order_id") or "").strip()
+            if order_id:
+                memory_by_id[order_id] = dict(item)
+        for item in robot_persistence.load_trade_history(user_id, 90):
+            order_id = str(item.get("order_id") or "").strip()
+            if order_id and order_id not in memory_by_id:
+                memory_by_id[order_id] = dict(item)
+
         synced_trades: list[dict[str, Any]] = []
-        for item in history:
+        for raw_item in history:
+            item = MarketingSimulationService.enrich_trade_with_strategy(dict(raw_item))
             # Operação ao vivo espelhada no Shift+O mantém o order_id da
             # Bullex para não duplicar com a linha já registrada pelo robô.
             trade_id = str(item.get("broker_order_id") or item.get("id") or "").strip()
             result = str(item.get("result") or "").strip().upper()
             if not trade_id or result not in {"WIN", "LOSS"}:
                 continue
+            existing = memory_by_id.get(trade_id)
+            if item.get("broker_order_id") and isinstance(existing, dict):
+                for field in TRADE_ANALYSIS_FIELDS:
+                    if existing.get(field) is not None:
+                        item[field] = existing[field]
+                if existing.get("timeframe"):
+                    item["timeframe"] = str(existing.get("timeframe")).upper()
             created_at = item.get("created_at") or datetime.now(timezone.utc).isoformat()
             trade = {
                 "order_id": trade_id,
@@ -2223,36 +3237,133 @@ def sync_marketing_display_to_robot(
                 "account_mode": "REAL",
                 "is_gale": False,
                 "gale_step": None,
+                "timeframe": str(
+                    item.get("timeframe") or item.get("period") or MarketingSimulationService.DEFAULT_PERIOD
+                ).upper(),
             }
+            for field in TRADE_ANALYSIS_FIELDS:
+                value = item.get(field)
+                if value is not None:
+                    trade[field] = value
             robot_persistence.save_trade_history(user_id, trade)
             invalidate_daily_history_cache(user_id)
             synced_trades.append(trade)
-        auto_trader.replace_history(user_id, synced_trades)
+            memory_by_id[trade_id] = trade
+        merged = list(memory_by_id.values())
+        merged.sort(key=lambda trade: str(trade.get("finished_at") or trade.get("sent_at") or ""))
+        auto_trader.replace_history(user_id, merged)
     except Exception:
         logger.exception("[MARKETING_HISTORY_SYNC_FAILED] user_id=%s", user_id)
 
 
-def delete_marketing_robot_history_item(user_id: str, order_id: str) -> bool:
+def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
     """
-    Remove uma operação do histórico `/robot` e ajusta o placar da sessão.
+    Subtrai WIN/LOSS/lucro de uma operação excluída do placar da sessão.
+
+    Adota o placar vivo do Redis antes de decrementar — em mode=external a
+    memória do gateway pode estar 0-0 enquanto o overlay ainda mostra o
+    placar real; decrementar em cima do zero e publicar ``apply_score``
+    apagava o placar em vez de só remover a operação.
+
+    Depois do decremento, persiste e publica com ``trust_local_score=True``.
+    Sem isso, ``publish_robot_control_snapshot`` chamava o reconcile que
+    “nunca rebaixa” e readotava o Redis antigo (ex.: 5x3), desfazendo a
+    exclusão no overlay.
+
+    Args:
+        user_id: Conta marketing autenticada.
+        trade: Operação removida (precisa de ``result`` e opcionalmente
+            ``profit``).
+    """
+    normalized_user = str(user_id or "").strip()
+    if not normalized_user or not isinstance(trade, dict):
+        return
+    result = str(trade.get("result") or "").strip().upper()
+    if result not in {"WIN", "LOSS"}:
+        # Sem WIN/LOSS não há o que subtrair, mas o silêncio aqui já custou
+        # dois diagnósticos: a operação sumia do Histórico e ficava no placar.
+        logger.warning(
+            "[MARKETING_SCORE_REMOVAL_SKIPPED] user_id=%s order_id=%s result=%s "
+            "reason=NO_RESULT",
+            normalized_user,
+            trade.get("order_id") or trade.get("id"),
+            result or None,
+        )
+        return
+    try:
+        profit = float(trade.get("profit") or 0)
+    except (TypeError, ValueError):
+        profit = 0.0
+    try:
+        adopt_live_session_score_if_blank(normalized_user)
+        state = auto_trader.get(normalized_user)
+        # Tirar do placar não desfaz dinheiro na corretora: a baixa vai para
+        # `stop_offset_*` e o stop continua vendo a operação real.
+        set_display_score(
+            state,
+            int(state.wins) - (1 if result == "WIN" else 0),
+            int(state.losses) - (1 if result == "LOSS" else 0),
+            float(state.profit) - profit,
+        )
+        # Marca ANTES de persistir/publicar: o persist é assíncrono e o
+        # snapshot do runtime pode chegar no meio. A partir daqui todo
+        # reconcile (gateway e runtime) obedece a este placar.
+        mark_session_score_authority(
+            normalized_user,
+            state.wins,
+            state.losses,
+            state.profit,
+        )
+        persist_robot(normalized_user)
+        publish_marketing_score_to_overlay(
+            normalized_user,
+            trust_local_score=True,
+        )
+        logger.info(
+            "[MARKETING_SCORE_REMOVED] user_id=%s result=%s wins=%s losses=%s profit=%s",
+            normalized_user,
+            result,
+            state.wins,
+            state.losses,
+            state.profit,
+        )
+    except Exception:
+        logger.exception(
+            "[MARKETING_SCORE_ADJUST_FAILED] user_id=%s order_id=%s",
+            normalized_user,
+            trade.get("order_id") or trade.get("id"),
+        )
+
+
+def delete_marketing_robot_history_item(
+    user_id: str,
+    order_id: str,
+    *,
+    adjust_score: bool = True,
+) -> dict[str, Any] | None:
+    """
+    Remove uma operação do histórico `/robot` e, opcionalmente, ajusta o placar.
 
     Usado quando a exclusão na conta marketing aponta para um ``order_id`` da
-    Bullex (não-UUID), que não existe em ``marketing_simulated_trades``.
-    Remove a linha das três fontes lidas pelo histórico — ``robot_trade_history``,
-    o espelho de restauração ``robot_trades`` e a memória do ``auto_trader`` —
-    para ela não voltar no próximo ``GET /robot/history`` nem após um restart.
+    Bullex (não-UUID), que não existe em ``marketing_simulated_trades``, ou
+    para o UUID do Shift+O. Remove a linha das três fontes lidas pelo
+    histórico — ``robot_trade_history``, o espelho ``robot_trades`` e a
+    memória do ``auto_trader`` — para ela não voltar no próximo
+    ``GET /robot/history`` nem após um restart.
 
     Args:
         user_id: Usuário autenticado da sessão marketing.
         order_id: Identificador da operação no histórico do robô.
+        adjust_score: Se False, só limpa as fontes (o caller ajusta uma vez
+            após limpar UUID e ``broker_order_id``).
 
     Returns:
-        True quando a linha foi removida de ao menos uma das fontes.
+        Metadados da operação removida, ou None se não havia linha.
     """
     normalized_user = str(user_id or "").strip()
     normalized_order = str(order_id or "").strip()
     if not normalized_user or not normalized_order:
-        return False
+        return None
     try:
         deleted = robot_persistence.delete_trade_history_item(
             normalized_user,
@@ -2264,12 +3375,13 @@ def delete_marketing_robot_history_item(user_id: str, order_id: str) -> bool:
             normalized_user,
             normalized_order,
         )
-        return False
+        return None
 
-    removed_memory = False
+    memory_trade: dict[str, Any] | None = None
     try:
-        removed_memory = bool(
-            auto_trader.remove_history_trade(normalized_user, normalized_order)
+        memory_trade = auto_trader.remove_history_trade(
+            normalized_user,
+            normalized_order,
         )
     except Exception:
         logger.exception(
@@ -2277,6 +3389,24 @@ def delete_marketing_robot_history_item(user_id: str, order_id: str) -> bool:
             normalized_user,
             normalized_order,
         )
+
+    # Ordem ao vivo pode existir SÓ no espelho ``robot_trades``. Ler a linha
+    # ANTES de apagar: ``delete_trade`` devolve apenas bool, e sem
+    # ``result``/``profit`` o ajuste do placar saía em silêncio — a operação
+    # sumia do Histórico e continuava contada no placar.
+    mirror_trade: dict[str, Any] | None = None
+    if deleted is None and memory_trade is None:
+        try:
+            for item in robot_persistence.load_trades(normalized_user) or []:
+                if str(item.get("order_id") or "").strip() == normalized_order:
+                    mirror_trade = dict(item)
+                    break
+        except Exception:
+            logger.exception(
+                "[MARKETING_ROBOT_TRADE_READ_FAILED] user_id=%s order_id=%s",
+                normalized_user,
+                normalized_order,
+            )
 
     removed_mirror = False
     try:
@@ -2290,27 +3420,15 @@ def delete_marketing_robot_history_item(user_id: str, order_id: str) -> bool:
             normalized_order,
         )
 
-    if not deleted and not removed_memory and not removed_mirror:
-        return False
+    trade_meta = deleted or memory_trade or mirror_trade
+    if trade_meta is None and not removed_mirror:
+        return None
+    if trade_meta is None:
+        trade_meta = {"order_id": normalized_order}
 
-    if deleted:
-        result = str(deleted.get("result") or "").strip().upper()
-        profit = float(deleted.get("profit") or 0)
-        try:
-            state = auto_trader.get(normalized_user)
-            if result == "WIN":
-                state.wins = max(0, int(state.wins) - 1)
-            elif result == "LOSS":
-                state.losses = max(0, int(state.losses) - 1)
-            state.profit = round(float(state.profit) - profit, 2)
-            persist_robot(normalized_user)
-        except Exception:
-            logger.exception(
-                "[MARKETING_SCORE_ADJUST_FAILED] user_id=%s order_id=%s",
-                normalized_user,
-                normalized_order,
-            )
-    return True
+    if adjust_score and isinstance(trade_meta, dict):
+        apply_marketing_score_removal(normalized_user, trade_meta)
+    return dict(trade_meta)
 
 
 async def resolve_marketing_asset_payout(user_id: str, symbol: str) -> int | None:
@@ -3098,6 +4216,7 @@ async def apply_impersonation(
         ("GET", "/robot/state"),
         ("GET", "/robot/history"),
         ("GET", "/robot/stats"),
+        ("GET", "/robot/ws-ticket"),
         ("GET", "/admin/support-sessions/current"),
         ("GET", "/admin/impersonations/current"),
         ("POST", "/bullex/connect"),
@@ -3242,6 +4361,23 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 
 
 _bullex_http_client: httpx.AsyncClient | None = None
+_bullex_order_http_client: httpx.AsyncClient | None = None
+_bullex_http_recycle_lock: asyncio.Lock | None = None
+_bullex_http_last_recycle_at: float = 0.0
+
+
+def is_bullex_order_path(method: str, path: str) -> bool:
+    """
+    Indica se a rota é POST de compra (não deve disputar o pool dos candles).
+
+    Args:
+        method: Verbo HTTP.
+        path: Caminho no bullex-service.
+
+    Returns:
+        True para ``/orders/buy-real`` e ``/orders/buy-demo``.
+    """
+    return method == "POST" and path in {"/orders/buy-real", "/orders/buy-demo"}
 
 
 def get_bullex_http_client() -> httpx.AsyncClient:
@@ -3259,9 +4395,186 @@ def get_bullex_http_client() -> httpx.AsyncClient:
                 BULLEX_UPSTREAM_TIMEOUT_SECONDS,
                 pool=BULLEX_POOL_TIMEOUT_SECONDS,
             ),
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=40),
+            limits=httpx.Limits(
+                max_connections=BULLEX_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=BULLEX_HTTP_MAX_CONNECTIONS,
+            ),
         )
     return _bullex_http_client
+
+
+def get_bullex_order_http_client() -> httpx.AsyncClient:
+    """
+    Client keep-alive só para POST de ordem.
+
+    O pool de candles (40 conexões, semáforo 40) enche no fechamento da vela.
+    A compra REAL precisa de conexão livre nesse instante; senão o wait_for
+    cancela o POST depois da BullEx já ter criado o ``order_id``.
+
+    Returns:
+        ``httpx.AsyncClient`` do pool de ordens, ou o client de teste injetado.
+    """
+    global _bullex_order_http_client
+    closed = bool(getattr(_bullex_order_http_client, "is_closed", False))
+    if _bullex_order_http_client is not None and not closed:
+        return _bullex_order_http_client
+    if _bullex_http_client is not None and type(_bullex_http_client) is not httpx.AsyncClient:
+        return _bullex_http_client
+    _bullex_order_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            BULLEX_BUY_TIMEOUT_SECONDS,
+            pool=BULLEX_POOL_TIMEOUT_SECONDS,
+        ),
+        limits=httpx.Limits(
+            max_connections=BULLEX_ORDER_HTTP_MAX_CONNECTIONS,
+            max_keepalive_connections=BULLEX_ORDER_HTTP_MAX_CONNECTIONS,
+        ),
+    )
+    return _bullex_order_http_client
+
+
+def bullex_pool_active_count() -> int | None:
+    """
+    Conta conexões não-ociosas do pool httpx do runtime.
+
+    Returns:
+        Quantidade de conexões ativas, ou ``None`` se a API interna do httpx
+        não estiver disponível (testes / client falso).
+    """
+    try:
+        connections = _bullex_http_client._transport._pool.connections
+        idle = sum(1 for connection in connections if connection.is_idle())
+        return len(connections) - idle
+    except Exception:
+        return None
+
+
+def should_recycle_bullex_http_client(exc: BaseException) -> bool:
+    """
+    Decide se o client keep-alive deve ser recriado após um timeout.
+
+    Só ``PoolTimeout`` indica pool vazado (request morreu na fila). Reciclar
+    em ``ConnectTimeout``/``TimeoutError`` fecha conexões no meio do handshake
+    e gera a tempestade de recycle vista em 18/08 à tarde.
+
+    Args:
+        exc: Exceção de timeout do httpx ou do ``wait_for``.
+
+    Returns:
+        True apenas quando a request nem saiu do pool (``PoolTimeout``).
+    """
+    return isinstance(exc, httpx.PoolTimeout)
+
+
+def bullex_timeout_for_request(method: str, path: str) -> float:
+    """
+    Timeout HTTP do runtime para cada rota do bullex-service.
+
+    Args:
+        method: Verbo HTTP (GET/POST/…).
+        path: Caminho no bullex-service (ex.: ``/candles``, ``/orders/buy-real``).
+
+    Returns:
+        Segundos de espera, incluindo o ``wait_for`` externo.
+    """
+    if method == "POST" and path == "/sessions/connect":
+        return BULLEX_CONNECT_TIMEOUT_SECONDS
+    if method == "GET" and path in {"/candles", "/payouts"}:
+        return BULLEX_MARKET_DATA_TIMEOUT_SECONDS
+    if method == "POST" and path in {"/orders/buy-real", "/orders/buy-demo"}:
+        return BULLEX_BUY_TIMEOUT_SECONDS
+    return BULLEX_UPSTREAM_TIMEOUT_SECONDS
+
+
+# Reauditoria 2026-09-03: com o early stop ligado, 602 de 1.493 varreduras de
+# produção pontuaram **1 ativo de 10** e 92% terminaram com `allowed=1`. O
+# ranking de substituição de 13/08 (`candidate_rank`) precisa de mais de um
+# candidato para tirar o slot do setup WEAK — com um candidato só ele é código
+# inerte. Desligar o early stop é a única alavanca que o histórico não consegue
+# estimar, porque os candidatos alternativos nunca foram calculados.
+#
+# `ANALYSIS_EARLY_STOP=true` volta ao comportamento antigo para comparação A/B.
+ANALYSIS_EARLY_STOP_ENABLED = os.getenv("ANALYSIS_EARLY_STOP", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
+def analysis_payload_allows_early_stop(payload: Any) -> bool:
+    """
+    Indica se o scan pode parar porque já existe CALL/PUT aprovado.
+
+    Args:
+        payload: Resposta de ``analyze_active_signal`` (``{ok, data}``).
+
+    Returns:
+        True se ``trade_allowed`` e direção CALL/PUT.
+    """
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    signal = str(data.get("signal") or data.get("direction") or "").upper()
+    return bool(data.get("trade_allowed")) and signal in {"CALL", "PUT"}
+
+
+def should_keep_pending_on_cycle_timeout(state: Any) -> bool:
+    """
+    Indica se o timeout do ciclo deve preservar o sinal já travado.
+
+    Args:
+        state: ``RobotState`` do usuário.
+
+    Returns:
+        True se ``pending_signal`` já existe — ``complete_cycle_without_trade``
+        apagaria a compra.
+    """
+    return bool(getattr(state, "pending_signal", None))
+
+
+async def recycle_saturated_bullex_http_client(reason: str) -> None:
+    """
+    Troca o client HTTP do processo quando o pool vaza conexões ativas.
+
+    O ponteiro global é anulado na hora para os próximos GETs nascerem limpos.
+    O ``aclose`` do client antigo roda depois; cooldown evita 40 timeouts
+    fecharem o client novo em sequência.
+
+    Args:
+        reason: Marcador de log (``PoolTimeout``, ``TimeoutError``, …).
+    """
+    global _bullex_http_client, _bullex_http_last_recycle_at, _bullex_http_recycle_lock
+    if _bullex_http_recycle_lock is None:
+        _bullex_http_recycle_lock = asyncio.Lock()
+    async with _bullex_http_recycle_lock:
+        now = monotonic()
+        if (
+            _bullex_http_last_recycle_at
+            and (now - _bullex_http_last_recycle_at) < BULLEX_HTTP_RECYCLE_COOLDOWN_SECONDS
+        ):
+            return
+        stale = _bullex_http_client
+        _bullex_http_client = None
+        _bullex_http_last_recycle_at = now
+        logger.warning(
+            "[BULLEX_HTTP_CLIENT_RECYCLE] reason=%s %s",
+            reason,
+            bullex_pool_stats(),
+        )
+    if stale is None:
+        return
+    if not hasattr(stale, "aclose") or getattr(stale, "is_closed", False):
+        return
+    try:
+        await stale.aclose()
+    except Exception:
+        logger.warning(
+            "[BULLEX_HTTP_CLIENT_RECYCLE_CLOSE_FAILED] reason=%s",
+            reason,
+            exc_info=True,
+        )
 
 
 def bullex_pool_stats() -> str:
@@ -3303,6 +4616,30 @@ async def call_bullex_service(
 ) -> tuple[int, dict[str, Any]]:
     cache_key = build_cache_key(path, params)
     ttl_seconds = request_cache_ttl_seconds(path, params)
+    if (
+        method == "GET"
+        and is_shared_market_path(path)
+        and ttl_seconds is not None
+        and not force_refresh
+    ):
+        shared = get_shared_market_cache_entry(cache_key)
+        if shared is not None:
+            seed_user_cache_from_shared(user_id, cache_key, shared)
+            log_fetch_metric(
+                path,
+                monotonic(),
+                user_id=user_id,
+                source="shared_market_cache",
+                status_code=shared.status_code,
+            )
+            logger.info(
+                "[SHARED_MARKET_CACHE_HIT] user_id=%s path=%s cache_key=%s",
+                user_id,
+                path,
+                cache_key,
+            )
+            schedule_background_refresh(user_id, method, path, params=params)
+            return shared.status_code, deepcopy(shared.payload)
     if method == "GET" and ttl_seconds is not None and not allow_session_restore and not force_refresh:
         cache = get_session_cache(user_id)
         cached = cache.responses.get(cache_key)
@@ -3368,6 +4705,26 @@ async def call_bullex_service(
             else:
                 logger.warning("[BACKOFF_ACTIVE] user_id=%s path=%s retry_in=%.2f", user_id, path, remaining)
             logger.warning("[CPU_LOOP_PROTECTION] user_id=%s path=%s reason=%s", user_id, path, reason)
+            # Desconexão manual: nunca ressuscitar "conectado" a partir de
+            # cache/memória. O próprio clique liga o backoff (o /sessions/status
+            # passa a responder SESSION_NOT_FOUND), e as saídas abaixo foram
+            # feitas para queda de rede — NENHUMA delas consegue devolver
+            # "desconectado" (ver o comentário "não devolver connected:false").
+            # Resultado: `[ACCOUNT_CACHE_RETURNED] source=last_valid_cache`
+            # servia o /account de antes do clique, com o saldo antigo, e o
+            # painel voltava para "Conectado".
+            # Lê o espelho em memória, não o Redis: este é caminho quente e
+            # leitura síncrona aqui congela o event loop (ver Incidente 2).
+            if user_id in bullex_manual_disconnect:
+                logger.warning(
+                    "[BACKOFF_CACHE_SKIPPED] user_id=%s path=%s reason=manual_disconnect",
+                    user_id,
+                    path,
+                )
+                return (
+                    200 if path == "/account" else 404,
+                    disconnected_cache_payload(source="manual_disconnect"),
+                )
             successful = cached_successful_response(user_id, cache_key)
             if successful is not None:
                 if path == "/account":
@@ -3416,25 +4773,51 @@ async def call_bullex_service(
                 return 200, backoff_payload(user_id, remaining)
         # Market data has per-active isolation; session backoff must not stop the robot cycle.
 
-    headers = {"x-user-id": user_id}
-    if allow_session_restore:
-        headers["x-allow-session-restore"] = "true"
-    url = f"{config.bullex_service_url}{path}"
-    timeout_seconds = (
-        BULLEX_CONNECT_TIMEOUT_SECONDS
-        if method == "POST" and path == "/sessions/connect"
-        else BULLEX_MARKET_DATA_TIMEOUT_SECONDS
-        if method == "GET" and path in {"/candles", "/payouts"}
-        else BULLEX_UPSTREAM_TIMEOUT_SECONDS
-    )
-
-    request_started_at = monotonic()
+    market_lock = None
+    acquired_market_lock = False
+    if method == "GET" and is_shared_market_path(path):
+        market_lock = _get_shared_market_lock(cache_key)
+        await market_lock.acquire()
+        acquired_market_lock = True
+        if not force_refresh:
+            shared = get_shared_market_cache_entry(cache_key)
+            if shared is not None:
+                seed_user_cache_from_shared(user_id, cache_key, shared)
+                log_fetch_metric(
+                    path,
+                    monotonic(),
+                    user_id=user_id,
+                    source="shared_market_single_flight",
+                    status_code=shared.status_code,
+                )
+                logger.info(
+                    "[SHARED_MARKET_SINGLE_FLIGHT] user_id=%s path=%s cache_key=%s",
+                    user_id,
+                    path,
+                    cache_key,
+                )
+                schedule_background_refresh(user_id, method, path, params=params)
+                market_lock.release()
+                acquired_market_lock = False
+                return shared.status_code, deepcopy(shared.payload)
+    recycle_reason: str | None = None
     try:
-        # Client HTTP reutilizado (keep-alive) — abrir AsyncClient por chamada
-        # saturava sockets sob polling de dezenas de usuários.
-        client = get_bullex_http_client()
-        response = await asyncio.wait_for(
-            client.request(
+        headers = {"x-user-id": user_id}
+        if allow_session_restore:
+            headers["x-allow-session-restore"] = "true"
+        url = f"{config.bullex_service_url}{path}"
+        timeout_seconds = bullex_timeout_for_request(method, path)
+
+        request_started_at = monotonic()
+        try:
+            # Client HTTP reutilizado (keep-alive) — abrir AsyncClient por chamada
+            # saturava sockets sob polling de dezenas de usuários.
+            client = (
+                get_bullex_order_http_client()
+                if is_bullex_order_path(method, path)
+                else get_bullex_http_client()
+            )
+            request_coro = client.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -3445,85 +4828,337 @@ async def call_bullex_service(
                 # wait_for permanece no valor original, só como rede de
                 # segurança contra travamento real.
                 timeout=max(0.05, timeout_seconds - BULLEX_CLIENT_TIMEOUT_MARGIN_SECONDS),
-            ),
-            timeout=timeout_seconds,
+            )
+            # Compra REAL não entra no semáforo dos candles — senão espera
+            # slot enquanto 38 GETs ocupam as 40 vagas e o wait_for estoura
+            # depois da corretora já ter aceito a ordem.
+            if is_bullex_order_path(method, path):
+                response = await asyncio.wait_for(request_coro, timeout=timeout_seconds)
+            else:
+                async with get_bullex_http_semaphore():
+                    response = await asyncio.wait_for(request_coro, timeout=timeout_seconds)
+        except (asyncio.TimeoutError, httpx.TimeoutException) as timeout_exc:
+            log_fetch_metric(path, request_started_at, user_id=user_id, source="timeout")
+            # Diagnóstico puro: NÃO altera o fluxo de erro já existente abaixo.
+            # `PoolTimeout` = a request morreu na fila do pool, sem sequer sair para
+            # o bullex-service — assinatura da queda de 08/08.
+            logger.warning(
+                "[BULLEX_POOL_STATS] user_id=%s path=%s kind=%s %s",
+                user_id,
+                path,
+                type(timeout_exc).__name__,
+                bullex_pool_stats(),
+            )
+            if is_bullex_order_path(method, path):
+                logger.warning(
+                    "[BUY_HTTP_TIMEOUT] user_id=%s path=%s timeout_seconds=%.2f kind=%s",
+                    user_id,
+                    path,
+                    timeout_seconds,
+                    type(timeout_exc).__name__,
+                )
+            elif should_recycle_bullex_http_client(timeout_exc):
+                recycle_reason = type(timeout_exc).__name__
+            if path == "/account":
+                logger.warning(
+                    "[ACCOUNT_FETCH_TIMEOUT] user_id=%s timeout_seconds=%s",
+                    user_id,
+                    timeout_seconds,
+                )
+                logger.warning(
+                    "[ACCOUNT_TIMEOUT_HANDLED] user_id=%s timeout_seconds=%s",
+                    user_id,
+                    timeout_seconds,
+                )
+            if method == "POST" and path == "/sessions/connect":
+                logger.warning(
+                    "[CONNECT_TIMEOUT_HANDLED] user_id=%s timeout_seconds=%s",
+                    user_id,
+                    timeout_seconds,
+                )
+                return 504, build_error("LOGIN_TIMEOUT")
+            if method == "GET" and path in SESSION_CACHEABLE_PATHS:
+                return temporary_upstream_response(
+                    user_id,
+                    path,
+                    cache_key,
+                    reason="timeout",
+                    allow_failure_backoff=allow_failure_backoff,
+                )
+            logger.warning(
+                "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=timeout",
+                user_id,
+                path,
+            )
+            if method == "GET" and path in {"/candles", "/payouts"}:
+                stale = stale_shared_or_user_market_response(user_id, cache_key)
+                if stale is not None:
+                    logger.warning(
+                        "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=timeout",
+                        user_id,
+                        path,
+                        cache_key,
+                    )
+                    logger.info(
+                        "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
+                        user_id,
+                        normalize_binary_active(str((params or {}).get("active") or "")),
+                        path,
+                    )
+                    return 200, add_stale_warning(stale.payload)
+                symbol = normalize_binary_active(str((params or {}).get("active") or ""))
+                if symbol:
+                    set_named_cooldown(
+                        active_cooldowns if path == "/candles" else payout_cooldowns,
+                        user_id,
+                        symbol,
+                        seconds=ACTIVE_COOLDOWN_SECONDS if path == "/candles" else PAYOUT_COOLDOWN_SECONDS,
+                        log_label="ACTIVE_TIMEOUT" if path == "/candles" else "PAYOUT_TIMEOUT",
+                        status=STATUS_ACTIVE_COOLDOWN if path == "/candles" else STATUS_PAYOUT_COOLDOWN,
+                        reason="ACTIVE_TIMEOUT" if path == "/candles" else "PAYOUT_TIMEOUT",
+                    )
+            return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
+        except httpx.HTTPError as exc:
+            log_fetch_metric(path, request_started_at, user_id=user_id, source=exc.__class__.__name__)
+            if method == "GET" and path == "/payouts":
+                symbol = normalize_binary_active(str((params or {}).get("active") or ""))
+                if symbol:
+                    set_named_cooldown(
+                        payout_cooldowns,
+                        user_id,
+                        symbol,
+                        seconds=PAYOUT_COOLDOWN_SECONDS,
+                        log_label="PAYOUT_COOLDOWN",
+                        status=STATUS_PAYOUT_COOLDOWN,
+                        reason="PAYOUT_COOLDOWN",
+                    )
+            if method == "GET" and path in SESSION_CACHEABLE_PATHS:
+                return temporary_upstream_response(
+                    user_id,
+                    path,
+                    cache_key,
+                    reason=exc.__class__.__name__,
+                    allow_failure_backoff=allow_failure_backoff,
+                )
+            logger.warning(
+                "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=%s",
+                user_id,
+                path,
+                exc.__class__.__name__,
+            )
+            if method == "GET" and path in {"/candles", "/payouts"}:
+                stale = stale_shared_or_user_market_response(user_id, cache_key)
+                if stale is not None:
+                    logger.warning(
+                        "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=%s",
+                        user_id,
+                        path,
+                        cache_key,
+                        exc.__class__.__name__,
+                    )
+                    logger.info(
+                        "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
+                        user_id,
+                        normalize_binary_active(str((params or {}).get("active") or "")),
+                        path,
+                    )
+                    return 200, add_stale_warning(stale.payload)
+                symbol = normalize_binary_active(str((params or {}).get("active") or ""))
+                if symbol:
+                    set_named_cooldown(
+                        active_cooldowns if path == "/candles" else payout_cooldowns,
+                        user_id,
+                        symbol,
+                        seconds=ACTIVE_COOLDOWN_SECONDS if path == "/candles" else PAYOUT_COOLDOWN_SECONDS,
+                        log_label="ACTIVE_SKIPPED",
+                        status=STATUS_ACTIVE_COOLDOWN if path == "/candles" else STATUS_PAYOUT_COOLDOWN,
+                        reason=exc.__class__.__name__,
+                    )
+            return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
+        except Exception as exc:
+            log_fetch_metric(path, request_started_at, user_id=user_id, source=exc.__class__.__name__)
+            logger.warning(
+                "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=%s",
+                user_id,
+                path,
+                exc.__class__.__name__,
+                exc_info=True,
+            )
+            if method == "GET" and path in SESSION_CACHEABLE_PATHS:
+                return temporary_upstream_response(
+                    user_id,
+                    path,
+                    cache_key,
+                    reason=exc.__class__.__name__,
+                    allow_failure_backoff=allow_failure_backoff,
+                )
+            if method == "GET" and path in {"/candles", "/payouts"}:
+                stale = stale_shared_or_user_market_response(user_id, cache_key)
+                if stale is not None:
+                    logger.warning(
+                        "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=%s",
+                        user_id,
+                        path,
+                        cache_key,
+                        exc.__class__.__name__,
+                    )
+                    logger.info(
+                        "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
+                        user_id,
+                        normalize_binary_active(str((params or {}).get("active") or "")),
+                        path,
+                    )
+                    return 200, add_stale_warning(stale.payload)
+            return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
+
+        log_fetch_metric(path, request_started_at, user_id=user_id, source="upstream", status_code=response.status_code)
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = build_error("INVALID_BULLEX_RESPONSE")
+
+        if response.status_code == 422 and path == "/orders/buy-real":
+            logger.error(
+                "[BUY_REAL_UPSTREAM_VALIDATION_ERROR] user_id=%s payload=%s detail=%s",
+                user_id,
+                strip_ai_fields(json_body or {}),
+                payload,
+            )
+            return response.status_code, build_error("BUY_REAL_PAYLOAD_REQUIRED_FIELDS")
+
+        response_contract_valid = (
+            isinstance(payload, dict)
+            and "ok" in payload
+            and "data" in payload
+            and "error" in payload
         )
-    except (asyncio.TimeoutError, httpx.TimeoutException) as timeout_exc:
-        log_fetch_metric(path, request_started_at, user_id=user_id, source="timeout")
-        # Diagnóstico puro: NÃO altera o fluxo de erro já existente abaixo.
-        # `PoolTimeout` = a request morreu na fila do pool, sem sequer sair para
-        # o bullex-service — assinatura da queda de 08/08.
-        logger.warning(
-            "[BULLEX_POOL_STATS] user_id=%s path=%s kind=%s %s",
-            user_id,
-            path,
-            type(timeout_exc).__name__,
-            bullex_pool_stats(),
-        )
-        if path == "/account":
-            logger.warning(
-                "[ACCOUNT_FETCH_TIMEOUT] user_id=%s timeout_seconds=%s",
-                user_id,
-                timeout_seconds,
-            )
-            logger.warning(
-                "[ACCOUNT_TIMEOUT_HANDLED] user_id=%s timeout_seconds=%s",
-                user_id,
-                timeout_seconds,
-            )
-        if method == "POST" and path == "/sessions/connect":
-            logger.warning(
-                "[CONNECT_TIMEOUT_HANDLED] user_id=%s timeout_seconds=%s",
-                user_id,
-                timeout_seconds,
-            )
-            return 504, build_error("LOGIN_TIMEOUT")
-        if method == "GET" and path in SESSION_CACHEABLE_PATHS:
+        if not response_contract_valid:
+            payload = build_success(payload) if response.is_success else build_error("INVALID_BULLEX_RESPONSE")
+
+        if (
+            method == "GET"
+            and path in SESSION_CACHEABLE_PATHS
+            and (response.status_code >= 500 or not response_contract_valid)
+        ):
             return temporary_upstream_response(
                 user_id,
                 path,
                 cache_key,
-                reason="timeout",
+                reason=f"status_{response.status_code}",
                 allow_failure_backoff=allow_failure_backoff,
             )
-        logger.warning(
-            "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=timeout",
-            user_id,
-            path,
+
+        if response.status_code >= 500:
+            error = str(payload.get("error") or "").strip().upper()
+            logger.warning(
+                "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=status_%s",
+                user_id,
+                path,
+                response.status_code,
+            )
+            if method == "POST" and path == "/sessions/connect" and error == "LOGIN_TIMEOUT":
+                logger.warning("[CONNECT_TIMEOUT_HANDLED] user_id=%s source=upstream", user_id)
+                return 504, build_error("LOGIN_TIMEOUT")
+            if method == "GET" and path in {"/candles", "/payouts"}:
+                stale = stale_shared_or_user_market_response(user_id, cache_key)
+                if stale is not None:
+                    logger.warning(
+                        "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=status_%s",
+                        user_id,
+                        path,
+                        cache_key,
+                        response.status_code,
+                    )
+                    logger.info(
+                        "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
+                        user_id,
+                        normalize_binary_active(str((params or {}).get("active") or "")),
+                        path,
+                    )
+                    return 200, add_stale_warning(stale.payload)
+            return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
+
+        cacheable_success = (
+            method == "GET"
+            and ttl_seconds is not None
+            and (
+                (
+                    response.is_success
+                    and payload.get("ok")
+                    and (
+                        path not in SESSION_CACHEABLE_PATHS
+                        or payload_connected_state(payload) is not False
+                    )
+                )
+                or is_order_result_path(path)
+            )
         )
-        if method == "GET" and path in {"/candles", "/payouts"}:
-            stale = stale_successful_response(user_id, cache_key)
-            if stale is not None:
-                logger.warning(
-                    "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=timeout",
-                    user_id,
-                    path,
+        if cacheable_success:
+            entry = BullexResponseCacheEntry(
+                status_code=response.status_code,
+                payload=deepcopy(payload),
+                expires_at=utc_now() + timedelta(seconds=ttl_seconds),
+            )
+            cache = get_session_cache(user_id)
+            cache.responses[cache_key] = entry
+            cache.last_successful_responses[cache_key] = deepcopy(entry)
+            if (
+                is_shared_market_path(path)
+                and shared_market_result_is_shareable(response.status_code, payload)
+            ):
+                store_shared_market_cache(
                     cache_key,
+                    response.status_code,
+                    payload,
+                    int(ttl_seconds),
                 )
-                logger.info(
-                    "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
-                    user_id,
-                    normalize_binary_active(str((params or {}).get("active") or "")),
-                    path,
-                )
-                return 200, add_stale_warning(stale.payload)
+
+        if method == "GET" and path in SESSION_CACHEABLE_PATHS:
+            if payload.get("ok") and payload_connected_state(payload) is True:
+                # Só reseta contadores de falha/backoff — reset_session_connection_cache
+                # apagaria a própria entrada de cache escrita acima (cacheable_success),
+                # inutilizando o throttle de 10s para usuários conectados.
+                reset_session_failure_counters(user_id)
+                clear_session_recovery_status(user_id)
+            elif payload_indicates_offline(response.status_code, payload):
+                if allow_failure_backoff:
+                    mark_session_failure(user_id, offline=True)
+                else:
+                    logger.info(
+                        "[BACKOFF_SKIPPED_RESTORE] user_id=%s path=%s",
+                        user_id,
+                        path,
+                    )
+            else:
+                if allow_failure_backoff:
+                    mark_session_failure(user_id)
+                else:
+                    logger.info(
+                        "[BACKOFF_SKIPPED_RESTORE] user_id=%s path=%s",
+                        user_id,
+                        path,
+                    )
+
+        if method == "GET" and path in {"/candles", "/payouts"}:
             symbol = normalize_binary_active(str((params or {}).get("active") or ""))
-            if symbol:
+            error_text = str(payload.get("error") or "").strip().lower()
+            if symbol and (
+                response.status_code == 404
+                or "asset unavailable" in error_text
+                or "active suspended" in error_text
+                or "active not found" in error_text
+            ):
                 set_named_cooldown(
-                    active_cooldowns if path == "/candles" else payout_cooldowns,
+                    active_cooldowns,
                     user_id,
                     symbol,
-                    seconds=ACTIVE_COOLDOWN_SECONDS if path == "/candles" else PAYOUT_COOLDOWN_SECONDS,
-                    log_label="ACTIVE_TIMEOUT" if path == "/candles" else "PAYOUT_TIMEOUT",
-                    status=STATUS_ACTIVE_COOLDOWN if path == "/candles" else STATUS_PAYOUT_COOLDOWN,
-                    reason="ACTIVE_TIMEOUT" if path == "/candles" else "PAYOUT_TIMEOUT",
+                    seconds=ACTIVE_COOLDOWN_SECONDS,
+                    log_label="ACTIVE_COOLDOWN",
+                    status=STATUS_ACTIVE_COOLDOWN,
+                    reason="ACTIVE_COOLDOWN",
                 )
-        return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
-    except httpx.HTTPError as exc:
-        log_fetch_metric(path, request_started_at, user_id=user_id, source=exc.__class__.__name__)
-        if method == "GET" and path == "/payouts":
-            symbol = normalize_binary_active(str((params or {}).get("active") or ""))
-            if symbol:
+            elif path == "/payouts" and symbol and (response.status_code >= 500 or not payload.get("ok")):
                 set_named_cooldown(
                     payout_cooldowns,
                     user_id,
@@ -3533,234 +5168,15 @@ async def call_bullex_service(
                     status=STATUS_PAYOUT_COOLDOWN,
                     reason="PAYOUT_COOLDOWN",
                 )
-        if method == "GET" and path in SESSION_CACHEABLE_PATHS:
-            return temporary_upstream_response(
-                user_id,
-                path,
-                cache_key,
-                reason=exc.__class__.__name__,
-                allow_failure_backoff=allow_failure_backoff,
-            )
-        logger.warning(
-            "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=%s",
-            user_id,
-            path,
-            exc.__class__.__name__,
-        )
-        if method == "GET" and path in {"/candles", "/payouts"}:
-            stale = stale_successful_response(user_id, cache_key)
-            if stale is not None:
-                logger.warning(
-                    "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=%s",
-                    user_id,
-                    path,
-                    cache_key,
-                    exc.__class__.__name__,
-                )
-                logger.info(
-                    "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
-                    user_id,
-                    normalize_binary_active(str((params or {}).get("active") or "")),
-                    path,
-                )
-                return 200, add_stale_warning(stale.payload)
-            symbol = normalize_binary_active(str((params or {}).get("active") or ""))
-            if symbol:
-                set_named_cooldown(
-                    active_cooldowns if path == "/candles" else payout_cooldowns,
-                    user_id,
-                    symbol,
-                    seconds=ACTIVE_COOLDOWN_SECONDS if path == "/candles" else PAYOUT_COOLDOWN_SECONDS,
-                    log_label="ACTIVE_SKIPPED",
-                    status=STATUS_ACTIVE_COOLDOWN if path == "/candles" else STATUS_PAYOUT_COOLDOWN,
-                    reason=exc.__class__.__name__,
-                )
-        return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
-    except Exception as exc:
-        log_fetch_metric(path, request_started_at, user_id=user_id, source=exc.__class__.__name__)
-        logger.warning(
-            "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=%s",
-            user_id,
-            path,
-            exc.__class__.__name__,
-            exc_info=True,
-        )
-        if method == "GET" and path in SESSION_CACHEABLE_PATHS:
-            return temporary_upstream_response(
-                user_id,
-                path,
-                cache_key,
-                reason=exc.__class__.__name__,
-                allow_failure_backoff=allow_failure_backoff,
-            )
-        if method == "GET" and path in {"/candles", "/payouts"}:
-            stale = stale_successful_response(user_id, cache_key)
-            if stale is not None:
-                logger.warning(
-                    "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=%s",
-                    user_id,
-                    path,
-                    cache_key,
-                    exc.__class__.__name__,
-                )
-                logger.info(
-                    "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
-                    user_id,
-                    normalize_binary_active(str((params or {}).get("active") or "")),
-                    path,
-                )
-                return 200, add_stale_warning(stale.payload)
-        return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
 
-    log_fetch_metric(path, request_started_at, user_id=user_id, source="upstream", status_code=response.status_code)
+        return response.status_code, payload
+    finally:
+        if acquired_market_lock and market_lock is not None:
+            market_lock.release()
+        if recycle_reason:
+            await recycle_saturated_bullex_http_client(recycle_reason)
 
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = build_error("INVALID_BULLEX_RESPONSE")
 
-    if response.status_code == 422 and path == "/orders/buy-real":
-        logger.error(
-            "[BUY_REAL_UPSTREAM_VALIDATION_ERROR] user_id=%s payload=%s detail=%s",
-            user_id,
-            strip_ai_fields(json_body or {}),
-            payload,
-        )
-        return response.status_code, build_error("BUY_REAL_PAYLOAD_REQUIRED_FIELDS")
-
-    response_contract_valid = (
-        isinstance(payload, dict)
-        and "ok" in payload
-        and "data" in payload
-        and "error" in payload
-    )
-    if not response_contract_valid:
-        payload = build_success(payload) if response.is_success else build_error("INVALID_BULLEX_RESPONSE")
-
-    if (
-        method == "GET"
-        and path in SESSION_CACHEABLE_PATHS
-        and (response.status_code >= 500 or not response_contract_valid)
-    ):
-        return temporary_upstream_response(
-            user_id,
-            path,
-            cache_key,
-            reason=f"status_{response.status_code}",
-            allow_failure_backoff=allow_failure_backoff,
-        )
-
-    if response.status_code >= 500:
-        error = str(payload.get("error") or "").strip().upper()
-        logger.warning(
-            "[UPSTREAM_ERROR_HANDLED] user_id=%s path=%s reason=status_%s",
-            user_id,
-            path,
-            response.status_code,
-        )
-        if method == "POST" and path == "/sessions/connect" and error == "LOGIN_TIMEOUT":
-            logger.warning("[CONNECT_TIMEOUT_HANDLED] user_id=%s source=upstream", user_id)
-            return 504, build_error("LOGIN_TIMEOUT")
-        if method == "GET" and path in {"/candles", "/payouts"}:
-            stale = stale_successful_response(user_id, cache_key)
-            if stale is not None:
-                logger.warning(
-                    "[MARKET_DATA_STALE_FALLBACK] user_id=%s path=%s cache_key=%s reason=status_%s",
-                    user_id,
-                    path,
-                    cache_key,
-                    response.status_code,
-                )
-                logger.info(
-                    "[ACTIVE_CACHE] user_id=%s symbol=%s path=%s stale=true",
-                    user_id,
-                    normalize_binary_active(str((params or {}).get("active") or "")),
-                    path,
-                )
-                return 200, add_stale_warning(stale.payload)
-        return 503, build_error(BULLEX_TEMPORARY_UNAVAILABLE)
-
-    cacheable_success = (
-        method == "GET"
-        and ttl_seconds is not None
-        and (
-            (
-                response.is_success
-                and payload.get("ok")
-                and (
-                    path not in SESSION_CACHEABLE_PATHS
-                    or payload_connected_state(payload) is not False
-                )
-            )
-            or is_order_result_path(path)
-        )
-    )
-    if cacheable_success:
-        entry = BullexResponseCacheEntry(
-            status_code=response.status_code,
-            payload=deepcopy(payload),
-            expires_at=utc_now() + timedelta(seconds=ttl_seconds),
-        )
-        cache = get_session_cache(user_id)
-        cache.responses[cache_key] = entry
-        cache.last_successful_responses[cache_key] = deepcopy(entry)
-
-    if method == "GET" and path in SESSION_CACHEABLE_PATHS:
-        if payload.get("ok") and payload_connected_state(payload) is True:
-            # Só reseta contadores de falha/backoff — reset_session_connection_cache
-            # apagaria a própria entrada de cache escrita acima (cacheable_success),
-            # inutilizando o throttle de 10s para usuários conectados.
-            reset_session_failure_counters(user_id)
-            clear_session_recovery_status(user_id)
-        elif payload_indicates_offline(response.status_code, payload):
-            if allow_failure_backoff:
-                mark_session_failure(user_id, offline=True)
-            else:
-                logger.info(
-                    "[BACKOFF_SKIPPED_RESTORE] user_id=%s path=%s",
-                    user_id,
-                    path,
-                )
-        else:
-            if allow_failure_backoff:
-                mark_session_failure(user_id)
-            else:
-                logger.info(
-                    "[BACKOFF_SKIPPED_RESTORE] user_id=%s path=%s",
-                    user_id,
-                    path,
-                )
-
-    if method == "GET" and path in {"/candles", "/payouts"}:
-        symbol = normalize_binary_active(str((params or {}).get("active") or ""))
-        error_text = str(payload.get("error") or "").strip().lower()
-        if symbol and (
-            response.status_code == 404
-            or "asset unavailable" in error_text
-            or "active suspended" in error_text
-            or "active not found" in error_text
-        ):
-            set_named_cooldown(
-                active_cooldowns,
-                user_id,
-                symbol,
-                seconds=ACTIVE_COOLDOWN_SECONDS,
-                log_label="ACTIVE_COOLDOWN",
-                status=STATUS_ACTIVE_COOLDOWN,
-                reason="ACTIVE_COOLDOWN",
-            )
-        elif path == "/payouts" and symbol and (response.status_code >= 500 or not payload.get("ok")):
-            set_named_cooldown(
-                payout_cooldowns,
-                user_id,
-                symbol,
-                seconds=PAYOUT_COOLDOWN_SECONDS,
-                log_label="PAYOUT_COOLDOWN",
-                status=STATUS_PAYOUT_COOLDOWN,
-                reason="PAYOUT_COOLDOWN",
-            )
-
-    return response.status_code, payload
 
 
 def polling_headers(seconds: int) -> dict[str, str]:
@@ -3900,6 +5316,16 @@ def recover_real_account_contract_for_start(
     error = str(failed_contract.get("error") or "").strip().upper()
     if error != "REAL_BALANCE_NOT_DETECTED":
         return None
+    if is_manual_disconnect(user_id):
+        # O cliente clicou em Desconectar: a sessão sumir é o resultado
+        # esperado, não uma falha transitória. Sem este guard o snapshot em
+        # memória (que sobrevive ao clique) virava um contrato connected=true
+        # com saldo, e o painel voltava para "Conectado" no poll seguinte.
+        logger.warning(
+            "[REAL_BALANCE_RECOVER_SKIPPED] user_id=%s reason=manual_disconnect",
+            user_id,
+        )
+        return None
 
     cached = get_cached_account_snapshot(user_id)
     cached_balance = number_or_none(cached.get("balance"))
@@ -3997,6 +5423,15 @@ def recover_real_account_contract_for_poll(
     """
     error = str(failed_contract.get("error") or "").strip().upper()
     if error != "REAL_BALANCE_NOT_DETECTED":
+        return None
+    if is_manual_disconnect(user_id):
+        # Ver o guard equivalente em recover_real_account_contract_for_start:
+        # aqui os fallbacks de memória/robot_state ressuscitariam a conta do
+        # mesmo jeito, mesmo com o start já barrado.
+        logger.warning(
+            "[REAL_BALANCE_RECOVER_SKIPPED] user_id=%s reason=manual_disconnect",
+            user_id,
+        )
         return None
 
     recovered = recover_real_account_contract_for_start(user_id, failed_contract)
@@ -4309,7 +5744,7 @@ async def try_auto_reconnect_with_saved_credentials(user_id: str) -> bool:
     Returns:
         True se a reconexão restabeleceu ``connected=true``.
     """
-    if user_id in bullex_manual_disconnect:
+    if is_manual_disconnect(user_id):
         # Desconexão manual vence a reconexão automática — é decisão explícita
         # do cliente. Só `POST /bullex/connect` (ou /bullex/reconnect) libera.
         logger.info("[BULLEX_AUTO_RECONNECT_SKIPPED] user_id=%s reason=manual_disconnect", user_id)
@@ -4891,15 +6326,48 @@ def cached_robot_connection_payload(state: Any) -> dict[str, Any]:
     )
 
 
+# Idade máxima da âncora absoluta (Bullex/VPS) antes de forçar novo GET
+# /sessions/status. Evita operar minutos com relógio só estimado.
+SERVER_CLOCK_RESAMPLE_SECONDS = 45
+# Fim da janela em que a compra pode ser AUTORIZADA (segundo da vela).
+ENTRY_WINDOW_END_SECOND = 3
+# Último segundo aceito no instante do POST da ordem. Existe porque entre a
+# autorização e o envio ainda correm a revalidação de canal e o hop HTTP; sem
+# esse teto a ordem saía no meio da vela sem ninguém perceber.
+ENTRY_SEND_MAX_SECOND = 6
+# Divergência a partir da qual o desvio entre o relógio da corretora e o da
+# VPS vira log [SERVER_CLOCK_SKEW]. É só alarme: a corretora continua sendo a
+# fonte, porque é ela quem define os limites de vela e a expiração. Serve para
+# flagrar se a âncora voltar a envelhecer por algum caminho novo.
+MAX_SERVER_CLOCK_SKEW_SECONDS = 2.0
+
+
 def estimate_state_server_timestamp(state: Any) -> float | None:
-    checked_at = getattr(state, "connection_checked_at", None)
+    """Estima o relógio Bullex a partir da última amostra absoluta.
+
+    Usa ``server_time_sampled_at`` (quando a âncora foi gravada). Não pode
+    reaplicar elapsed sobre um ``server_time`` que já era estimado — isso
+    compostava drift e abria a janela de compra cedo.
+
+    Args:
+        state: Estado do robô com ``server_time`` e âncora de amostragem.
+
+    Returns:
+        Epoch estimado, ou ``None`` se não houver âncora utilizável.
+    """
     server_time = getattr(state, "server_time", None)
-    if checked_at is None or not server_time:
+    if not server_time:
         return None
     parsed_server_time = parse_datetime(server_time)
     if parsed_server_time is None:
         return None
-    elapsed = (utc_now() - checked_at).total_seconds()
+    sampled_at = getattr(state, "server_time_sampled_at", None)
+    if sampled_at is None:
+        # Compat: estados antigos só tinham connection_checked_at.
+        sampled_at = getattr(state, "connection_checked_at", None)
+    if sampled_at is None:
+        return None
+    elapsed = (utc_now() - sampled_at).total_seconds()
     if elapsed < 0:
         return None
     return parsed_server_time.timestamp() + elapsed
@@ -4910,14 +6378,19 @@ def build_guarded_connection_payload(reason: str) -> dict[str, Any]:
 
 
 TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800}
-# Janela de compra no início da vela. 0–8s: tolerância para latência de
-# refresh/conta/revalidação de canal (em prod o worker perdia em ~6,3s com
-# [ENTRY_WINDOW_MISSED] e descartava setups bons).
+# Janela de compra no início da vela. A auditoria de 2026-08-30 mediu que só
+# 33,6% das ordens caíam em 0–8s: metade saía entre 9 e 20s porque o relógio
+# do robô atrasava (ver `refresh_entry_window`) e porque nada revalidava o
+# segundo entre a abertura da janela e o POST da ordem. Entrar tarde não piora
+# só o preço — a partir de ~53s a corretora rola a expiração para o fim da
+# vela SEGUINTE, e a operação passa a apostar numa vela que nunca foi
+# analisada. Janela de decisão apertada para 0–3s; a folga de latência virou
+# `ENTRY_SEND_MAX_SECOND`, checada no instante do envio.
 ENTRY_WINDOWS = {
-    "M1": (0, 8),
-    "M5": (0, 8),
-    "M15": (0, 8),
-    "M30": (0, 8),
+    "M1": (0, ENTRY_WINDOW_END_SECOND),
+    "M5": (0, ENTRY_WINDOW_END_SECOND),
+    "M15": (0, ENTRY_WINDOW_END_SECOND),
+    "M30": (0, ENTRY_WINDOW_END_SECOND),
 }
 ANALYSIS_WINDOWS = {
     "M1": (5, 20),
@@ -5170,15 +6643,105 @@ def calculate_expected_expire_at(
     return expected, "server_time_aligned"
 
 
+def server_clock_needs_resample(state: Any, *, max_age_seconds: int = SERVER_CLOCK_RESAMPLE_SECONDS) -> bool:
+    """Indica se a âncora de relógio está velha demais para só estimar.
+
+    Args:
+        state: Estado do robô.
+        max_age_seconds: Idade máxima aceitável da amostra absoluta.
+
+    Returns:
+        True se deve buscar ``server_time`` fresco na Bullex/VPS.
+    """
+    sampled_at = getattr(state, "server_time_sampled_at", None)
+    if sampled_at is None:
+        sampled_at = getattr(state, "connection_checked_at", None)
+    if sampled_at is None or not getattr(state, "server_time", None):
+        return True
+    age = (utc_now() - sampled_at).total_seconds()
+    return age < 0 or age > max_age_seconds
+
+
+def resolve_server_clock_timestamp(
+    raw_timestamp: float | None,
+    *,
+    payload_age_seconds: float | None,
+    vps_timestamp: float,
+) -> tuple[float, str, float]:
+    """
+    Converte o ``server_time`` da corretora no instante atual confiável.
+
+    O defeito medido em 2026-08-30: ``/sessions/status`` tem TTL e throttle de
+    20s, então a resposta podia chegar do cache já velha e mesmo assim virava
+    âncora carimbada como nova. Resultado: a janela de compra abria com o
+    segundo errado — atraso de mediana 1,4s, p95 12,9s e máximo 27s. A correção
+    é somar a idade real da resposta ao ``server_time`` que veio nela.
+
+    O desvio contra o relógio local é devolvido apenas para o chamador
+    registrar. Deliberadamente NÃO troca a fonte: a corretora é quem define os
+    limites de vela, e trocar por conta própria esconderia uma dessincronia
+    real atrás de um relógio que não é o da expiração.
+
+    Args:
+        raw_timestamp: ``server_time`` lido da corretora (``None`` se ausente).
+        payload_age_seconds: Há quanto tempo essa resposta chegou.
+        vps_timestamp: Epoch do relógio local, usado como referência do desvio.
+
+    Returns:
+        Tupla ``(timestamp, fonte, desvio_em_segundos)``. A fonte é
+        ``vps_fallback`` só quando não houve amostra da corretora.
+    """
+    if raw_timestamp is None:
+        return vps_timestamp, "vps_fallback", 0.0
+    age = float(payload_age_seconds or 0.0)
+    if age < 0:
+        age = 0.0
+    corrected = float(raw_timestamp) + age
+    return corrected, "bullex", corrected - vps_timestamp
+
+
+def entry_send_candle_second(window: dict[str, Any]) -> float:
+    """
+    Segundo da vela agora, medido a partir da janela que autorizou a entrada.
+
+    A janela é conferida antes da revalidação de canal e do hop HTTP; tudo que
+    corre depois é tempo cego, e nada reconferia o segundo no instante do POST.
+    Avança a MESMA janela pelo tempo monotônico decorrido — usar outra fonte de
+    relógio aqui compararia a autorização com um relógio que não é o dela.
+
+    Args:
+        window: Contrato de ``get_entry_window`` que autorizou a compra.
+
+    Returns:
+        Segundos decorridos dentro da vela atual.
+    """
+    interval = int(window.get("expiration_seconds") or 60)
+    captured_at = float(window.get("_captured_monotonic") or monotonic())
+    elapsed = max(0.0, monotonic() - captured_at)
+    return (float(window["server_timestamp"]) + elapsed) % interval
+
+
 async def refresh_entry_window(user_id: str, state: Any) -> tuple[int, dict[str, Any], dict[str, Any] | None]:
-    if fresh_robot_connection(state) or robot_has_recent_real_cache(user_id, state):
+    use_cached_clock = (
+        (fresh_robot_connection(state) or robot_has_recent_real_cache(user_id, state))
+        and not server_clock_needs_resample(state)
+    )
+    if use_cached_clock:
         estimated_timestamp = estimate_state_server_timestamp(state)
         window = get_entry_window(
             state.timeframe,
             estimated_timestamp,
             server_time_source="bullex" if estimated_timestamp is not None else "vps_fallback",
         )
-        auto_trader.update_entry_window(user_id, window)
+        # Estimativa NÃO vira nova âncora — senão o próximo poll compostaria
+        # o elapsed e a compra sairia no meio da vela (~45s cedo no M1).
+        # Sem âncora prévia: VPS absoluto precisa persistir para o próximo ciclo.
+        persist_clock = estimated_timestamp is None
+        auto_trader.update_entry_window(
+            user_id,
+            window,
+            persist_server_clock=persist_clock,
+        )
         logger.info(
             "[ENTRY_WINDOW_CALCULATED] user_id=%s timeframe=%s current_candle_seconds=%s "
             "server_time_source=%s analysis_window_start=%s analysis_window_end=%s analysis_open=%s "
@@ -5198,14 +6761,19 @@ async def refresh_entry_window(user_id: str, state: Any) -> tuple[int, dict[str,
         return 200, cached_robot_connection_payload(state), window
 
     status_code, payload = await call_bullex_service("GET", "/sessions/status", user_id)
-    timestamp = extract_server_timestamp(payload)
-    if timestamp is None:
-        timestamp = utc_now().timestamp()
-        window = get_entry_window(
-            state.timeframe,
-            timestamp,
-            server_time_source="vps_fallback",
-        )
+    raw_timestamp = extract_server_timestamp(payload)
+    previous_source = getattr(state, "server_time_source", None)
+    timestamp, resolved_source, clock_skew = resolve_server_clock_timestamp(
+        raw_timestamp,
+        payload_age_seconds=cached_response_age_seconds(user_id, "/sessions/status"),
+        vps_timestamp=utc_now().timestamp(),
+    )
+    window = get_entry_window(
+        state.timeframe,
+        timestamp,
+        server_time_source=resolved_source,
+    )
+    if resolved_source == "vps_fallback":
         logger.warning(
             "[SERVER_TIME_FALLBACK] user_id=%s status_code=%s current_candle_seconds=%s",
             user_id,
@@ -5213,15 +6781,18 @@ async def refresh_entry_window(user_id: str, state: Any) -> tuple[int, dict[str,
             window["current_candle_seconds"],
         )
     else:
-        previous_source = getattr(state, "server_time_source", None)
-        window = get_entry_window(
-            state.timeframe,
-            timestamp,
-            server_time_source="bullex",
-        )
+        if abs(clock_skew) > MAX_SERVER_CLOCK_SKEW_SECONDS:
+            # Não corrige nada — só torna visível. Se isto passar a aparecer em
+            # volume, a âncora voltou a envelhecer em algum caminho novo.
+            logger.warning(
+                "[SERVER_CLOCK_SKEW] user_id=%s skew=%.2f current_candle_seconds=%s",
+                user_id,
+                clock_skew,
+                window["current_candle_seconds"],
+            )
         if previous_source == "vps_fallback" and getattr(state, "server_time", None):
-            logger.info("[SERVER_TIME_BULLEX_RESTORED] user_id=%s", user_id)
-    auto_trader.update_entry_window(user_id, window)
+            logger.info("[SERVER_TIME_BULLEX_RESTORED] user_id=%s skew=%.2f", user_id, clock_skew)
+    auto_trader.update_entry_window(user_id, window, persist_server_clock=True)
     logger.info(
         "[ENTRY_WINDOW_CALCULATED] user_id=%s timeframe=%s current_candle_seconds=%s "
         "server_time_source=%s analysis_window_start=%s analysis_window_end=%s analysis_open=%s "
@@ -5263,8 +6834,10 @@ def real_block_reason(
         stop_reason = (daily_stop_reason(user_id, state) if user_id is not None else None) or robot_stop_reason(state)
         if stop_reason is not None:
             reason = stop_reason
-        elif state.entry_value > MAX_REAL_ENTRY:
-            reason = "REAL_ENTRY_VALUE_EXCEEDS_MAX"
+        elif user_id is not None and state.entry_value < min_real_entry_for_currency(
+            resolve_user_account_currency(user_id)
+        ):
+            reason = "ENTRY_VALUE_TOO_LOW"
     logger.info(
         "[REAL_READY_CHECK] user_id=%s account_mode=%s active_mode=%s connected=%s allow_real=%s confirm_real=%s reason=%s",
         user_id,
@@ -5357,12 +6930,51 @@ def extract_asset_open(payload: dict[str, Any], symbol: str, timeframe: str) -> 
 # gravação de qualquer operação invalida na hora, então stop win/loss continuam
 # enxergando o resultado assim que ele é registrado.
 DAILY_HISTORY_CACHE_TTL_SECONDS = 5.0
+# Vencido o TTL, a releitura corre numa thread e a chamada devolve a lista
+# anterior (stale-while-revalidate): em 10/09/2026 o `_snapshot_publisher`
+# ainda relia o histórico DENTRO do event loop a cada 5s por usuário (~10% do
+# tempo travado). A frescura é a mesma de antes — a thread traz o dado novo
+# poucos centésimos depois — e a leitura bloqueante só sobra quando não há lista
+# nenhuma (primeira vez, ou logo depois de gravar operação) ou quando a lista
+# passou de DAILY_HISTORY_MAX_STALE_SECONDS (a thread não está conseguindo ler).
+DAILY_HISTORY_MAX_STALE_SECONDS = 60.0
 _daily_history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+# Geração por usuário: a invalidação incrementa, e uma releitura que começou
+# ANTES dela (logo, sem a operação recém-gravada) não pode sobrescrever o cache.
+_daily_history_generation: dict[str, int] = {}
+_daily_history_refreshing: set[str] = set()
+_DAILY_HISTORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="daily-history")
 
 
 def invalidate_daily_history_cache(user_id: str) -> None:
     """Descarta o histórico do dia em cache (chamar ao gravar operação)."""
-    _daily_history_cache.pop(str(user_id), None)
+    key = str(user_id)
+    _daily_history_generation[key] = _daily_history_generation.get(key, 0) + 1
+    _daily_history_cache.pop(key, None)
+
+
+def _refresh_daily_history_in_background(user_id: str) -> None:
+    """Relê o histórico do dia numa thread, uma releitura por vez por usuário."""
+    key = str(user_id)
+    if key in _daily_history_refreshing:
+        return
+    _daily_history_refreshing.add(key)
+    generation = _daily_history_generation.get(key, 0)
+
+    def _reload() -> None:
+        try:
+            items = load_robot_history_items(user_id, 1)
+            if _daily_history_generation.get(key, 0) == generation:
+                _daily_history_cache[key] = (monotonic(), items)
+        except Exception:
+            logger.warning("[DAILY_HISTORY_REFRESH_FAILED] user_id=%s", user_id, exc_info=True)
+        finally:
+            _daily_history_refreshing.discard(key)
+
+    try:
+        _DAILY_HISTORY_EXECUTOR.submit(_reload)
+    except RuntimeError:
+        _daily_history_refreshing.discard(key)
 
 
 def load_daily_history_cached(user_id: str) -> list[dict[str, Any]]:
@@ -5376,16 +6988,21 @@ def load_daily_history_cached(user_id: str) -> list[dict[str, Any]]:
         Mesma lista que ``load_robot_history_items(user_id, 1)`` retornaria.
     """
     now = monotonic()
-    cached = _daily_history_cache.get(user_id)
-    if cached is not None and now - cached[0] < DAILY_HISTORY_CACHE_TTL_SECONDS:
-        return cached[1]
+    key = str(user_id)
+    cached = _daily_history_cache.get(key)
+    if cached is not None:
+        age = now - cached[0]
+        if age < DAILY_HISTORY_CACHE_TTL_SECONDS:
+            return cached[1]
+        if age < DAILY_HISTORY_MAX_STALE_SECONDS:
+            _refresh_daily_history_in_background(user_id)
+            return cached[1]
     items = load_robot_history_items(user_id, 1)
-    _daily_history_cache[user_id] = (now, items)
+    _daily_history_cache[key] = (now, items)
     return items
 
 
 def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
-    today = datetime.now(timezone.utc).date()
     reset_at = parse_datetime(getattr(state, "stop_reset_at", None))
     gross_profit = 0.0
     gross_loss = 0.0
@@ -5402,9 +7019,13 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
         if result not in {"WIN", "LOSS"}:
             continue
         finished_at = parse_datetime(trade.get("finished_at"))
-        if finished_at is None or finished_at.date() != today:
+        if finished_at is None or not is_brasilia_today(finished_at):
             continue
         if reset_at is not None and finished_at < reset_at:
+            continue
+        # Linha do Shift+O (UUID) não é dinheiro na corretora: não conta para
+        # o stop. `wins`/`losses` abaixo já descontam `stop_offset_*`.
+        if is_synthetic_trade(trade):
             continue
         trade_profit = float(trade.get("profit") or 0)
         trades_count += 1
@@ -5516,9 +7137,20 @@ def classify_no_opportunity_reason(blocked: set[str] | list[str] | None) -> str:
         "LEVEL_CONFLICT",
         "LEVEL_REJECTION",
         "SR_ZONE",
+        "WICK_EXCESS",
         "LAST_3_ALIGNMENT",
         "CONTINUATION_DEAD_RSI",
         "WEAK_CONTINUATION_PUT",
+        "WEAK_PUT",
+        "PUT_CHASE",
+        "CALL_CHASE",
+        "CALL_GRG",
+        "REPEAT_ENTRY",
+        "PUT_BODY",
+        "PUT_WICK",
+        "TOXIC_HOUR",
+        "ASSET_BAN",
+        "TOXIC_WEAK_PAIR",
         "EMA_TREND",
         "RSI_RANGE",
         "NO_ALTERNATING_LAST_3",
@@ -5584,6 +7216,96 @@ def global_loss_cooldown_reason(user_id: str) -> str | None:
     return None
 
 
+def apply_revz_guard(
+    user_id: str,
+    state: Any,
+    selected: dict[str, Any],
+    *,
+    blocked_filters: list[str],
+    approved_filters: list[str],
+    confidence: int,
+    direction: str,
+) -> tuple[bool, dict[str, Any], str | None]:
+    """Portão de estratégia de um candidato da REV-Z (mercado aberto).
+
+    Mantém só o que impede a ordem ou protege a banca: payout, piso de
+    confiança na escala da REV-Z, cooldowns de ativo e de perda, entrada
+    repetida. Os filtros de qualidade do motor clássico não entram — ver
+    ``REVZ_NON_WAIVABLE``.
+
+    Args:
+        user_id: Dono do ciclo.
+        state: Estado do robô.
+        selected: Sinal já com payout e modo.
+        blocked_filters: Bloqueios acumulados até aqui (payout).
+        approved_filters: Aprovações acumuladas até aqui.
+        confidence: Confiança do sinal (escala 55–75 da REV-Z).
+        direction: ``CALL``/``PUT``.
+
+    Returns:
+        O mesmo contrato de ``apply_strategy_guard``.
+    """
+    symbol = normalize_binary_active(str(selected.get("symbol") or ""))
+
+    def bloqueia(nome: str) -> None:
+        if nome not in blocked_filters:
+            blocked_filters.append(nome)
+
+    minimo = revz_min_confidence(int(state.min_confidence))
+    if confidence < minimo:
+        bloqueia("MIN_CONFIDENCE")
+    elif "MIN_CONFIDENCE" not in approved_filters:
+        approved_filters.append("MIN_CONFIDENCE")
+    if "DIRECTION_VALID" not in approved_filters:
+        approved_filters.append("DIRECTION_VALID")
+    cooldown = asset_cooldown_reason(user_id, symbol)
+    if cooldown is not None:
+        bloqueia(cooldown)
+    if REPEAT_ENTRY_HARD_BLOCK and user_id and repeat_entry_cooldown_remaining(user_id, symbol) is not None:
+        bloqueia("REPEAT_ENTRY")
+    loss_cooldown = global_loss_cooldown_reason(user_id)
+    if loss_cooldown is not None:
+        bloqueia(loss_cooldown)
+
+    hard_blocks = [nome for nome in blocked_filters if nome in REVZ_NON_WAIVABLE]
+    trade_allowed = not hard_blocks
+    reason = str(selected.get("reason") or selected.get("signal_explanation") or "").strip()
+    selected["blocked_filters"] = blocked_filters
+    selected["approved_filters"] = approved_filters
+    selected["trade_allowed"] = trade_allowed
+    selected["direction"] = direction
+    selected["signal"] = direction
+    selected["strategy_score"] = confidence
+    selected["quality_score"] = confidence
+    selected["score"] = confidence
+    selected["block_reasons"] = list(blocked_filters)
+    selected["reason"] = reason
+    selected["entry_reason"] = selected.get("entry_reason") or reason
+    selected["quality_reason"] = "OK" if trade_allowed else ",".join(hard_blocks)
+    selected["frequency_recovery"] = False
+    revz = selected.get("revz") or {}
+    if trade_allowed:
+        logger.info(
+            "[REVZ_GUARD_PASS] user_id=%s symbol=%s direction=%s z=%s confidence=%s piso=%s",
+            user_id,
+            symbol,
+            direction,
+            revz.get("z"),
+            confidence,
+            minimo,
+        )
+        return True, selected, None
+    logger.info(
+        "[REVZ_GUARD_BLOCK] user_id=%s symbol=%s direction=%s z=%s bloqueios=%s",
+        user_id,
+        symbol,
+        direction,
+        revz.get("z"),
+        hard_blocks,
+    )
+    return False, selected, hard_blocks[0]
+
+
 def apply_strategy_guard(
     user_id: str,
     state: Any,
@@ -5625,7 +7347,81 @@ def apply_strategy_guard(
     else:
         set_filter("PAYOUT_UNAVAILABLE", True)
         set_filter("MIN_PAYOUT", float(payout) >= state.min_payout)
-    set_filter("MIN_CONFIDENCE", confidence >= state.min_confidence)
+    if is_revz_candidate(selected):
+        # Mercado aberto: a REV-Z tem portão próprio. Tudo abaixo daqui é
+        # filtro do motor clássico, que segue tendência — EMA a favor, RSI
+        # 55–75 para CALL, as 3 últimas velas na direção da entrada. Numa
+        # entrada de reversão cada um deles é um veto à tese, e a simulação dos
+        # 60% não passou por nenhum.
+        return apply_revz_guard(
+            user_id,
+            state,
+            selected,
+            blocked_filters=blocked_filters,
+            approved_filters=approved_filters,
+            confidence=confidence,
+            direction=direction,
+        )
+    veredito_revz = selected.get("revz")
+    if isinstance(veredito_revz, dict):
+        # A REV-Z avaliou o par aberto e NÃO viu extremo. Sem esta saída o
+        # guarda clássico abaixo deduz uma direção pela tendência (bloco do
+        # WAIT, lá em cima) e o sinal seguia vivo com score zero — segurado só
+        # pelo piso. No aberto, "sem extremo" é "sem entrada", ponto.
+        motivo_revz = str(veredito_revz.get("blocked") or "REVZ_SEM_DESVIO_EXTREMO")
+        if motivo_revz not in blocked_filters:
+            blocked_filters.append(motivo_revz)
+        selected.update(
+            {
+                "blocked_filters": blocked_filters,
+                "approved_filters": approved_filters,
+                "trade_allowed": False,
+                "direction": "WAIT",
+                "signal": "WAIT",
+                "strategy_score": 0,
+                "quality_score": 0,
+                "score": 0,
+                "block_reasons": list(blocked_filters),
+                "quality_reason": motivo_revz,
+            }
+        )
+        return False, selected, motivo_revz
+    minimo_confianca = int(state.min_confidence)
+    # Mesma armadilha das duas escalas, agora para a SR-R (teto 75): sem isto o
+    # mínimo padrão do painel (80) barra 100% dos sinais de nível e o robô só
+    # "aparece parado", sem erro nenhum. Ver `docs/ESTRATEGIA_SR.md`.
+    veredito_sr = selected.get("sr")
+    sr_decidiu = (
+        isinstance(veredito_sr, dict)
+        and str(veredito_sr.get("direction") or "").upper() in {"CALL", "PUT"}
+    )
+    # Terceira estratégia com escala própria, mesma armadilha das duas acima:
+    # teto 75 contra o mínimo 80 do painel barra 100% dos sinais Vertex, e o
+    # robô só "aparece parado", sem erro nenhum no log.
+    #
+    # O quanto o piso desce depende do mercado e a regra vive num lugar só,
+    # `vertex_min_confidence` — este portão e o `candidate_meets_cycle_threshold`
+    # precisam concordar, e duplicar a conta aqui é como as escalas divergem.
+    aplicado_vertex = vertex_min_confidence(minimo_confianca, selected)
+    if aplicado_vertex != minimo_confianca:
+        logger.info(
+            "[VERTEX_MIN_CONFIDENCE_RESCALED] user_id=%s symbol=%s user_min=%s applied=%s",
+            user_id,
+            selected.get("symbol") or selected.get("active"),
+            minimo_confianca,
+            aplicado_vertex,
+        )
+        minimo_confianca = aplicado_vertex
+    if sr_decidiu and minimo_confianca > SR_CONFIDENCE_MAX:
+        logger.info(
+            "[SR_MIN_CONFIDENCE_RESCALED] user_id=%s user_min=%s sr_max=%s applied=%s",
+            user_id,
+            minimo_confianca,
+            SR_CONFIDENCE_MAX,
+            SR_CONFIDENCE_MAX,
+        )
+        minimo_confianca = SR_CONFIDENCE_MAX
+    set_filter("MIN_CONFIDENCE", confidence >= minimo_confianca)
     if direction in {"CALL", "PUT"}:
         if "SIGNAL_WAIT" in blocked_filters:
             blocked_filters.remove("SIGNAL_WAIT")
@@ -5672,12 +7468,27 @@ def apply_strategy_guard(
         rsi = float(selected.get("rsi") or 50)
         rsi_ok = (direction == "CALL" and 55 <= rsi <= 75) or (direction == "PUT" and 25 <= rsi <= 45)
         set_filter("RSI_RANGE", rsi_ok)
-    if "body_ratio" in selected and float(selected.get("body_ratio") or 0) < float(
-        (STRATEGY_PROFILES.get(str(selected.get("strategy_mode") or state.strategy_mode) or {}) or {}).get(
-            "body_ratio", 0.40
-        )
-    ):
-        set_filter("CANDLE_STRENGTH", False)
+    body_ratio = None
+    body_ratio = None
+    if "body_ratio" in selected:
+        try:
+            body_ratio = float(selected.get("body_ratio") or 0)
+        except (TypeError, ValueError):
+            body_ratio = 0.0
+    elif isinstance(selected.get("metrics"), dict):
+        try:
+            body_ratio = float(
+                selected["metrics"].get("current_candle_strength")
+                or selected["metrics"].get("body_ratio")
+                or 0
+            )
+        except (TypeError, ValueError):
+            body_ratio = 0.0
+    if body_ratio is not None:
+        if CANDLE_WEAK_HARD_BLOCK and is_weak_candle_body(body_ratio):
+            set_filter("CANDLE_STRENGTH", False)
+        if DOJI_HARD_BLOCK and is_doji_body(body_ratio):
+            set_filter("DOJI_FILTER", False)
     if direction == "CALL" and "upper_wick_ratio" in selected and float(selected.get("upper_wick_ratio") or 0) > 0.45:
         set_filter("WICK_REJECTION", False)
     if direction == "PUT" and "lower_wick_ratio" in selected and float(selected.get("lower_wick_ratio") or 0) > 0.45:
@@ -5728,12 +7539,75 @@ def apply_strategy_guard(
             "WEAK_CONTINUATION_PUT",
             not (is_continuation and direction == "PUT" and is_weak_continuation_put_asset(symbol)),
         )
+    if WEAK_PUT_HARD_BLOCK:
+        set_filter("WEAK_PUT", not is_weak_put_setup(price_action_setup, direction))
+    if PUT_CHASE_HARD_BLOCK:
+        set_filter(
+            "PUT_CHASE",
+            not is_chasing_continuation_put(
+                price_action_setup,
+                direction,
+                extract_last_3_colors(selected),
+            ),
+        )
+    if CALL_CHASE_HARD_BLOCK:
+        set_filter(
+            "CALL_CHASE",
+            not is_chasing_continuation_call(
+                price_action_setup,
+                direction,
+                extract_last_3_colors(selected),
+            ),
+        )
+    if CALL_GRG_HARD_BLOCK:
+        set_filter(
+            "CALL_GRG",
+            not is_call_green_red_green(
+                direction,
+                extract_last_3_colors(selected),
+            ),
+        )
+    if SEQ_GGG_HARD_BLOCK:
+        set_filter(
+            "SEQ_GGG",
+            not is_seq_green_green_green(extract_last_3_colors(selected)),
+        )
+    if SEQ_GRR_HARD_BLOCK:
+        set_filter(
+            "SEQ_GRR",
+            not is_seq_green_red_red(extract_last_3_colors(selected)),
+        )
+    if WEAK_SETUP_HARD_BLOCK:
+        set_filter("WEAK_SETUP", not is_weak_setup(price_action_setup))
+    if PUT_BODY_HARD_BLOCK:
+        set_filter(
+            "PUT_BODY",
+            body_ratio is None or not is_put_thin_body(body_ratio, direction),
+        )
+    if PUT_WICK_HARD_BLOCK:
+        lower_wick = selected.get("lower_wick_ratio")
+        if lower_wick is None and isinstance(selected.get("metrics"), dict):
+            lower_wick = selected["metrics"].get("lower_wick_ratio")
+        set_filter("PUT_WICK", not is_put_against_wick(lower_wick, direction))
+    if TOXIC_HOUR_HARD_BLOCK:
+        set_filter("TOXIC_HOUR", not is_toxic_hour_brt())
+    if ASSET_BAN_HARD_BLOCK:
+        set_filter("ASSET_BAN", not is_banned_asset(symbol))
+    if TOXIC_WEAK_PAIR_HARD_BLOCK:
+        set_filter(
+            "TOXIC_WEAK_PAIR",
+            not is_toxic_weak_pair(price_action_setup, direction, symbol),
+        )
 
     cooldown = asset_cooldown_reason(user_id, symbol)
     if cooldown is not None:
         if cooldown not in blocked_filters:
             blocked_filters.append(cooldown)
         logger.warning("[ASSET_COOLDOWN] user_id=%s symbol=%s", user_id, symbol)
+    if REPEAT_ENTRY_HARD_BLOCK and user_id and repeat_entry_cooldown_remaining(user_id, symbol) is not None:
+        if "REPEAT_ENTRY" not in blocked_filters:
+            blocked_filters.append("REPEAT_ENTRY")
+        logger.info("[REPEAT_ENTRY] user_id=%s symbol=%s", user_id, symbol)
 
     loss_cooldown = global_loss_cooldown_reason(user_id)
     if loss_cooldown is not None:
@@ -5762,11 +7636,25 @@ def apply_strategy_guard(
         "LAST_3_ALIGNMENT": 20,
         "CONTINUATION_DEAD_RSI": 18,
         "WEAK_CONTINUATION_PUT": 20,
+        "WEAK_PUT": 20,
+        "PUT_CHASE": 20,
+        "CALL_CHASE": 20,
+        "CALL_GRG": 20,
+        "SEQ_GGG": 20,
+        "SEQ_GRR": 20,
+        "WEAK_SETUP": 20,
+        "REPEAT_ENTRY": 20,
+        "PUT_BODY": 18,
+        "PUT_WICK": 12,
+        "TOXIC_HOUR": 20,
+        "ASSET_BAN": 20,
+        "TOXIC_WEAK_PAIR": 20,
     }
     recovery = frequency_recovery_active(user_id) or bool(selected.get("frequency_recovery"))
     penalty_names = set(blocked_filters)
     if recovery:
-        penalty_names -= set(FREQUENCY_RECOVERY_SOFT_BLOCKS)
+        waived = set(FREQUENCY_RECOVERY_SOFT_BLOCKS) - set(FREQUENCY_RECOVERY_KEEP_SCORE_PENALTIES)
+        penalty_names -= waived
     strategy_score = max(
         0,
         confidence - sum(penalties.get(name, 0) for name in penalty_names),
@@ -5777,6 +7665,16 @@ def apply_strategy_guard(
         if name in effective_critical_trade_blocks(frequency_recovery=recovery)
     ]
     trade_allowed = not hard_blocks
+    if is_live_demo(selected):
+        # Este e o ponto que realmente derrubava a entrada de demonstracao: o
+        # veto e refeito aqui a partir de `blocked_filters`, que `apply_live_demo`
+        # deixa intacto de proposito. Com trade_allowed=False o candidato morria
+        # no portao ANTES do desvio do modo — por isso nao havia
+        # [LIVE_DEMO_GATE_BLOCK] no log, so [NO_OPPORTUNITY].
+        hard_blocks = [nome for nome in hard_blocks if nome in LIVE_NON_WAIVABLE]
+        trade_allowed = not hard_blocks
+        if trade_allowed:
+            strategy_score = LIVE_CONFIDENCE
     reason = str(selected.get("reason") or selected.get("signal_explanation") or "").strip()
     if blocked_filters:
         reason = f"{reason} Penalizacoes/bloqueios: {', '.join(blocked_filters)}.".strip()
@@ -5916,6 +7814,58 @@ def get_cached_account_snapshot(user_id: str) -> dict[str, Any]:
     }
 
 
+# Moeda lida do Supabase, por usuário: (instante monotônico, moeda crua).
+#
+# No robot-runtime o cache de `/account` fica vazio (quem chama /account é o
+# gateway), então `resolve_user_account_currency` caía no Supabase TODA vez — e
+# ela roda no `_snapshot_publisher` a cada 1s por usuário, via
+# `real_block_reason`. Medido em 10/09/2026 com py-spy: ~94% do tempo ocupado do
+# event loop era esse HTTPS síncrono (upsert em /users + GET bullex_connections,
+# TLS novo a cada chamada). O loop travava, o `sleep` do worker voltava com
+# +0,8s de mediana e +2s no p90, e 63% das entradas se perdiam
+# (ENTRY_WINDOW_MISSED/ENTRY_SEND_TOO_LATE). A moeda da conta não muda no meio
+# da sessão; o cache de `/account`, quando existe, continua tendo prioridade.
+ACCOUNT_CURRENCY_CACHE_TTL_SECONDS = 300.0
+_account_currency_cache: dict[str, tuple[float, str | None]] = {}
+
+
+def invalidate_account_currency_cache(user_id: str | None = None) -> None:
+    """Descarta a moeda memorizada (de um usuário, ou de todos)."""
+    if user_id is None:
+        _account_currency_cache.clear()
+    else:
+        _account_currency_cache.pop(str(user_id), None)
+
+
+def resolve_user_account_currency(user_id: str | None) -> str:
+    """Lê a moeda da conta persistida/cached. Nunca vem do body do frontend.
+
+    Ordem: cache de ``/account`` (quando o processo tem) → moeda memorizada há
+    menos de ``ACCOUNT_CURRENCY_CACHE_TTL_SECONDS`` → Supabase. Roda no event
+    loop, então a ida ao Supabase precisa ser exceção, não regra.
+
+    Args:
+        user_id: Identificador do usuário autenticado.
+
+    Returns:
+        ``USD`` ou ``BRL``. Sem snapshot, assume BRL.
+    """
+    if not user_id:
+        return "BRL"
+    snapshot = get_cached_account_snapshot(user_id)
+    currency = snapshot.get("currency") if isinstance(snapshot, dict) else None
+    if not currency:
+        key = str(user_id)
+        memo = _account_currency_cache.get(key)
+        if memo is not None and monotonic() - memo[0] < ACCOUNT_CURRENCY_CACHE_TTL_SECONDS:
+            currency = memo[1]
+        else:
+            snapshot = get_user_account_snapshot(user_id)
+            currency = snapshot.get("currency") if isinstance(snapshot, dict) else None
+            _account_currency_cache[key] = (monotonic(), currency)
+    return normalize_account_currency(currency)
+
+
 def robot_has_recent_real_cache(user_id: str, state: Any, *, max_age_seconds: int = ROBOT_VALID_CACHE_SECONDS) -> bool:
     """Indica se o robô pode seguir analisando com evidência REAL recente.
 
@@ -6034,6 +7984,11 @@ def recent_real_account_connection_payload(user_id: str) -> dict[str, Any] | Non
 
 
 def memory_account_fallback(user_id: str) -> dict[str, Any] | None:
+    # Desconexão manual: memória/grace NÃO podem ressuscitar "conectado".
+    # O poll de /bullex/status caía neste fallback após SESSION_NOT_FOUND e
+    # devolvia o último active_mode REAL — o painel voltava a "Conectado".
+    if is_manual_disconnect(user_id):
+        return None
     state = auto_trader.get(user_id)
     snapshot = get_cached_account_snapshot(user_id)
     connected = bool(state.connected or snapshot.get("connected") is True)
@@ -6052,6 +8007,625 @@ def memory_account_fallback(user_id: str) -> dict[str, Any] | None:
             }
         )
     )
+
+
+def _session_score_total(wins: int, losses: int) -> int:
+    """Total de operações contabilizadas no placar (WIN + LOSS)."""
+    return max(0, int(wins or 0)) + max(0, int(losses or 0))
+
+
+def _parse_session_score_from_mapping(data: dict[str, Any]) -> tuple[int, int, float]:
+    """
+    Extrai wins/losses/profit de um dict de estado ou snapshot.
+
+    Args:
+        data: Payload parcial com campos de placar.
+
+    Returns:
+        Tupla ``(wins, losses, profit)`` normalizada e não negativa.
+    """
+    try:
+        wins = max(0, int(data.get("wins") or 0))
+        losses = max(0, int(data.get("losses") or 0))
+        profit = float(data.get("profit") or 0)
+    except (TypeError, ValueError):
+        wins = losses = 0
+        profit = 0.0
+    return wins, losses, round(profit, 2)
+
+
+def _pick_preferred_session_score(
+    *candidates: tuple[int, int, float],
+) -> tuple[int, int, float]:
+    """
+    Escolhe o placar com mais operações; empate desempata por |profit| maior.
+
+    Evita que snapshot Redis/DB atrasado (ex.: 2x0) sobrescreva sessão viva
+    (ex.: 5x3) no start/stop ou no GET /robot/state.
+
+    Args:
+        *candidates: Placares candidatos ``(wins, losses, profit)``.
+
+    Returns:
+        Placar preferido entre os candidatos informados.
+    """
+    best = (0, 0, 0.0)
+    best_total = -1
+    for wins, losses, profit in candidates:
+        total = _session_score_total(wins, losses)
+        if total > best_total or (
+            total == best_total and abs(profit) > abs(best[2])
+        ):
+            best = (wins, losses, profit)
+            best_total = total
+    return best
+
+
+# ── Placar autoritativo após baixa intencional (exclusão no Shift+O) ──────────
+# O placar da sessão vive em QUATRO réplicas: memória do gateway, memória do
+# ``robot-runtime``, ``robot:snapshot`` no Redis e ``robot_states`` no Supabase.
+# Todo reconcile entre elas escolhe o MAIOR total (``_pick_preferred_session_score``,
+# "nunca rebaixa") — regra correta para WIN/LOSS novo, porque a réplica atrasada
+# é sempre a menor, e exatamente errada para EXCLUSÃO, a única operação que baixa
+# o placar de propósito. Sem uma marca de "este é o placar certo agora", qualquer
+# réplica atrasada ressuscitava a operação excluída no poll seguinte — e de forma
+# permanente, porque o ``persist_robot`` seguinte regravava o valor ressuscitado.
+#
+# Esta marca fixa o placar nos dois processos até a próxima operação real ser
+# contabilizada (ou o "Reiniciar placar"). TTL curto: se o processo morrer no meio
+# ela caduca sozinha em vez de congelar o placar do cliente para sempre.
+SESSION_SCORE_AUTHORITY_TTL_SECONDS = 120
+# Cache negativo: o publisher do runtime chama o reconcile 1x/s por usuário e
+# "não há marca" é o caso comum. Sem isso seria um GET no Redis por segundo por
+# robô só para descobrir que nada mudou.
+SESSION_SCORE_AUTHORITY_MISS_TTL_SECONDS = 2.0
+# ``None`` como valor = ausência confirmada (cache negativo).
+_session_score_authority: dict[str, tuple[float, tuple[int, int, float] | None]] = {}
+
+
+def mark_session_score_authority(
+    user_id: str,
+    wins: int,
+    losses: int,
+    profit: float,
+) -> tuple[int, int, float]:
+    """
+    Fixa o placar correto da sessão após uma baixa intencional.
+
+    Grava na memória do processo e espelha no Redis — gateway e
+    ``robot-runtime`` precisam parar de promover as réplicas atrasadas ao
+    mesmo tempo, senão o processo que não sabe da baixa republica o placar
+    velho no próximo snapshot.
+
+    Args:
+        user_id: Dono da sessão.
+        wins: WIN da sessão depois da baixa.
+        losses: LOSS da sessão depois da baixa.
+        profit: Lucro da sessão depois da baixa.
+
+    Returns:
+        Placar registrado, normalizado e não negativo.
+    """
+    normalized = str(user_id or "").strip()
+    score = (
+        max(0, int(wins or 0)),
+        max(0, int(losses or 0)),
+        round(float(profit or 0), 2),
+    )
+    if not normalized:
+        return score
+    _session_score_authority[normalized] = (
+        monotonic() + SESSION_SCORE_AUTHORITY_TTL_SECONDS,
+        score,
+    )
+    try:
+        robot_bus.set_score_authority(normalized, score[0], score[1], score[2])
+    except Exception:
+        logger.warning(
+            "[SCORE_AUTHORITY_PUBLISH_FAILED] user_id=%s",
+            normalized,
+            exc_info=True,
+        )
+    logger.warning(
+        "[SCORE_AUTHORITY_MARKED] user_id=%s wins=%s losses=%s profit=%s ttl=%s",
+        normalized,
+        score[0],
+        score[1],
+        score[2],
+        SESSION_SCORE_AUTHORITY_TTL_SECONDS,
+    )
+    return score
+
+
+def get_session_score_authority(user_id: str) -> tuple[int, int, float] | None:
+    """
+    Lê a baixa intencional vigente, ou None se não há nenhuma.
+
+    Com Redis ligado a chave compartilhada manda: é ela que faz o gateway
+    respeitar uma baixa aplicada no runtime (e vice-versa), e é a ausência
+    dela que libera o placar quando o outro processo contabiliza um WIN novo.
+    Sem Redis (testes/dev) vale só a marca em memória.
+
+    Args:
+        user_id: Dono da sessão.
+
+    Returns:
+        ``(wins, losses, profit)`` fixados, ou None.
+    """
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        return None
+    now = monotonic()
+    cached = _session_score_authority.get(normalized)
+    if cached is not None and cached[0] <= now:
+        _session_score_authority.pop(normalized, None)
+        cached = None
+    if not getattr(robot_bus, "enabled", False):
+        return cached[1] if cached is not None else None
+    if cached is not None and cached[1] is None:
+        # Ausência já confirmada há pouco no Redis.
+        return None
+    try:
+        remote = robot_bus.get_score_authority(normalized)
+    except Exception:
+        logger.warning(
+            "[SCORE_AUTHORITY_READ_FAILED] user_id=%s",
+            normalized,
+            exc_info=True,
+        )
+        return cached[1] if cached is not None else None
+    if isinstance(remote, dict):
+        score = _parse_session_score_from_mapping(remote)
+        _session_score_authority[normalized] = (
+            now + SESSION_SCORE_AUTHORITY_TTL_SECONDS,
+            score,
+        )
+        return score
+    # Redis respondendo e sem a chave = marca liberada (ou caducada) por
+    # quem contabilizou o resultado seguinte. A cópia local não pode
+    # sobreviver a isso, senão o placar congela por até 120s.
+    _session_score_authority[normalized] = (
+        now + SESSION_SCORE_AUTHORITY_MISS_TTL_SECONDS,
+        None,
+    )
+    return None
+
+
+def clear_session_score_authority(user_id: str) -> None:
+    """
+    Libera a baixa intencional: o placar volta a poder subir.
+
+    Chamado ao contabilizar uma operação real (``finish_monitored_trade``) e
+    no "Reiniciar placar" — sem isso a marca seguraria o placar por até
+    ``SESSION_SCORE_AUTHORITY_TTL_SECONDS`` e o WIN novo não apareceria.
+
+    Args:
+        user_id: Dono da sessão.
+    """
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        return
+    previous = _session_score_authority.pop(normalized, None)
+    try:
+        robot_bus.clear_score_authority(normalized)
+    except Exception:
+        logger.warning(
+            "[SCORE_AUTHORITY_CLEAR_FAILED] user_id=%s",
+            normalized,
+            exc_info=True,
+        )
+    if previous is not None and previous[1] is not None:
+        logger.warning("[SCORE_AUTHORITY_CLEARED] user_id=%s", normalized)
+
+
+def apply_session_score_authority_to_state(user_id: str) -> tuple[int, int, float] | None:
+    """
+    Força o placar em memória a obedecer à baixa intencional vigente.
+
+    Args:
+        user_id: Dono da sessão.
+
+    Returns:
+        Placar aplicado, ou None se não há baixa vigente.
+    """
+    score = get_session_score_authority(user_id)
+    if score is None:
+        return None
+    state = auto_trader.get(user_id)
+    current = _parse_session_score_from_mapping(
+        {
+            "wins": getattr(state, "wins", 0),
+            "losses": getattr(state, "losses", 0),
+            "profit": getattr(state, "profit", 0),
+        }
+    )
+    if current != score:
+        state.wins = score[0]
+        state.losses = score[1]
+        state.profit = score[2]
+        logger.warning(
+            "[SCORE_AUTHORITY_ENFORCED] user_id=%s previous=%sx%s/%s "
+            "authority=%sx%s/%s",
+            user_id,
+            current[0],
+            current[1],
+            current[2],
+            score[0],
+            score[1],
+            score[2],
+        )
+    return score
+
+
+def _load_redis_session_score(user_id: str) -> tuple[int, int, float] | None:
+    """
+    Lê wins/losses/profit do snapshot Redis do robô.
+
+    Args:
+        user_id: Cliente autenticado.
+
+    Returns:
+        Placar do Redis ou ``None`` se indisponível/em branco.
+    """
+    if not getattr(robot_bus, "enabled", False):
+        return None
+    try:
+        remote = robot_bus.get_snapshot(user_id)
+    except Exception:
+        logger.warning(
+            "[SCORE_READ_REDIS_FAILED] user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(remote, dict) or not isinstance(remote.get("data"), dict):
+        return None
+    wins, losses, profit = _parse_session_score_from_mapping(remote["data"])
+    if wins or losses or abs(profit) > 1e-9:
+        return wins, losses, profit
+    return None
+
+
+def _load_persisted_session_score(user_id: str) -> tuple[int, int, float] | None:
+    """
+    Lê wins/losses/profit da persistência do robô.
+
+    Args:
+        user_id: Cliente autenticado.
+
+    Returns:
+        Placar persistido ou ``None`` se indisponível/em branco.
+    """
+    try:
+        payload = robot_persistence.load_state(user_id)
+    except Exception:
+        logger.warning(
+            "[SCORE_READ_PERSISTENCE_FAILED] user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    wins, losses, profit = _parse_session_score_from_mapping(payload)
+    if wins or losses or abs(profit) > 1e-9:
+        return wins, losses, profit
+    return None
+
+
+def reconcile_session_score_on_gateway(user_id: str) -> bool:
+    """
+    Alinha a memória do gateway ao placar mais completo entre fontes locais.
+
+    Fontes: memória do ``auto_trader``, snapshot Redis e persistência. Nunca
+    rebaixa o placar — só promove quando outra fonte tem mais WIN+LOSS.
+
+    Respeita ``stop_reset_at`` com placar zerado (Reiniciar placar).
+
+    Args:
+        user_id: Usuário do robô.
+
+    Returns:
+        True se wins/losses/profit em memória foram alterados.
+    """
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        return False
+    # Baixa intencional vigente (exclusão no Shift+O) manda sobre todas as
+    # réplicas: é a única situação em que a fonte certa é a MENOR.
+    authority = get_session_score_authority(normalized)
+    if authority is not None:
+        state = auto_trader.get(normalized)
+        before = _parse_session_score_from_mapping(
+            {
+                "wins": getattr(state, "wins", 0),
+                "losses": getattr(state, "losses", 0),
+                "profit": getattr(state, "profit", 0),
+            }
+        )
+        apply_session_score_authority_to_state(normalized)
+        return before != authority
+    state = auto_trader.get(normalized)
+    local = _parse_session_score_from_mapping(
+        {
+            "wins": getattr(state, "wins", 0),
+            "losses": getattr(state, "losses", 0),
+            "profit": getattr(state, "profit", 0),
+        }
+    )
+    if getattr(state, "stop_reset_at", None) is not None and _session_score_total(
+        local[0], local[1]
+    ) == 0 and abs(local[2]) < 1e-9:
+        return False
+
+    candidates: list[tuple[int, int, float]] = [local]
+    redis_score = _load_redis_session_score(normalized)
+    if redis_score is not None:
+        candidates.append(redis_score)
+    persisted_score = _load_persisted_session_score(normalized)
+    if persisted_score is not None:
+        candidates.append(persisted_score)
+
+    preferred = _pick_preferred_session_score(*candidates)
+    if preferred == local:
+        return False
+
+    state.wins = preferred[0]
+    state.losses = preferred[1]
+    state.profit = preferred[2]
+    logger.info(
+        "[SCORE_RECONCILED_ON_GATEWAY] user_id=%s previous=%sx%s/%s "
+        "preferred=%sx%s/%s",
+        normalized,
+        local[0],
+        local[1],
+        local[2],
+        preferred[0],
+        preferred[1],
+        preferred[2],
+    )
+    return True
+
+
+def enrich_robot_snapshot_session_score(
+    user_id: str,
+    remote: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Corrige wins/losses/profit de um snapshot Redis antes de servir ao painel.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` o GET /robot/state devolvia o Redis
+    cru; um snapshot de controle atrasado (2x0) sobrescrevia o overlay mesmo
+    com a sessão em 5x3 na memória/persistência.
+
+    Args:
+        user_id: Cliente autenticado.
+        remote: Envelope ``{ok, data}`` lido do Redis.
+
+    Returns:
+        Snapshot com placar elevado ao máximo entre Redis, gateway e DB.
+    """
+    data = remote.get("data")
+    if not isinstance(data, dict):
+        return remote
+    reconcile_session_score_on_gateway(user_id)
+    authority = get_session_score_authority(user_id)
+    if authority is not None:
+        # Snapshot do runtime pode ter sido publicado antes do `apply_score`
+        # chegar. Servir o máximo aqui ressuscitava a operação excluída.
+        current = _parse_session_score_from_mapping(data)
+        if current == authority:
+            return remote
+        patched = dict(data)
+        patched["wins"] = authority[0]
+        patched["losses"] = authority[1]
+        patched["profit"] = authority[2]
+        logger.warning(
+            "[SCORE_SNAPSHOT_CLAMPED_TO_AUTHORITY] user_id=%s redis=%sx%s/%s "
+            "authority=%sx%s/%s",
+            user_id,
+            current[0],
+            current[1],
+            current[2],
+            authority[0],
+            authority[1],
+            authority[2],
+        )
+        return {**remote, "data": patched}
+    state = auto_trader.get(user_id)
+    candidates = [
+        _parse_session_score_from_mapping(data),
+        _parse_session_score_from_mapping(
+            {
+                "wins": getattr(state, "wins", 0),
+                "losses": getattr(state, "losses", 0),
+                "profit": getattr(state, "profit", 0),
+            }
+        ),
+    ]
+    persisted_score = _load_persisted_session_score(user_id)
+    if persisted_score is not None:
+        candidates.append(persisted_score)
+    preferred = _pick_preferred_session_score(*candidates)
+    current = _parse_session_score_from_mapping(data)
+    if preferred == current:
+        return remote
+    patched = dict(data)
+    patched["wins"] = preferred[0]
+    patched["losses"] = preferred[1]
+    patched["profit"] = preferred[2]
+    logger.info(
+        "[SCORE_SNAPSHOT_ENRICHED] user_id=%s redis=%sx%s/%s enriched=%sx%s/%s",
+        user_id,
+        current[0],
+        current[1],
+        current[2],
+        preferred[0],
+        preferred[1],
+        preferred[2],
+    )
+    return {**remote, "data": patched}
+
+
+def adopt_live_session_score_if_blank(user_id: str) -> bool:
+    """
+    Copia o placar vivo (Redis ou persistência) para a memória do gateway.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` o placar da sessão mora no
+    ``robot-runtime``. O gateway local muitas vezes fica em 0-0 ou atrasado
+    (ex.: 2x0); publicar esse snapshot no start/stop apagava WIN/LOSS no
+    Redis e o overlay “sumia” ou caía (5x3 → 2x0).
+
+    Delega para ``reconcile_session_score_on_gateway``, que promove o placar
+    sem rebaixar. Não reidrata quando ``stop_reset_at`` está setado com 0-0
+    (Reiniciar placar).
+
+    Args:
+        user_id: Usuário do robô.
+
+    Returns:
+        True se a memória local recebeu wins/losses/profit de outra fonte.
+    """
+    return reconcile_session_score_on_gateway(user_id)
+
+
+def publish_robot_control_snapshot(
+    user_id: str,
+    *,
+    worker_running: bool | None = None,
+    trust_local_score: bool = False,
+) -> dict[str, Any]:
+    """
+    Publica no Redis o estado atual do robô após start/stop explícito.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` o painel (HTTP + WS) lê
+    ``robot:snapshot:{user_id}``. O publisher do runtime só cobre usuários em
+    ``robot_tasks``: no stop o task some e o snapshot antigo
+    (``enabled/worker_running=true``, TTL 600s) continuava no Redis — o overlay
+    demorava (ou ficava preso) em "Parar Operação". No start, o front esperava
+    o persist + 1º snapshot do runtime. Espelha o padrão de
+    ``publish_manual_disconnect_robot_snapshot``.
+
+    Antes de montar o payload, adota o placar vivo do Redis/persistência se a
+    memória do gateway estiver zerada — evita start/stop apagarem WIN/LOSS.
+    Passe ``trust_local_score=True`` após uma baixa intencional (exclusão
+    marketing / ``apply_score``) para não readotar o Redis antigo.
+
+    Args:
+        user_id: Cliente autenticado.
+        worker_running: Se informado, força o campo no payload (no stop use
+            ``False`` antes do cancel terminar; no start use ``True`` para a
+            UI refletir na hora).
+        trust_local_score: Se True, não chama
+            ``adopt_live_session_score_if_blank`` (reconcile que só promove).
+
+    Returns:
+        Envelope ``build_robot_payload`` publicado (ou montado se o Redis
+        falhar).
+    """
+    if not trust_local_score:
+        adopt_live_session_score_if_blank(user_id)
+    state = auto_trader.get(user_id)
+    account_snapshot = get_cached_account_snapshot(user_id)
+    if is_manual_disconnect(user_id):
+        connected = False
+        active_mode = None
+        source = "disconnected"
+    else:
+        connected = bool(state.connected or account_snapshot.get("connected") is True)
+        active_mode = state.active_mode or account_snapshot.get("mode")
+        active_mode = str(active_mode).strip().upper() if active_mode else None
+        source = state.connection_status_source or (
+            "cached" if account_snapshot.get("connected") is not None else "memory"
+        )
+    block_reason = real_block_reason(
+        state, connected=connected, active_mode=active_mode, user_id=user_id
+    )
+    balance_value = number_or_none(account_snapshot.get("balance"))
+    real_ready = bool(
+        connected
+        and active_mode == "REAL"
+        and block_reason is None
+        and (balance_value is None or float(balance_value) > 0)
+    )
+    payload = build_robot_payload(
+        state,
+        user_id=user_id,
+        connected=connected,
+        active_mode=active_mode,
+        balance=None if not connected else account_snapshot.get("balance"),
+        currency=None if not connected else account_snapshot.get("currency"),
+        email=None if not connected else account_snapshot.get("email"),
+        connection_checked_at=state.connection_checked_at.isoformat()
+        if state.connection_checked_at is not None
+        else None,
+        connection_status_source=source,
+        real_ready=real_ready,
+        real_block_reason=block_reason,
+    )
+    data = payload.get("data")
+    if isinstance(data, dict) and worker_running is not None:
+        data["worker_running"] = bool(worker_running)
+        # ``build_robot_payload`` promove STOPPED→RUNNING enquanto ainda existe
+        # task em ``robot_tasks``. No stop publicamos o snapshot ANTES do
+        # cancel — sem este ajuste o payload sai com worker_running=false e
+        # status=RUNNING (overlay/testes inconsistentes).
+        if worker_running is False and not data.get("enabled"):
+            if str(data.get("status") or "").upper() == "RUNNING":
+                data["status"] = STATUS_STOPPED
+    try:
+        robot_bus.publish_snapshot(user_id, payload)
+        if robot_state_ws_hub.has_connections(user_id):
+            robot_state_ws_hub.schedule_publish(user_id)
+        logger.info(
+            "[ROBOT_CONTROL_SNAPSHOT_PUBLISHED] user_id=%s enabled=%s worker_running=%s status=%s",
+            user_id,
+            bool(getattr(state, "enabled", False)),
+            (data or {}).get("worker_running") if isinstance(data, dict) else None,
+            getattr(state, "status", None),
+        )
+    except Exception:
+        logger.warning(
+            "[ROBOT_CONTROL_SNAPSHOT_PUBLISH_FAILED] user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+    return payload
+
+
+def publish_manual_disconnect_robot_snapshot(user_id: str) -> None:
+    """Grava no Redis o estado desconectado após ``POST /bullex/disconnect``.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` o gateway serve
+    ``robot_bus.get_snapshot`` no ``/robot/state`` e no WS. O runtime só
+    republica snapshots de usuários com worker ativo — ao cancelar o task no
+    disconnect, o snapshot antigo (``connected=true``, TTL 600s) ficava no
+    Redis e o painel voltava para "Conectado" sozinho. Relato 12/08: clientes
+    clicavam Desconectar dezenas de vezes com ``upstream_ok=True``.
+    """
+    state = auto_trader.get(user_id)
+    payload = build_robot_payload(
+        state,
+        user_id=user_id,
+        connected=False,
+        active_mode=None,
+        connection_status_source="disconnected",
+        real_ready=False,
+        real_block_reason="Conta Bullex desconectada",
+    )
+    data = payload.get("data")
+    if isinstance(data, dict):
+        data["worker_running"] = False
+    try:
+        robot_bus.publish_snapshot(user_id, payload)
+        if robot_state_ws_hub.has_connections(user_id):
+            robot_state_ws_hub.schedule_publish(user_id)
+    except Exception:
+        logger.warning(
+            "[BULLEX_DISCONNECT_SNAPSHOT_PUBLISH_FAILED] user_id=%s",
+            user_id,
+            exc_info=True,
+        )
 
 
 def memory_status_fallback(user_id: str) -> dict[str, Any] | None:
@@ -6101,6 +8675,55 @@ PENDING_SIGNAL_STATUS_OVERRIDE_BLOCKLIST = frozenset(
 )
 
 
+def open_market_really_available(
+    user_id: str | None,
+    timeframe: str | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, str | None]:
+    """Mercado aberto disponivel DE VERDADE, nao so pelo relogio.
+
+    `is_forex_open_market_open` conhece apenas a janela semanal (dom 22:00 ->
+    sex 22:00 UTC). Ele **nao conhece feriado**: em 07/09/2026 (Labor Day nos
+    EUA + 7 de Setembro) ele disse "aberto" enquanto o volume era 18% de uma
+    segunda normal — e a medicao daquele dia levou a uma conclusao errada sobre
+    a corretora que custou uma trava indevida no painel.
+
+    Agora a corretora e consultada: ela informa, por ativo, se o canal
+    turbo/binary esta aberto. Se ela diz que TODOS os pares abertos conhecidos
+    estao fechados, esta fechado — feriado incluido.
+
+    Sem nenhuma amostra em cache (sessao fria, usuario recem-conectado) o
+    relogio continua valendo. Travar o painel por cache vazio seria pior do que
+    o defeito que isto conserta.
+
+    Args:
+        user_id: Usuario autenticado; sem ele so o relogio responde.
+        timeframe: Timeframe operacional (define turbo vs binary).
+        now: Instante avaliado, para teste.
+
+    Returns:
+        Par ``(disponivel, motivo)``. ``motivo`` e ``None`` quando disponivel,
+        ``"forex_closed"`` fora da janela semanal e ``"broker_closed"`` quando a
+        corretora fechou os pares dentro dela.
+    """
+    if not is_forex_open_market_open(now):
+        return False, "forex_closed"
+    if not user_id:
+        return True, None
+    tf = str(timeframe or "M1")
+    conhecidos = 0
+    for symbol in ANALYSIS_ASSETS_OPEN:
+        flag = cached_asset_open_for_active(str(user_id), symbol, tf)
+        if flag is None:
+            continue
+        conhecidos += 1
+        if flag:
+            return True, None
+    if conhecidos == 0:
+        return True, None
+    return False, "broker_closed"
+
+
 def build_robot_payload(state: Any, **extra: Any) -> dict[str, Any]:
     data = strip_ai_fields(state.to_dict())
     data["status"] = normalize_robot_status(data.get("status"))
@@ -6110,7 +8733,12 @@ def build_robot_payload(state: Any, **extra: Any) -> dict[str, Any]:
     selectable_mode = coerce_selectable_market_mode(data.get("market_mode"))
     data["market_mode"] = selectable_mode
     data["market_mode_effective"] = effective_market_mode(selectable_mode)
-    data["open_market_available"] = is_forex_open_market_open()
+    disponivel, motivo_fechado = open_market_really_available(
+        extra.get("user_id"),
+        data.get("timeframe"),
+    )
+    data["open_market_available"] = disponivel
+    data["open_market_closed_reason"] = motivo_fechado
     data["open_market_hours_until"] = hours_until_forex_open_market()
     if str(data.get("active_mode") or "").strip().upper() == "DEMO":
         data["active_mode"] = "REAL"
@@ -6240,8 +8868,21 @@ def build_robot_payload(state: Any, **extra: Any) -> dict[str, Any]:
         data["result_waiting"] = False
         data["analysis_message"] = None
         data["pending_signal"] = None
-        data["operation_message"] = INSUFFICIENT_BALANCE_START_MESSAGE
-        data["status_message"] = INSUFFICIENT_BALANCE_START_MESSAGE
+        existing = str(
+            data.get("status_message")
+            or data.get("operation_message")
+            or data.get("last_order_error")
+            or ""
+        ).strip()
+        if (
+            not existing
+            or existing == STATUS_INSUFFICIENT_BALANCE
+            or existing.lower() == "saldo insuficiente na conta real"
+        ):
+            existing = INSUFFICIENT_BALANCE_START_MESSAGE
+        data["operation_message"] = existing
+        data["status_message"] = existing
+        data["last_order_error"] = existing
         data["real_ready"] = False
     if data.get("status") == STATUS_BULLEX_ACTIVE_MODE_NOT_REAL:
         data["enabled"] = False
@@ -6310,8 +8951,100 @@ def build_robot_state_fallback_payload(user_id: str | None, exc: Exception) -> d
     )
 
 
+def reconcile_gateway_enabled_from_runtime_snapshot(user_id: str, state: Any) -> Any:
+    """
+    Alinha ``enabled`` do gateway com o estado real do runtime (mode=external).
+
+    Stop Win/Loss (e outros stops) no ``robot-runtime`` gravam ``enabled=false``
+    no Redis e o painel mostra parado. A memória do gateway, porém, continua
+    com ``enabled=true`` do último ``POST /robot/start``. Sem reconciliar,
+    ``POST /robot/config`` devolve ``ROBOT_RUNNING_CONFIG_LOCKED``
+    ("Pare o robô antes de alterar configurações.") mesmo com o overlay parado.
+
+    Fonte de verdade: snapshot Redis; se expirou, persistência gravada pelo
+    runtime no pause/stop.
+
+    Args:
+        user_id: Cliente autenticado.
+        state: Estado em memória do gateway.
+
+    Returns:
+        Estado possivelmente com ``enabled``/status/placar alinhados ao runtime.
+    """
+    if robot_runtime_mode() != "external":
+        return state
+    if not getattr(state, "enabled", False):
+        return state
+
+    remote_data: dict[str, Any] | None = None
+    if getattr(robot_bus, "enabled", False):
+        remote = robot_bus.get_snapshot(user_id)
+        if isinstance(remote, dict) and isinstance(remote.get("data"), dict):
+            remote_data = remote["data"]
+
+    if remote_data is None:
+        try:
+            payload = robot_persistence.load_state(user_id)
+        except Exception:
+            logger.warning(
+                "[GATEWAY_ENABLED_RECONCILE_PERSIST_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+            return state
+        if not isinstance(payload, dict):
+            return state
+        remote_data = payload
+
+    if bool(remote_data.get("enabled")):
+        return state
+
+    previous_status = str(getattr(state, "status", "") or "")
+    remote_status = str(remote_data.get("status") or "").strip().upper()
+    local_score = _parse_session_score_from_mapping(
+        {
+            "wins": getattr(state, "wins", 0),
+            "losses": getattr(state, "losses", 0),
+            "profit": getattr(state, "profit", 0),
+        }
+    )
+    remote_score = _parse_session_score_from_mapping(remote_data)
+    # Baixa intencional vigente: não promover o snapshot do runtime, que pode
+    # ser anterior ao `apply_score` da exclusão.
+    authority = get_session_score_authority(user_id)
+    preferred = authority or _pick_preferred_session_score(local_score, remote_score)
+    state.wins = preferred[0]
+    state.losses = preferred[1]
+    state.profit = preferred[2]
+
+    if is_stop_status(remote_status):
+        state = auto_trader.pause_by_stop(user_id, remote_status)
+    else:
+        state.enabled = False
+        state.operation_in_progress = False
+        if not is_stop_status(getattr(state, "status", None)):
+            known_off = {
+                STATUS_STOPPED,
+                STATUS_INSUFFICIENT_BALANCE,
+                STATUS_ACCOUNT_DISCONNECTED,
+            }
+            state.status = remote_status if remote_status in known_off else STATUS_STOPPED
+
+    logger.warning(
+        "[GATEWAY_ENABLED_RECONCILED_FROM_RUNTIME] user_id=%s previous_status=%s "
+        "remote_status=%s wins=%s losses=%s",
+        user_id,
+        previous_status or None,
+        remote_status or None,
+        getattr(state, "wins", None),
+        getattr(state, "losses", None),
+    )
+    return state
+
+
 def robot_config_locked(user_id: str, state: Any) -> bool:
     """Trava config só com robô ativo (enabled ou worker). Parado libera o pop-up de início."""
+    state = reconcile_gateway_enabled_from_runtime_snapshot(user_id, state)
     worker_task = robot_tasks.get(user_id)
     worker_running = bool(worker_task is not None and not worker_task.done())
     return bool(getattr(state, "enabled", False) or worker_running)
@@ -6392,8 +9125,25 @@ async def stop_real_robot_for_insufficient_balance(
     *,
     balance: float | None,
     entry_value: float | None = None,
+    message: str | None = None,
 ) -> Any:
+    """
+    Para o robô REAL e marca ``INSUFFICIENT_BALANCE`` no painel.
+
+    Args:
+        user_id: Usuário do robô.
+        balance: Saldo conhecido (pode ser None se a corretora só rejeitou a compra).
+        entry_value: Valor da entrada que falhou (opcional).
+        message: Texto amigável para overlay; default = aviso de saldo/entrada.
+
+    Returns:
+        Estado do robô após o stop.
+    """
     state = auto_trader.insufficient_balance(user_id)
+    friendly = (message or INSUFFICIENT_FUNDS_ORDER_MESSAGE).strip() or INSUFFICIENT_FUNDS_ORDER_MESSAGE
+    state.last_order_error = friendly
+    state.operation_message = friendly
+    state.status_message = friendly
     persist_robot(user_id)
     logger.warning(
         "[ROBOT_STOPPED_BALANCE_ZERO] user_id=%s balance=%s entry_value=%s",
@@ -6478,9 +9228,37 @@ def recover_analysis_error_to_window(
     return state
 
 
+def is_insufficient_funds_error(error: Any) -> bool:
+    """
+    Detecta recusa da corretora por saldo insuficiente (compra REAL).
+
+    Args:
+        error: Mensagem/código bruto da Bullex ou do gateway.
+
+    Returns:
+        True quando o erro indica falta de fundos para a entrada.
+    """
+    normalized = str(error or "").strip().lower().replace("_", " ").replace("-", " ")
+    if not normalized:
+        return False
+    if "insufficient funds" in normalized or "insufficient balance" in normalized:
+        return True
+    if "saldo insuficiente" in normalized:
+        return True
+    if "not enough funds" in normalized or "not enough balance" in normalized:
+        return True
+    if "funds for this transaction" in normalized:
+        return True
+    return False
+
+
 def readable_order_error(error: Any) -> str:
     raw_error = str(error or "ORDER_FAILED").strip() or "ORDER_FAILED"
     normalized = raw_error.lower().replace("_", " ").replace("-", " ")
+    # Fundos primeiro: mensagens com "cannot purchase" + insufficient funds
+    # não devem virar "ativo indisponível".
+    if is_insufficient_funds_error(raw_error):
+        return INSUFFICIENT_FUNDS_ORDER_MESSAGE
     if "asset is not available" in normalized or "cannot purchase" in normalized:
         return "Ativo indisponivel no momento da compra"
     if "active suspended" in normalized or "ativo suspenso" in normalized:
@@ -6497,8 +9275,72 @@ def readable_order_error(error: Any) -> str:
 
 
 def is_order_availability_error(error: Any) -> bool:
+    if is_insufficient_funds_error(error):
+        return False
     normalized = str(error or "").strip().lower().replace("_", " ").replace("-", " ")
     return any(term in normalized for term in ORDER_AVAILABILITY_ERROR_TERMS)
+
+
+def rehydrate_score_from_persistence_if_blank(user_id: str) -> bool:
+    """
+    Recupera WIN/LOSS/profit da persistência quando a memória está zerada.
+
+    Evita placar sumir no painel quando o snapshot Redis expira (TTL 120s) e
+    o gateway em modo ``external`` cai no ``auto_trader`` local vazio.
+
+    Args:
+        user_id: Usuário do robô.
+
+    Returns:
+        True se o placar em memória foi preenchido a partir da persistência.
+    """
+    state = auto_trader.get(user_id)
+    live_wins = int(getattr(state, "wins", 0) or 0)
+    live_losses = int(getattr(state, "losses", 0) or 0)
+    live_profit = float(getattr(state, "profit", 0) or 0)
+    if live_wins or live_losses or abs(live_profit) > 1e-9:
+        return False
+    # ``reset_score`` zera de propósito e marca ``stop_reset_at``. Não
+    # reidratar o placar antigo da DB (persistência ainda assíncrona).
+    if getattr(state, "stop_reset_at", None) is not None:
+        return False
+    # Excluir a última operação deixa 0-0 de propósito: sem este guard a DB
+    # (gravada em background, ainda com a linha antiga) reidratava o placar.
+    authority = get_session_score_authority(user_id)
+    if authority is not None:
+        if authority != (0, 0, 0.0):
+            apply_session_score_authority_to_state(user_id)
+        return False
+    try:
+        payload = robot_persistence.load_state(user_id)
+    except Exception:
+        logger.warning(
+            "[SCORE_REHYDRATE_FAILED] user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return False
+    if not isinstance(payload, dict):
+        return False
+    persisted_wins = int(payload.get("wins") or 0)
+    persisted_losses = int(payload.get("losses") or 0)
+    try:
+        persisted_profit = float(payload.get("profit") or 0)
+    except (TypeError, ValueError):
+        persisted_profit = 0.0
+    if not (persisted_wins or persisted_losses or abs(persisted_profit) > 1e-9):
+        return False
+    state.wins = persisted_wins
+    state.losses = persisted_losses
+    state.profit = persisted_profit
+    logger.warning(
+        "[SCORE_REHYDRATED_FROM_PERSISTENCE] user_id=%s wins=%s losses=%s profit=%s",
+        user_id,
+        persisted_wins,
+        persisted_losses,
+        persisted_profit,
+    )
+    return True
 
 
 def candidate_pre_order_block_reason(candidate: dict[str, Any]) -> str | None:
@@ -6570,7 +9412,12 @@ def resolve_entry_validation_reason(
         payout = float(candidate.get("payout") or 0)
     except (TypeError, ValueError):
         return LOW_QUALITY_SIGNAL
-    if confidence < int(minimum_confidence):
+    piso = (
+        revz_min_confidence(int(minimum_confidence))
+        if is_revz_candidate(candidate)
+        else vertex_min_confidence(int(minimum_confidence), candidate)
+    )
+    if confidence < piso:
         return "MIN_CONFIDENCE"
     if payout < float(state.min_payout):
         return "PAYOUT_TOO_LOW"
@@ -6650,6 +9497,392 @@ async def fresh_asset_open_for_active(
     if status_code >= 400 or not payload.get("ok"):
         return None
     return extract_asset_open(payload, symbol, timeframe)
+
+
+# Ultimo (ciclo, ativo) pre-aquecido por usuario. O worker faz poll curto perto
+# da abertura da vela; sem esta trava o pre-aquecimento viraria uma rajada de
+# /payouts na corretora para o mesmo ativo.
+#
+# A chave inclui o ATIVO porque `cycle_id` nao roda a cada entrada: medido em
+# 08/09/2026, o ciclo 2178739c serviu GBPCHF-OTC, GBPAUD-OTC e EURCAD-OTC em
+# ~6 minutos. Com a trava so por ciclo, o 1o ativo aquecia e os outros caiam no
+# caminho antigo — e foi justamente o EURCAD-OTC nao aquecido que estourou o
+# timeout de 0,9s DENTRO da janela de compra, o problema que isto existe para
+# resolver.
+_channel_prewarmed_cycle_by_user: dict[str, tuple[str, str]] = {}
+
+
+async def prewarm_execution_channel_before_entry(
+    user_id: str,
+    candidate: dict[str, Any],
+    timeframe: str,
+    *,
+    seconds_until_entry: float,
+    cycle_id: str | None,
+) -> None:
+    """Aquece o cache de canal ANTES da vela abrir, uma vez por ciclo.
+
+    Roda a mesma consulta que ``refresh_candidate_execution_channel`` faria na
+    hora da compra, mas enquanto a vela anterior ainda corre — o unico momento
+    em que ela nao custa nada da janela de entrada.
+
+    Nao levanta: pre-aquecer e otimizacao, e a espera da entrada nao pode
+    quebrar por causa dela. Falhando, o caminho antigo segue inteiro na compra.
+
+    Args:
+        user_id: Identificador autenticado.
+        candidate: Candidato ja selecionado para a ordem.
+        timeframe: Timeframe operacional (define turbo vs binary).
+        seconds_until_entry: Quanto falta para a janela abrir.
+        cycle_id: Ciclo atual — chave da trava de uma-vez-por-ciclo.
+
+    Returns:
+        None.
+    """
+    if not cycle_id:
+        return
+    if not (0 < seconds_until_entry <= CHANNEL_PREWARM_LEAD_SECONDS):
+        return
+    symbol = normalize_binary_active(str((candidate or {}).get("symbol") or ""))
+    if not symbol:
+        return
+    chave = str(user_id)
+    marca = (str(cycle_id), symbol)
+    if _channel_prewarmed_cycle_by_user.get(chave) == marca:
+        return
+    _channel_prewarmed_cycle_by_user[chave] = marca
+    # O timeout nunca passa do que falta para a vela abrir: pre-aquecer nao
+    # pode atrasar a propria abertura que ele existe para proteger.
+    timeout_seconds = min(CHANNEL_PREWARM_TIMEOUT_SECONDS, float(seconds_until_entry))
+    try:
+        aberto = await fresh_asset_open_for_active(
+            user_id,
+            symbol,
+            timeframe,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        logger.warning(
+            "[CHANNEL_PREWARM_FAILED] user_id=%s symbol=%s", user_id, symbol, exc_info=True
+        )
+        return
+    if aberto is None:
+        # Nao esquentou nada: a compra vai refazer a consulta dentro da janela,
+        # que e exatamente o custo que este caminho existe para evitar. Merece
+        # tag propria — dizer "PREWARMED" aqui escondia o problema no log.
+        logger.warning(
+            "[CHANNEL_PREWARM_MISSED] user_id=%s cycle_id=%s symbol=%s timeout=%.2fs lead=%.2fs",
+            user_id,
+            cycle_id,
+            symbol,
+            timeout_seconds,
+            float(seconds_until_entry),
+        )
+        return
+    logger.info(
+        "[CHANNEL_PREWARMED] user_id=%s cycle_id=%s symbol=%s timeframe=%s open=%s lead=%.2fs",
+        user_id,
+        cycle_id,
+        symbol,
+        timeframe,
+        aberto,
+        float(seconds_until_entry),
+    )
+
+
+REVZ_ENTRY_CONFIRM_TIMEOUT_SECONDS = float(os.getenv("REVZ_ENTRY_CONFIRM_TIMEOUT", "1.2"))
+
+
+async def confirm_revz_before_entry(
+    user_id: str,
+    candidate: dict[str, Any],
+    *,
+    server_timestamp: float | None,
+    timeout_seconds: float = REVZ_ENTRY_CONFIRM_TIMEOUT_SECONDS,
+) -> str | None:
+    """Refaz o z da REV-Z com a vela M1 que acabou de fechar, no disparo.
+
+    A análise indica o candidato olhando a vela ainda em formação (segundo
+    5-20). A simulação dos 60% decide no FECHAMENTO da vela e entra na abertura
+    da seguinte — é isto que esta função reproduz: só sai ordem se o |z| no
+    fechamento da vela anterior passa de ``REVZ_THRESHOLD`` na mesma direção.
+
+    Falha FECHADA, ao contrário da reconferência de nível: sem a vela fechada
+    não há como saber se a condição simulada vale, e entrar mesmo assim seria
+    operar a indicação (|z| menor) como se fosse o sinal. O motivo vai para o
+    log em WARNING para aparecer se virar volume.
+
+    Args:
+        user_id: Dono da sessão.
+        candidate: Candidato da REV-Z prestes a virar ordem.
+        server_timestamp: Relógio da corretora no instante do disparo.
+        timeout_seconds: Teto da consulta (medido ~150 ms; janela de 0-3 s).
+
+    Returns:
+        ``None`` quando confirmado; senão o código do bloqueio.
+    """
+    direction = str(candidate.get("direction") or candidate.get("signal") or "").strip().upper()
+    symbol = normalize_binary_active(str(candidate.get("symbol") or candidate.get("active") or ""))
+    agora = float(server_timestamp) if server_timestamp else utc_now().timestamp()
+    vela_atual = int(agora // 60) * 60
+    try:
+        # Direto na corretora, sem cache: o TTL de velas (60 s) devolveria as
+        # velas da análise — foi o que deixou a reconferência de nível inerte.
+        status_code, payload = await asyncio.wait_for(
+            call_bullex_service(
+                "GET",
+                "/candles",
+                user_id,
+                params={
+                    "active": symbol,
+                    "interval": 60,
+                    "count": REVZ_LOOKBACK + 10,
+                },
+            ),
+            timeout=timeout_seconds,
+        )
+        candles = extract_candles(payload) if status_code < 400 and payload.get("ok") else []
+    except Exception:
+        logger.warning(
+            "[REVZ_ENTRY_CONFIRM_ERRO] user_id=%s symbol=%s acao=NAO_OPERA",
+            user_id,
+            symbol,
+            exc_info=True,
+        )
+        return "REVZ_CONFIRMACAO_SEM_DADOS"
+    closes = closes_of_closed_candles(candles, current_candle_start=vela_atual)
+    confirmado, z, motivo = revz_confirm_at_entry(closes, direction)
+    revz = dict(candidate.get("revz") or {})
+    revz["z_indicacao"] = revz.get("z")
+    revz["z_confirmacao"] = z
+    revz["confirmacao"] = motivo
+    candidate["revz"] = revz
+    if confirmado:
+        logger.info(
+            "[REVZ_ENTRY_CONFIRMED] user_id=%s symbol=%s direction=%s z_indicacao=%s z_fechamento=%.2f",
+            user_id,
+            symbol,
+            direction,
+            revz.get("z_indicacao"),
+            z,
+        )
+        return None
+    logger.warning(
+        "[REVZ_ENTRY_NOT_CONFIRMED] user_id=%s symbol=%s direction=%s z_indicacao=%s z_fechamento=%s motivo=%s velas=%s",
+        user_id,
+        symbol,
+        direction,
+        revz.get("z_indicacao"),
+        None if z is None else round(z, 2),
+        motivo,
+        len(candles),
+    )
+    return motivo
+
+
+def candles_with_current_candle(
+    candles: list[dict[str, Any]],
+    current_candle_start: int,
+) -> list[dict[str, Any]]:
+    """Garante que a última vela da lista é a vela em formação da entrada.
+
+    `build_zone` trata a última vela como preço e monta os níveis só com as
+    anteriores. No segundo 0 da vela a corretora às vezes ainda não abriu a
+    vela nova: a lista termina na que ACABOU de fechar, e ela ficava de fora
+    dos níveis — justamente a vela que confirma o pivô novo. Medido em 10/09
+    (EURNZD-OTC PUT, R$ 200, 19:19 UTC): com a vela fechada fora, o suporte
+    sumia e a reconferência liberou (`OK_FORA_DA_REGIAO`); com ela dentro, era
+    `CONTRA_O_NIVEL`. Aqui, se a última vela começa antes da vela atual, entra
+    uma vela em formação no fechamento dela.
+
+    Args:
+        candles: Velas da corretora, em ordem cronológica.
+        current_candle_start: Abertura da vela de entrada (relógio da corretora).
+
+    Returns:
+        A lista, com a vela em formação garantida no fim.
+    """
+    if not candles:
+        return candles
+    ultima = candles[-1]
+    try:
+        inicio_ultima = int(float(ultima.get("from") or ultima.get("time") or 0))
+    except (TypeError, ValueError):
+        return candles
+    if not inicio_ultima or inicio_ultima >= current_candle_start:
+        return candles
+    preco = float(ultima["close"])
+    return [*candles, {"from": current_candle_start, "open": preco, "close": preco, "max": preco, "min": preco}]
+
+
+async def revalidate_level_before_entry(
+    user_id: str,
+    candidate: dict[str, Any],
+    timeframe: str,
+    *,
+    server_timestamp: float | None = None,
+    timeout_seconds: float = SR_ENTRY_RECHECK_TIMEOUT_SECONDS,
+) -> str | None:
+    """Reconfere suporte/resistência com a vela recém-fechada, no disparo.
+
+    O veredito que o candidato carrega foi calculado na análise, uma vela antes.
+    Quando a vela fecha, um pivô novo pode nascer exatamente onde o preço está —
+    foi assim que uma entrada de venda saiu em cima do suporte em 10/09.
+
+    Quando não dá para verificar (timeout, sem velas, erro) a ordem **não sai**
+    (``SR_ZONE_SEM_VERIFICACAO``) — decisão do dono em 10/09: S/R antes de
+    volume. O risco conhecido é o de sempre neste projeto, "o robô parou de
+    operar em silêncio"; por isso cada caso loga em WARNING com
+    ``acao=BLOQUEADO`` e ``SR_ENTRY_RECHECK_FAIL_CLOSED=false`` volta a liberar
+    sem redeploy. `SR_ENTRY_RECHECK=false` desliga a reconferência inteira.
+
+    A consulta usa ``endtime`` = abertura da vela de entrada (relógio da
+    corretora) e ``count`` próprio. Isso dá uma chave de cache por vela: as
+    contas que entram no mesmo ativo no mesmo minuto dividem UMA busca
+    (single-flight) — os timeouts vinham de três contas buscando o mesmo gráfico
+    no mesmo segundo — e a chave nunca serve a vela do minuto anterior. A chave
+    antiga, sem ``endtime``, ficava 60s no cache compartilhado: duas contas no
+    mesmo ativo em minutos seguidos (AUDCHF 17:18 e 17:19 em 10/09) faziam a
+    segunda reconferir com o gráfico de antes do fechamento.
+
+    Args:
+        user_id: Dono da sessão, para o fetch de velas.
+        candidate: Candidato prestes a virar ordem.
+        timeframe: Timeframe da operação.
+        timeout_seconds: Teto para a consulta; medido ~300ms a frio.
+
+    Returns:
+        ``None`` quando pode operar (inclusive quando não deu para verificar);
+        ``"SR_ZONE_NA_ENTRADA"`` quando o nível virou contra a direção;
+        ``"PAVIO_NA_ENTRADA"`` quando a vela recém-fechada (ou a sequência das
+        últimas) deixou pavio demais — ver ``wick_filter``;
+        ``"SR_ZONE_SEM_VERIFICACAO"`` quando não deu para verificar e
+        ``SR_ENTRY_RECHECK_FAIL_CLOSED`` está ligado.
+    """
+    if not SR_ENTRY_RECHECK or not SR_ZONE_HARD_BLOCK:
+        return None
+    direction = str(candidate.get("direction") or candidate.get("signal") or "").strip().upper()
+    if direction not in {"CALL", "PUT"}:
+        return None
+    symbol = str(candidate.get("symbol") or candidate.get("active") or "").strip()
+    if not symbol:
+        return None
+    # NÃO usar `load_candles_for_active`: ele é cache-first e o TTL de velas é
+    # CANDLES_CACHE_TTL_SECONDS (60s). A análise roda no segundo 5-20 da vela N
+    # e a entrada no segundo 0-3 da N+1 — ~40-55s depois, DENTRO do TTL. A
+    # reconferência receberia exatamente as velas da análise, chegaria ao mesmo
+    # veredito e nunca barraria nada. Foi o que aconteceu: 64 ordens, zero
+    # bloqueios, verificação inerte. Aqui a consulta vai direto à corretora.
+    erro = None
+    sem_dado = "SR_ZONE_SEM_VERIFICACAO" if SR_ENTRY_RECHECK_FAIL_CLOSED else None
+    acao = "BLOQUEADO" if SR_ENTRY_RECHECK_FAIL_CLOSED else "LIBERADO_SEM_VERIFICAR"
+    agora = float(server_timestamp) if server_timestamp else utc_now().timestamp()
+    try:
+        status_code, payload = await asyncio.wait_for(
+            call_bullex_service(
+                "GET",
+                "/candles",
+                user_id,
+                params={
+                    "active": normalize_binary_active(symbol),
+                    "interval": TIMEFRAME_SECONDS[timeframe],
+                    # +1: chave diferente da análise (count=ROBOT_CANDLE_COUNT
+                    # com o mesmo endtime). Sem isso a análise do minuto leria
+                    # o gráfico que a reconferência buscou no segundo 0-3.
+                    "count": ROBOT_CANDLE_COUNT + 1,
+                    "endtime": closed_candle_endtime(agora, timeframe),
+                },
+            ),
+            timeout=timeout_seconds,
+        )
+        candles = extract_candles(payload) if status_code < 400 and payload.get("ok") else []
+        if not candles:
+            erro = f"CANDLES_STATUS_{status_code}"
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[SR_ENTRY_RECHECK_TIMEOUT] user_id=%s symbol=%s timeout=%ss acao=%s",
+            user_id,
+            symbol,
+            timeout_seconds,
+            acao,
+        )
+        candidate["sr_entry_recheck_reason"] = "SEM_VERIFICACAO_TIMEOUT"
+        return sem_dado
+    except Exception:
+        # Qualquer erro na busca de velas TEM de morrer aqui. Esta função roda
+        # dentro do laço de compra: uma exceção que escapa não "bloqueia a
+        # entrada", ela derruba o ciclo inteiro e a ordem não sai — foi o que
+        # aconteceu ao rodar `test_auto_trader` (11 testes de envio quebrados,
+        # nenhum log meu, porque o erro subia antes de logar).
+        logger.warning(
+            "[SR_ENTRY_RECHECK_ERRO_VELAS] user_id=%s symbol=%s acao=%s",
+            user_id,
+            symbol,
+            acao,
+            exc_info=True,
+        )
+        candidate["sr_entry_recheck_reason"] = "SEM_VERIFICACAO_ERRO"
+        return sem_dado
+    if erro or not candles:
+        logger.warning(
+            "[SR_ENTRY_RECHECK_SEM_VELAS] user_id=%s symbol=%s erro=%s acao=%s",
+            user_id,
+            symbol,
+            erro,
+            acao,
+        )
+        candidate["sr_entry_recheck_reason"] = "SEM_VERIFICACAO_SEM_VELAS"
+        return sem_dado
+    try:
+        candles = candles_with_current_candle(candles, closed_candle_endtime(agora, timeframe))
+        zona = build_zone(candles)
+        respeita, motivo = evaluate_respect(direction, zona, candles[-1])
+    except Exception:
+        logger.warning(
+            "[SR_ENTRY_RECHECK_FALHOU] user_id=%s symbol=%s acao=%s",
+            user_id,
+            symbol,
+            acao,
+            exc_info=True,
+        )
+        candidate["sr_entry_recheck_reason"] = "SEM_VERIFICACAO_ERRO"
+        return sem_dado
+    candidate["sr_entry_recheck_reason"] = motivo
+    if not respeita:
+        logger.warning(
+            "[SR_ENTRY_RECHECK_BLOCK] user_id=%s symbol=%s direction=%s motivo=%s "
+            "motivo_analise=%s suporte=%s resistencia=%s",
+            user_id,
+            symbol,
+            direction,
+            motivo,
+            candidate.get("sr_respect_reason"),
+            zona.get("support"),
+            zona.get("resistance"),
+        )
+        return "SR_ZONE_NA_ENTRADA"
+    # Pavio (11/09): a vela que estava em formação na análise acabou de fechar
+    # e só agora mostra o pavio que deixou. A vela atual tem 0-3s e fica de fora.
+    try:
+        sem_pavio, motivo_pavio, detalhe_pavio = evaluate_wicks(candles, check_forming=False)
+    except Exception:
+        logger.warning("[WICK_ENTRY_RECHECK_FALHOU] user_id=%s symbol=%s", user_id, symbol, exc_info=True)
+        return None
+    candidate["wick_entry_reason"] = motivo_pavio
+    if sem_pavio:
+        return None
+    logger.warning(
+        "[WICK_ENTRY_BLOCK] user_id=%s symbol=%s direction=%s motivo=%s motivo_analise=%s "
+        "pavio_fechadas=%s range_atr=%s",
+        user_id,
+        symbol,
+        direction,
+        motivo_pavio,
+        candidate.get("wick_reason"),
+        detalhe_pavio.get("wick_closed"),
+        detalhe_pavio.get("wick_closed_range_atr"),
+    )
+    return "PAVIO_NA_ENTRADA"
 
 
 async def refresh_candidate_execution_channel(
@@ -6737,7 +9970,7 @@ def order_attempt_candidates(
             and candidate_meets_cycle_threshold(
                 candidate,
                 state,
-                minimum_confidence=int(state.min_confidence),
+                minimum_confidence=live_min_confidence(state.min_confidence, candidate),
                 user_id=user_id,
             )
         ],
@@ -6764,16 +9997,49 @@ def order_attempt_candidates(
 
 
 def build_strategy_narration(candidate: dict[str, Any]) -> tuple[str, str, list[str]]:
+    """Monta o nome da estrategia, o motivo e a lista de estrategias faladas.
+
+    A lista que sai daqui e a que o overlay LE EM VOZ ALTA em "Estrategia
+    utilizada" (`strategyLabel` em `robotNarration.ts` prefere `used_strategies`
+    a qualquer outra coisa) e a que vai ao painel e ao historico.
+
+    Duas coisas erradas saiam por aqui, ate 09/09/2026:
+
+    1. A lista comecava pela CHAVE INTERNA (`used.append(strategy_key)`), entao
+       o robo falava "Estrategia utilizada: RETRACEMENT_SR, EMA9/EMA21, RSI...".
+       No modo LIVE era pior: a chave era `LIVE_DEMO` e o robo anunciava o modo
+       em voz alta, na transmissao.
+    2. Sem estrategia nomeada, o nome virava `"Confluencia " + " + ".join(used)`
+       — "Confluencia EMA9/EMA21 + RSI + Candle Force + Pavios + Price Action +
+       Ultimos Candles + Volatilidade + Payout". Era o "confluencia" que o
+       cliente ouvia: um inventario de indicadores lido como se fosse nome de
+       estrategia.
+
+    Agora a preferencia e a lista do motor (`used_strategies`, que ja vem de
+    `ACTIVE_ENTRY_STRATEGIES` — Price Action, Psicologia de velas, Padroes de
+    vela, mais "Multi-timeframe 1m/5m/15m" quando a leitura foi combinada). Sao
+    as estrategias reais, com nome de gente. Os componentes derivados dos
+    filtros continuam como fallback, para sinal que chega sem a lista.
+
+    Args:
+        candidate: Candidato selecionado no ciclo.
+
+    Returns:
+        ``(strategy_name, strategy_reason, used_strategies)``.
+    """
     approved = set(candidate.get("approved_filters") or [])
     used: list[str] = []
     named_label = str(candidate.get("strategy_name") or "").strip()
     strategy_key = str(candidate.get("strategy_key") or "").strip().upper()
+    do_motor = [
+        str(item).strip()
+        for item in (candidate.get("used_strategies") or [])
+        if str(item).strip()
+    ]
     named_keys = [
         str(item.get("key") if isinstance(item, dict) else item)
         for item in (candidate.get("named_strategies") or candidate.get("named_strategy_keys") or [])
     ]
-    if strategy_key:
-        used.append(strategy_key)
     for key in named_keys:
         if key and key not in used:
             used.append(key)
@@ -6801,6 +10067,9 @@ def build_strategy_narration(candidate: dict[str, Any]) -> tuple[str, str, list[
         used.append("Payout")
     if not used:
         used = ["Score de Estratégias", "Payout"]
+    # A lista do motor ganha dos componentes derivados: é ela que o overlay fala.
+    if do_motor:
+        used = do_motor
 
     # Preferência: rótulo da estratégia nomeada (retração / exaustão / fluxo).
     if named_label and strategy_key in {
@@ -6813,7 +10082,7 @@ def build_strategy_narration(candidate: dict[str, Any]) -> tuple[str, str, list[
     elif named_label and not named_label.lower().startswith("confluência"):
         strategy_name = named_label
     else:
-        strategy_name = "Confluência " + " + ".join(used)
+        strategy_name = ", ".join(used)
     strategy_reason = str(
         candidate.get("analysis_detail")
         or candidate.get("strategy_reason")
@@ -6844,6 +10113,7 @@ async def submit_bullex_order(
     service_paths = {
         "/bullex/buy-demo": "/orders/buy-demo",
         "/bullex/buy-real": "/orders/buy-real",
+        "/bullex/buy-digital": "/orders/buy-digital",
     }
     return await call_bullex_service(
         "POST",
@@ -6851,6 +10121,86 @@ async def submit_bullex_order(
         user_id,
         json_body=body,
     )
+
+
+async def submit_order_with_digital_fallback(
+    user_id: str,
+    endpoint: str,
+    body: dict[str, Any],
+    *,
+    symbol: str,
+    duration_minutes: int,
+) -> tuple[int, dict[str, Any]]:
+    """Envia a ordem e, se o canal turbo/binary recusar o ativo, tenta o digital.
+
+    São dois canais diferentes na mesma corretora. Nos pares de mercado aberto
+    o digital responde payout 82–88 enquanto o turbo/binary fica fechado, e
+    ``client.buy()`` — que é por onde `/orders/buy-real` manda — devolve
+    "asset is not available at the moment". Sem esta retentativa, ativo aberto
+    nunca vira ordem, que é o que o histórico mostra: 0 de 11.628.
+
+    Se o digital também recusar, devolve a resposta ORIGINAL do turbo/binary,
+    para o tratamento de erro a jusante continuar vendo exatamente o que via.
+
+    Args:
+        user_id: Dono da ordem.
+        endpoint: Rota do gateway (``/bullex/buy-real``).
+        body: Corpo já montado para o canal turbo/binary.
+        symbol: Ativo, para decidir se vale tentar o digital.
+        duration_minutes: Duração da opção, em minutos.
+
+    Returns:
+        Par ``(status, payload)``.
+    """
+    status, payload = await submit_bullex_order(user_id, endpoint, body)
+    if payload.get("ok"):
+        return status, payload
+    motivo = str(payload.get("error") or "")
+    if not DIGITAL_FALLBACK_ENABLED or str(symbol).upper().endswith("-OTC"):
+        return status, payload
+    if not is_order_availability_error(motivo):
+        return status, payload
+
+    logger.warning(
+        "[DIGITAL_FALLBACK_TRY] user_id=%s active=%s motivo_turbo=%s",
+        user_id,
+        symbol,
+        motivo,
+    )
+    try:
+        digital_status, digital_payload = await submit_bullex_order(
+            user_id,
+            "/bullex/buy-digital",
+            {
+                "amount": body.get("amount"),
+                "active": symbol,
+                "action": str(body.get("action") or "").lower(),
+                "duration": int(duration_minutes),
+            },
+        )
+    except Exception:  # noqa: BLE001 - o fallback nunca pode derrubar o ciclo
+        logger.warning(
+            "[DIGITAL_FALLBACK_FAILED] user_id=%s active=%s",
+            user_id,
+            symbol,
+            exc_info=True,
+        )
+        return status, payload
+    if digital_payload.get("ok"):
+        logger.warning(
+            "[DIGITAL_FALLBACK_OK] user_id=%s active=%s order_id=%s",
+            user_id,
+            symbol,
+            (digital_payload.get("data") or {}).get("order_id"),
+        )
+        return digital_status, digital_payload
+    logger.info(
+        "[DIGITAL_FALLBACK_REJECTED] user_id=%s active=%s erro=%s",
+        user_id,
+        symbol,
+        digital_payload.get("error"),
+    )
+    return status, payload
 
 
 def opposite_execution_direction(analyzed_direction: str) -> str:
@@ -7395,6 +10745,29 @@ async def analyze_active_signal(
             reason="PAYOUT_COOLDOWN",
         )
 
+    # A REV-Z lê o z das velas M1 mesmo quando a operação é M5/M15: medido em
+    # 05/09, o z calculado nas velas do próprio timeframe cai para 49,59% (M5)
+    # e 41,67% (M15), contra 60,56% em M1. A expiração maior é que ajuda —
+    # M5 mede 67,31% no holdout com o SINAL vindo do M1.
+    velas_m1: list[dict[str, Any]] | None = None
+    if REVZ_ENABLED and operation_timeframe != "M1" and not is_otc_symbol(symbol):
+        # Buscar de verdade, não só ler o cache: conta M5/M15 não tem ninguém
+        # enchendo o cache M1 daquele par, e sem as M1 a vela fica sem entrada.
+        # Só no mercado aberto — o OTC não usa a REV-Z.
+        velas_m1, _, _ = await load_candles_for_active(
+            user_id,
+            symbol,
+            "M1",
+            endtime=closed_candle_endtime(reference_endtime, "M1"),
+        )
+        if not velas_m1:
+            logger.info(
+                "[REVZ_M1_CANDLES_MISSING] user_id=%s symbol=%s timeframe=%s",
+                user_id,
+                symbol,
+                operation_timeframe,
+            )
+
     signal = analyze_signal(
         symbol,
         candles,
@@ -7402,6 +10775,8 @@ async def analyze_active_signal(
         strategy_mode=strategy_mode,
         payout=payout,
         frequency_recovery=frequency_recovery_active(user_id),
+        m1_candles=velas_m1,
+        live_demo=bool(getattr(auto_trader.get(user_id), "live_demo", False)),
     )
     signal["operation_timeframe"] = operation_timeframe
     signal["analysis_timeframe"] = operation_timeframe
@@ -7621,13 +10996,34 @@ async def scan_local_signals(
     asset_sleep_seconds: float = 0.0,
     market_mode: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    """
+    Varre ativos em sequência e devolve sinais ranqueados.
+
+    Para no primeiro CALL/PUT com ``trade_allowed`` para caber no orçamento
+    de 110s do ciclo (BOTH com 20 ativos × timeout por ativo estourava).
+
+    Args:
+        user_id: Usuário autenticado dono da sessão da corretora.
+        limit: Máximo de sinais retornados após o ranking.
+        include_wait: Se True, inclui ativos WAIT na lista (overlay).
+        timeframe: Timeframe da análise (M1/M5/…).
+        endtime: Timestamp da vela; ``None`` usa o relógio do servidor.
+        strategy_mode: Modo da estratégia (conservative/…).
+        max_assets: Teto de ativos na fila deste ciclo.
+        asset_sleep_seconds: Pausa entre ativos (0 no robô).
+        market_mode: OTC, OPEN ou BOTH.
+
+    Returns:
+        Tupla ``(status_http, payload)`` com ``data`` = lista de sinais.
+    """
     logger.info("[SIGNAL SCAN START]")
     signals = []
     resolved_mode = effective_market_mode(market_mode)
     analysis_assets = select_analysis_assets_for_cycle(
         user_id,
         max_assets=max_assets,
-        market_mode=resolved_mode,
+        market_mode=market_mode,
+        timeframe=timeframe,
     )
     logger.info(
         "[ANALYSIS_FILTER] market_mode=%s requested=%s total_allowed=%s filtered_assets=%s",
@@ -7637,6 +11033,7 @@ async def scan_local_signals(
         len(analysis_assets),
     )
     logger.info("[ANALYSIS_FILTER_ASSETS] assets=%s", ",".join(analysis_assets))
+    scan_started_at = monotonic()
 
     async def analyze_one(symbol: str) -> tuple[str, int, dict[str, Any]]:
         try:
@@ -7654,9 +11051,13 @@ async def scan_local_signals(
             )
             return symbol, status_code, payload
         except asyncio.TimeoutError:
-            cached_candles = cached_candles_for_active(user_id, symbol, timeframe, endtime=endtime)
+            cached_candles, cached_payout, cache_is_fresh = resolve_analysis_timeout_cache(
+                user_id,
+                symbol,
+                timeframe,
+                endtime=endtime,
+            )
             if cached_candles:
-                cached_payout = cached_payout_for_active(user_id, symbol)
                 cached_signal = analyze_signal(
                     symbol,
                     cached_candles,
@@ -7665,6 +11066,18 @@ async def scan_local_signals(
                     payout=cached_payout,
                     frequency_recovery=frequency_recovery_active(user_id),
                 )
+                if cache_is_fresh:
+                    # Cache ainda no TTL: é o mesmo dado que outras contas
+                    # usam para comprar. Carimbar STALE aqui virava NO_TRADE
+                    # só porque o wait_for de 5s estourou (incidente
+                    # 2026-08-19 ~02h, conta marketing).
+                    logger.info(
+                        "[ACTIVE_CACHE] user_id=%s symbol=%s path=/candles "
+                        "reason=ANALYSIS_TIMEOUT_FRESH",
+                        user_id,
+                        symbol,
+                    )
+                    return symbol, 200, build_success(cached_signal)
                 cached_signal["from_cache"] = True
                 cached_signal["market_data_stale"] = True
                 cached_signal["stale"] = True
@@ -7713,6 +11126,26 @@ async def scan_local_signals(
         results.append(result)
         advance_analysis_asset_cursor(user_id, market_mode=resolved_mode)
         robot_worker_last_tick_at[user_id] = utc_now()
+        if ANALYSIS_EARLY_STOP_ENABLED and analysis_payload_allows_early_stop(result[2]):
+            remaining = analysis_assets[index + 1 :]
+            logger.info(
+                "[ANALYSIS_EARLY_STOP] user_id=%s symbol=%s remaining=%s",
+                user_id,
+                symbol,
+                ",".join(remaining) if remaining else "-",
+            )
+            break
+        elapsed = monotonic() - scan_started_at
+        if elapsed >= ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS:
+            remaining = analysis_assets[index + 1 :]
+            logger.warning(
+                "[ANALYSIS_SCAN_BUDGET] user_id=%s elapsed=%.2f scanned=%s remaining=%s",
+                user_id,
+                elapsed,
+                index + 1,
+                ",".join(remaining) if remaining else "-",
+            )
+            break
         if asset_sleep_seconds > 0 and index + 1 < len(analysis_assets):
             await asyncio.sleep(asset_sleep_seconds)
     timed_out_symbols = [
@@ -7823,26 +11256,85 @@ def simple_candle_direction(candles: list[dict[str, Any]]) -> str:
     return "CALL" if prices[-1] >= prices[0] else "PUT"
 
 
-def candidate_rank(candidate: dict[str, Any] | None) -> tuple[int, float, int]:
-    """Ordena candidatos por qualidade estrutural, não por confiança bruta.
-
-    Em opções binárias OTC a confiança alta do score técnico não implica edge
-    (amostra real: conf ≥95 com WR 37,8%). O ranking prioriza ``strategy_score``
-    (já penalizado pelos filtros) e payout; a confiança fica por último só como
-    desempate fraco.
+def candidate_price_action_setup(candidate: dict[str, Any] | None) -> str:
+    """Extrai o setup de price action do candidato (topo ou metrics).
 
     Args:
         candidate: Candidato de entrada ou ``None``.
 
     Returns:
-        Tupla ordenável ``(strategy_score, payout, confidence)``.
+        Setup em maiúsculas (ex.: ``CONTINUATION``, ``WEAK``) ou string vazia.
     """
     if not isinstance(candidate, dict):
-        return (-1, -1.0, -1)
+        return ""
+    setup = candidate.get("price_action_setup")
+    if setup is None or str(setup).strip() == "":
+        metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+        setup = metrics.get("price_action_setup")
+    return str(setup or "").strip().upper()
+
+
+def candidate_quality_tier(candidate: dict[str, Any] | None) -> int:
+    """Tier estrutural para substitution no mesmo ciclo (maior = melhor).
+
+    Preferir CONTINUATION/REVERSAL/S-R a WEAK sem cancelar o ciclo: o ranking
+    escolhe outro ativo/direção e a frequência de operações se mantém.
+
+    Args:
+        candidate: Candidato de entrada ou ``None``.
+
+    Returns:
+        Inteiro 0–3 usado como primeira chave de ``candidate_rank``.
+    """
+    if not isinstance(candidate, dict):
+        return -1
+    setup = candidate_price_action_setup(candidate)
+    direction = str(candidate.get("direction") or candidate.get("signal") or "").upper()
+    symbol = str(candidate.get("symbol") or candidate.get("active") or "")
+
+    if setup in {"", "WEAK", "NONE", "UNKNOWN", "?"}:
+        return 0
+    if (
+        setup == "CONTINUATION"
+        and direction == "PUT"
+        and is_weak_continuation_put_asset(symbol)
+    ):
+        return 1
+    if setup in {"CONTINUATION", "REVERSAL", "SUPPORT_RESISTANCE"}:
+        if is_rank_demotion_asset(symbol):
+            return 2
+        return 3
+    return 2
+
+
+def candidate_rank(candidate: dict[str, Any] | None) -> tuple[int, int, float, int]:
+    """Ordena candidatos por qualidade estrutural, não por confiança bruta.
+
+    Em opções binárias OTC a confiança alta do score técnico não implica edge
+    (amostra real: conf ≥95 com WR 37,8%). Ordem:
+
+    1. ``quality_tier`` — WEAK perde para setups estruturados (substitution)
+    2. ``strategy_score`` — já penalizado pelos filtros
+    3. ``payout``
+    4. confiança limitada a 92 — evita desempate por score OTC inflado
+
+    Args:
+        candidate: Candidato de entrada ou ``None``.
+
+    Returns:
+        Tupla ordenável ``(tier, strategy_score, payout, confidence_cap)``.
+    """
+    if not isinstance(candidate, dict):
+        return (-1, -1, -1.0, -1)
+    try:
+        confidence = int(candidate.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
     return (
+        candidate_quality_tier(candidate),
         int(candidate.get("strategy_score") or candidate.get("score") or 0),
         float(candidate.get("payout") or 0),
-        int(candidate.get("confidence") or 0),
+        min(confidence, 92),
     )
 
 def candidate_meets_cycle_threshold(
@@ -7874,6 +11366,134 @@ def candidate_meets_cycle_threshold(
     # (LEVEL_CONFLICT, DOJI_FILTER etc.) eram executados em produção.
     if candidate.get("trade_allowed") is not True:
         return False
+    # Entrada de demonstracao tem portao proprio. Os testes abaixo sao de
+    # QUALIDADE — recalculam, por conta propria, o mesmo veto que o modo LIVE
+    # acabou de dispensar no motor. Medido em 07/09/2026: 138 de 138 liberacoes
+    # LIVE morriam aqui e nenhuma virava ordem, que e o relato de "demora 30
+    # minutos para pegar operacao". Os portoes de execucao (ativo fechado,
+    # stale, trade_allowed) ja rodaram acima e continuam valendo.
+    if is_live_demo(candidate):
+        liberado, motivo = live_demo_passa_portao(
+            candidate,
+            min_payout=float(getattr(state, "min_payout", 0) or 0),
+            minimo_confianca=int(minimum_confidence),
+        )
+        if not liberado:
+            logger.info(
+                "[LIVE_DEMO_GATE_BLOCK] user_id=%s symbol=%s motivo=%s",
+                user_id,
+                candidate.get("symbol") or candidate.get("active"),
+                motivo,
+            )
+        return liberado
+    # Mercado aberto (REV-Z): mesmo desenho do desvio acima. Os testes que vêm
+    # depois recalculam, por conta própria, os cortes do motor clássico a
+    # partir do corpo e das cores das últimas velas (CALL_GRG, PUT_BODY...) e a
+    # memória de padrões por hora — todos calibrados para quem segue a vela. É
+    # o segundo portão que já calou a REV-Z, a Vertex e o modo LIVE; o piso tem
+    # de descer AQUI também, não só em `apply_strategy_guard`.
+    if is_revz_candidate(candidate):
+        liberado, motivo = revz_passa_portao(
+            candidate,
+            min_payout=float(getattr(state, "min_payout", 0) or 0),
+            minimo_confianca=int(minimum_confidence),
+        )
+        if liberado and REPEAT_ENTRY_HARD_BLOCK and user_id:
+            simbolo = normalize_binary_active(str(candidate.get("symbol") or candidate.get("active") or ""))
+            if simbolo and repeat_entry_cooldown_remaining(user_id, simbolo) is not None:
+                liberado, motivo = False, "REPEAT_ENTRY"
+        if not liberado:
+            logger.info(
+                "[REVZ_GATE_BLOCK] user_id=%s symbol=%s motivo=%s",
+                user_id,
+                candidate.get("symbol") or candidate.get("active"),
+                motivo,
+            )
+        return liberado
+    simbolo_candidato = str(candidate.get("symbol") or candidate.get("active") or "")
+    if REVZ_ENABLED and simbolo_candidato and not is_otc_symbol(simbolo_candidato):
+        # Com a REV-Z ligada, par de mercado aberto só opera com veredito
+        # dela. Visto no deploy de 10/09 12:24: um candidato do motor clássico
+        # analisado ANTES do restart voltou restaurado como sinal pendente e
+        # virou ordem (EURJPY CALL, confiança 100) sem passar pela REV-Z.
+        logger.info(
+            "[REVZ_GATE_BLOCK] user_id=%s symbol=%s motivo=SEM_VEREDITO_REVZ",
+            user_id,
+            simbolo_candidato,
+        )
+        return False
+    if WEAK_PUT_HARD_BLOCK and is_weak_put_setup(
+        candidate_price_action_setup(candidate),
+        str(candidate.get("direction") or candidate.get("signal") or ""),
+    ):
+        return False
+    direction = str(candidate.get("direction") or candidate.get("signal") or "").upper()
+    body_ratio = candidate.get("body_ratio")
+    if body_ratio is None and isinstance(candidate.get("metrics"), dict):
+        body_ratio = candidate["metrics"].get("current_candle_strength") or candidate[
+            "metrics"
+        ].get("body_ratio")
+    if body_ratio is not None:
+        if CANDLE_WEAK_HARD_BLOCK and is_weak_candle_body(body_ratio):
+            return False
+        if DOJI_HARD_BLOCK and is_doji_body(body_ratio):
+            return False
+        if PUT_BODY_HARD_BLOCK and is_put_thin_body(body_ratio, direction):
+            return False
+    if PUT_CHASE_HARD_BLOCK and is_chasing_continuation_put(
+        candidate_price_action_setup(candidate),
+        direction,
+        extract_last_3_colors(candidate),
+    ):
+        return False
+    if CALL_CHASE_HARD_BLOCK and is_chasing_continuation_call(
+        candidate_price_action_setup(candidate),
+        direction,
+        extract_last_3_colors(candidate),
+    ):
+        return False
+    if CALL_GRG_HARD_BLOCK and is_call_green_red_green(
+        direction,
+        extract_last_3_colors(candidate),
+    ):
+        return False
+    if SEQ_GGG_HARD_BLOCK and is_seq_green_green_green(
+        extract_last_3_colors(candidate),
+    ):
+        return False
+    if SEQ_GRR_HARD_BLOCK and is_seq_green_red_red(
+        extract_last_3_colors(candidate),
+    ):
+        return False
+    if WEAK_SETUP_HARD_BLOCK and is_weak_setup(
+        candidate_price_action_setup(candidate),
+    ):
+        return False
+    if PUT_WICK_HARD_BLOCK:
+        lower_wick = candidate.get("lower_wick_ratio")
+        if lower_wick is None and isinstance(candidate.get("metrics"), dict):
+            lower_wick = candidate["metrics"].get("lower_wick_ratio")
+        if is_put_against_wick(lower_wick, direction):
+            return False
+    if TOXIC_HOUR_HARD_BLOCK and is_toxic_hour_brt():
+        return False
+    cand_symbol = normalize_binary_active(
+        str(candidate.get("symbol") or candidate.get("active") or "")
+    )
+    if ASSET_BAN_HARD_BLOCK and is_banned_asset(cand_symbol):
+        return False
+    if TOXIC_WEAK_PAIR_HARD_BLOCK and is_toxic_weak_pair(
+        candidate_price_action_setup(candidate),
+        direction,
+        cand_symbol,
+    ):
+        return False
+    if REPEAT_ENTRY_HARD_BLOCK and user_id:
+        symbol = normalize_binary_active(
+            str(candidate.get("symbol") or candidate.get("active") or "")
+        )
+        if symbol and repeat_entry_cooldown_remaining(user_id, symbol) is not None:
+            return False
     blocked_filters = {str(item) for item in (candidate.get("blocked_filters") or [])}
     recovery = bool(candidate.get("frequency_recovery")) or frequency_recovery_active(user_id)
     if blocked_filters & effective_critical_trade_blocks(frequency_recovery=recovery):
@@ -7892,7 +11512,10 @@ def candidate_meets_cycle_threshold(
         )
     except (TypeError, ValueError):
         return False
-    score_floor = int(minimum_confidence)
+    # Segundo portão da mesma escala. O rescale precisa existir aqui E em
+    # `apply_strategy_guard`: faltar num dos dois deixa a estratégia muda, sem
+    # erro nenhum no log — já custou a REV-Z, a SR-R e o modo LIVE.
+    score_floor = vertex_min_confidence(int(minimum_confidence), candidate)
     if recovery:
         score_floor = min(score_floor, FREQUENCY_RECOVERY_MIN_SCORE)
     if not (payout >= float(state.min_payout) and effective_score >= score_floor):
@@ -7911,6 +11534,31 @@ def candidate_meets_cycle_threshold(
             return False
     return True
 
+def candidate_direction_label(candidate: dict[str, Any] | None) -> str:
+    """Direção CALL/PUT do candidato, ou vazio."""
+    if not isinstance(candidate, dict):
+        return ""
+    return str(candidate.get("direction") or candidate.get("signal") or "").strip().upper()
+
+
+def pick_best_candidate(candidates: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Escolhe o melhor candidato pela substitution (tier, score, payout).
+
+    WEAK perde para CONTINUATION/REVERSAL no mesmo ciclo. Sem viés CALL/PUT
+    e sem os cortes de 15/08 (desligados).
+
+    Args:
+        candidates: Lista de candidatos já filtrados.
+
+    Returns:
+        Candidato escolhido ou ``None``.
+    """
+    pool = [item for item in (candidates or []) if isinstance(item, dict)]
+    if not pool:
+        return None
+    return max(pool, key=candidate_rank)
+
+
 def choose_better_candidate(
     current: dict[str, Any] | None,
     incoming: dict[str, Any] | None,
@@ -7919,7 +11567,8 @@ def choose_better_candidate(
         return current
     if current is None:
         return dict(incoming)
-    return dict(incoming) if candidate_rank(incoming) > candidate_rank(current) else current
+    picked = pick_best_candidate([current, incoming])
+    return dict(picked) if picked is not None else current
 
 
 def resolve_cycle_entry_candidate(
@@ -7931,15 +11580,23 @@ def resolve_cycle_entry_candidate(
     if candidate_meets_cycle_threshold(
         strict,
         state,
-        minimum_confidence=int(state.min_confidence),
+        minimum_confidence=live_min_confidence(state.min_confidence, strict),
         user_id=user_id,
     ):
         return dict(strict)
     fallback = state.cycle_best_candidate
+    # O piso deste ramo era 70 FIXO, e ele é o que executa a ordem quando o
+    # candidato estrito não passa. Com o painel em 80 isso abria uma porta 10
+    # pontos mais baixa sem ninguém pedir: em 10/09 uma entrada de score 60
+    # virou ordem de R$ 200 numa conta configurada para 80. O `cycle_best_candidate`
+    # que chega aqui vem de `visible_candidates`, que tem um `or candidates` de
+    # exibição no fim — ou seja, pode não ter passado portão NENHUM.
+    # Agora o piso é o do usuário; `live_min_confidence` continua rebaixando
+    # para LIVE_CONFIDENCE (60) só nas entradas de demonstração.
     if candidate_meets_cycle_threshold(
         fallback,
         state,
-        minimum_confidence=70,
+        minimum_confidence=live_min_confidence(state.min_confidence, fallback),
         user_id=user_id,
     ):
         candidate = dict(fallback)
@@ -7958,6 +11615,7 @@ async def select_fallback_candidate(
         user_id,
         max_assets=max_assets,
         market_mode=getattr(state, "market_mode", "OTC"),
+        timeframe=getattr(state, "timeframe", "M1"),
     )
     for index, symbol in enumerate(assets):
         if index > 0:
@@ -8124,7 +11782,10 @@ async def update_cycle_analysis(
         timeframe=state.timeframe,
         endtime=int(entry_window["server_timestamp"]),
         strategy_mode=state.strategy_mode,
-        max_assets=len(resolve_analysis_assets(state.market_mode)),
+        max_assets=min(
+            ROBOT_ANALYSIS_MAX_ASSETS,
+            len(resolve_analysis_assets(state.market_mode)),
+        ),
         asset_sleep_seconds=ROBOT_ASSET_QUEUE_SLEEP_SECONDS,
         market_mode=state.market_mode,
     )
@@ -8311,13 +11972,18 @@ async def update_cycle_analysis(
         endtime=int(entry_window["server_timestamp"]),
         strategy_mode=state.strategy_mode,
     )
+    # A confirmacao multi-timeframe zera `trade_allowed` por MTF_CONFLUENCE /
+    # MTF_DATA_UNAVAILABLE / MTF_HIGHER_TF_CONFLICT — mais um estagio que refaz
+    # o veto sem saber do modo LIVE. Confluencia e criterio de QUALIDADE: e
+    # exatamente o que o modo dispensa. Bloqueio de execucao segue derrubando.
+    candidates = [live_demo_restaura(candidate) for candidate in candidates]
     strict_candidates = [
         candidate
         for candidate in candidates
         if candidate_meets_cycle_threshold(
             candidate,
             state,
-            minimum_confidence=int(state.min_confidence),
+            minimum_confidence=live_min_confidence(state.min_confidence, candidate),
             user_id=user_id,
         )
     ]
@@ -8327,12 +11993,12 @@ async def update_cycle_analysis(
         if candidate_meets_cycle_threshold(
             candidate,
             state,
-            minimum_confidence=70,
+            minimum_confidence=live_min_confidence(70, candidate),
             user_id=user_id,
         )
     ] or candidates
-    current_best_candidate = max(visible_candidates, key=candidate_rank) if visible_candidates else None
-    current_best_trade_candidate = max(strict_candidates, key=candidate_rank) if strict_candidates else None
+    current_best_candidate = pick_best_candidate(visible_candidates)
+    current_best_trade_candidate = pick_best_candidate(strict_candidates)
     previous_symbol = (state.cycle_best_candidate or {}).get("symbol") if state.cycle_best_candidate else None
     state = auto_trader.set_analysis_candidates(
         user_id,
@@ -8561,6 +12227,9 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
         async with auto_trader.cycle_lock(user_id):
             finalized, state = auto_trader.finish_trade(user_id, order_id, result, profit)
             if finalized:
+                # O placar subiu por conta própria: a baixa da exclusão
+                # anterior já valeu e não pode travar este WIN/LOSS novo.
+                clear_session_score_authority(user_id)
                 # Com a aba fechada o flash de 5s some; guarda para o placar ao voltar.
                 # A narração do placar não depende disso: usa `state.result_voice`.
                 if not is_panel_online(user_id):
@@ -9350,11 +13019,7 @@ async def execute_robot_cycle(
                     and candidate.get("payout") is not None
                     and candidate.get("direction") in {"CALL", "PUT"}
                 ]
-                selected = (
-                    max(approved_candidates, key=candidate_rank)
-                    if approved_candidates
-                    else None
-                )
+                selected = pick_best_candidate(approved_candidates)
                 auto_trader.set_analysis_candidates(user_id, candidates, selected)
                 logger.info(
                     "[ANALYSIS_CANDIDATES] user_id=%s cycle_id=%s count=%s candidates=%s",
@@ -9575,6 +13240,16 @@ async def execute_robot_cycle(
                     entry_window["entry_window_start_second"],
                     entry_window["entry_window_end_second"],
                 )
+                # Ultimo instante util antes da vela abrir: aquece o canal aqui
+                # para a compra nao gastar a janela com a mesma consulta. Custo
+                # zero para a janela — o timeout nunca passa do que falta.
+                await prewarm_execution_channel_before_entry(
+                    user_id,
+                    selected,
+                    state.timeframe,
+                    seconds_until_entry=float(entry_window["seconds_until_entry_window"] or 0),
+                    cycle_id=state.cycle_id,
+                )
                 return 200, build_robot_payload(state)
 
             logger.info(
@@ -9634,8 +13309,9 @@ async def execute_robot_cycle(
             last_friendly_error = NO_AVAILABLE_ASSET_ERROR
             attempted_unavailable = False
             # Orçamento compartilhado da revalidação de canal: a janela de
-            # compra é 0-5s, então o conjunto de candidatos não pode gastar
-            # mais que isso consultando a corretora.
+            # compra é 0-3s (envio aceito até ENTRY_SEND_MAX_SECOND), então o
+            # conjunto de candidatos não pode gastar mais que isso consultando
+            # a corretora.
             revalidation_deadline = monotonic() + CHANNEL_REVALIDATION_BUDGET_SECONDS
             for candidate in order_attempt_candidates(state, selected, user_id=user_id):
                 is_gale_order = bool(state.gale_pending or candidate.get("is_gale"))
@@ -9674,11 +13350,34 @@ async def execute_robot_cycle(
                         ),
                     )
                 validation_reason = None
-                if not is_gale_order:
+                if not is_gale_order and is_revz_candidate(candidate):
+                    # REV-Z: a condição simulada (|z| no FECHAMENTO da vela
+                    # anterior) só existe agora. Vem antes do nível para um
+                    # veto cair no mesmo caminho de fallback.
+                    validation_reason = await confirm_revz_before_entry(
+                        user_id,
+                        candidate,
+                        server_timestamp=entry_window.get("server_timestamp"),
+                    )
+                if validation_reason is None and not is_gale_order:
+                    # O nível é reconferido AQUI, com a vela recém-fechada: o
+                    # veredito que o candidato traz é de uma vela atrás e pode
+                    # ter virado. Entra antes da validação geral para que um
+                    # veto de nível caia no mesmo caminho de fallback para o
+                    # próximo candidato.
+                    validation_reason = await revalidate_level_before_entry(
+                        user_id,
+                        candidate,
+                        state.timeframe,
+                        server_timestamp=entry_window.get("server_timestamp"),
+                    )
+                if validation_reason is None and not is_gale_order:
                     validation_reason = resolve_entry_validation_reason(
                         candidate,
                         state,
-                        minimum_confidence=int(state.min_confidence),
+                        minimum_confidence=live_min_confidence(
+                            state.min_confidence, candidate
+                        ),
                         user_id=user_id,
                     )
                 stop_reason = daily_stop_reason(user_id, state) or robot_stop_reason(state)
@@ -9736,6 +13435,29 @@ async def execute_robot_cycle(
                 )
                 payout = selected.get("payout")
                 order_amount = state.gale_amount if is_gale_order else state.entry_value
+                try:
+                    amount_value = float(order_amount)
+                except (TypeError, ValueError):
+                    amount_value = 0.0
+                account_currency = resolve_user_account_currency(user_id)
+                min_entry = min_real_entry_for_currency(account_currency)
+                if amount_value < min_entry:
+                    logger.error(
+                        "[ORDER_AMOUNT_BELOW_CURRENCY_MIN] user_id=%s amount=%s currency=%s min=%s gale=%s",
+                        user_id,
+                        order_amount,
+                        account_currency,
+                        min_entry,
+                        is_gale_order,
+                    )
+                    state.last_order_error = "ENTRY_VALUE_TOO_LOW"
+                    state = reset_cycle_after_finish(user_id)
+                    logger.info(
+                        "[NEXT_CYCLE_SCHEDULED] user_id=%s next_cycle_at=%s",
+                        user_id,
+                        state.next_cycle_at,
+                    )
+                    return 200, build_robot_payload(state, user_id=user_id)
                 logger.info(
                     "[ENTRY_ALLOWED] user_id=%s cycle_id=%s symbol=%s direction=%s amount=%s payout=%s",
                     user_id,
@@ -9788,6 +13510,29 @@ async def execute_robot_cycle(
                     payout,
                     selected.get("confidence"),
                 )
+                send_candle_second = entry_send_candle_second(entry_window)
+                if not is_gale_order and send_candle_second > ENTRY_SEND_MAX_SECOND:
+                    # Chegamos aqui autorizados, mas a revalidação de canal e o
+                    # hop HTTP consumiram a janela. Enviar agora colocaria a
+                    # ordem no meio da vela — e acima de ~53s a corretora rola a
+                    # expiração para a vela seguinte, que ninguém analisou.
+                    # Melhor perder a entrada e reanalisar na próxima vela.
+                    logger.warning(
+                        "[ENTRY_SEND_TOO_LATE] user_id=%s cycle_id=%s symbol=%s "
+                        "candle_second=%.2f limit=%s timeframe=%s",
+                        user_id,
+                        state.cycle_id,
+                        symbol,
+                        send_candle_second,
+                        ENTRY_SEND_MAX_SECOND,
+                        state.timeframe,
+                    )
+                    state = auto_trader.expire_pending_signal(
+                        user_id,
+                        reason="ENTRY_SEND_TOO_LATE",
+                        wait_seconds=max(1, int(entry_window["seconds_until_entry_window"])),
+                    )
+                    return 200, build_robot_payload(state, user_id=user_id)
                 state = auto_trader.start_sending_order(user_id)
                 logger.info("[STATE] BUYING user_id=%s cycle_id=%s symbol=%s direction=%s", user_id, state.cycle_id, symbol, direction)
                 logger.info(
@@ -9817,10 +13562,12 @@ async def execute_robot_cycle(
                         direction,
                         order_amount,
                     )
-                    order_status, order_payload = await submit_bullex_order(
+                    order_status, order_payload = await submit_order_with_digital_fallback(
                         user_id,
                         order_path,
                         order_body,
+                        symbol=symbol,
+                        duration_minutes=entry_window["expiration_minutes"],
                     )
                 except Exception as exc:
                     reason = str(exc).strip() or type(exc).__name__
@@ -9829,13 +13576,25 @@ async def execute_robot_cycle(
                     last_order_reason = reason
                     last_friendly_error = friendly_error
                     logger.exception("[ORDER_SEND_FAILED] user_id=%s active=%s error=%s", user_id, symbol, reason)
+                    if is_insufficient_funds_error(reason):
+                        state = await stop_real_robot_for_insufficient_balance(
+                            user_id,
+                            balance=None,
+                            entry_value=float(order_amount) if order_amount is not None else None,
+                            message=friendly_error,
+                        )
+                        logger.error(
+                            "[ORDER_REJECTED_INSUFFICIENT_FUNDS] user_id=%s reason=%s",
+                            user_id,
+                            reason,
+                        )
+                        return 402, build_robot_payload(state, user_id=user_id)
                     if is_order_availability_error(reason):
                         attempted_unavailable = True
                         mark_execution_channel_unavailable(
                             user_id,
                             symbol,
                             state.timeframe,
-                            seconds=UNAVAILABLE_ASSET_COOLDOWN_SECONDS,
                         )
                         logger.info(
                             "[ORDER_FALLBACK_NEXT_CANDIDATE] user_id=%s failed_active=%s attempts=%s",
@@ -9873,13 +13632,25 @@ async def execute_robot_cycle(
                     last_order_reason = reason
                     last_friendly_error = friendly_error
                     logger.error("[ORDER_SEND_FAILED] user_id=%s active=%s error=%s", user_id, symbol, reason)
+                    if is_insufficient_funds_error(reason):
+                        state = await stop_real_robot_for_insufficient_balance(
+                            user_id,
+                            balance=None,
+                            entry_value=float(order_amount) if order_amount is not None else None,
+                            message=friendly_error,
+                        )
+                        logger.error(
+                            "[ORDER_REJECTED_INSUFFICIENT_FUNDS] user_id=%s reason=%s",
+                            user_id,
+                            reason,
+                        )
+                        return 402, build_robot_payload(state, user_id=user_id)
                     if is_order_availability_error(reason):
                         attempted_unavailable = True
                         mark_execution_channel_unavailable(
                             user_id,
                             symbol,
                             state.timeframe,
-                            seconds=UNAVAILABLE_ASSET_COOLDOWN_SECONDS,
                         )
                         logger.info(
                             "[ORDER_FALLBACK_NEXT_CANDIDATE] user_id=%s failed_active=%s attempts=%s",
@@ -10003,6 +13774,15 @@ async def execute_robot_cycle(
                     "expiration_source": expiration_source,
                     "server_time_at_send": expiration_window.get("server_time"),
                     "server_timestamp_at_send": expiration_window.get("server_timestamp"),
+                    # Sem isto não dá para responder "a ordem pegou o início da
+                    # vela?" depois do fato — a auditoria de 2026-08-30 teve que
+                    # inferir isso de `sent_at`, que só é gravado após o ACK.
+                    "entry_candle_second": round(send_candle_second, 3),
+                    "entry_candle_second_authorized": round(
+                        float(entry_window.get("current_candle_seconds") or 0.0), 3
+                    ),
+                    "entry_window_end_second": int(entry_window.get("entry_window_end_second") or 0),
+                    "entry_server_time_source": str(entry_window.get("server_time_source") or ""),
                     "cycle_id": state.cycle_id,
                     "order_attempts": state.order_attempts,
                     "fallback_candidate_used": state.fallback_candidate_used,
@@ -10010,6 +13790,29 @@ async def execute_robot_cycle(
                     "strategy_mode": state.strategy_mode,
                     "strategy_name": selected.get("strategy_name"),
                     "strategy_key": selected.get("strategy_key"),
+                    # `TRADE_ANALYSIS_FIELDS` lista `live_demo` e o comentario
+                    # em `robot_persistence.py` diz que e ELE que a auditoria
+                    # consulta para excluir o modo LIVE das medicoes — mas o
+                    # registro da operacao nunca carregava o campo, entao ele
+                    # caia na montagem (o dict de persistencia descarta `None`).
+                    # Medido em 08/09: 184 operacoes do modo LIVE gravadas, 184
+                    # com `strategy_key=LIVE_DEMO` e ZERO com o booleano. Desde
+                    # 09/09 a chave nao diz mais o modo (era falada em voz alta
+                    # na transmissao): este booleano e a unica marca. Mesma
+                    # armadilha de lista fixa de campos de sempre.
+                    # `None` para operacao normal preserva as linhas de hoje:
+                    # so a entrada de demonstracao ganha a marca.
+                    "live_demo": True if selected.get("live_demo") is True else None,
+                    # z da indicação e do fechamento: é com isto que a REV-Z vai
+                    # ser medida para a frente. `None` fora do mercado aberto.
+                    "revz": dict(selected["revz"]) if isinstance(selected.get("revz"), dict) else None,
+                    # Veredito de S/R na análise e na reconferência do disparo.
+                    # Sem isto a única forma de provar a um cliente que a
+                    # entrada respeitou o nível era remontar o gráfico à mão.
+                    "sr_respect_reason": selected.get("sr_respect_reason"),
+                    "sr_entry_recheck_reason": selected.get("sr_entry_recheck_reason"),
+                    "wick_reason": selected.get("wick_reason"),
+                    "wick_entry_reason": selected.get("wick_entry_reason"),
                     "strategy_summary": selected.get("strategy_summary"),
                     "analysis_detail": selected.get("analysis_detail")
                     or selected.get("entry_reason"),
@@ -10070,6 +13873,15 @@ async def execute_robot_cycle(
                     order_id,
                     state.status,
                 )
+                if not is_gale_order:
+                    mark_repeat_entry_cooldown(
+                        user_id,
+                        str(selected.get("symbol") or selected.get("active") or ""),
+                        str(getattr(state, "timeframe", "M1") or "M1"),
+                    )
+                # Ordem aceita: o par voltou a funcionar, a escada de cooldown
+                # dele recomeça do primeiro degrau.
+                clear_unavailable_asset_strikes(symbol)
                 logger.info(
                     "[ORDER_SENT] user_id=%s cycle_id=%s order_id=%s symbol=%s direction=%s fallback=%s",
                     user_id,
@@ -10194,6 +14006,17 @@ async def execute_robot_worker_cycle(user_id: str) -> None:
             timeout=ROBOT_CYCLE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
+        state = auto_trader.get(user_id)
+        if should_keep_pending_on_cycle_timeout(state):
+            robot_worker_last_tick_at[user_id] = utc_now()
+            persist_robot(user_id)
+            logger.warning(
+                "[ROBOT_CYCLE_TIMEOUT_KEEP_SIGNAL] user_id=%s timeout_seconds=%.2f symbol=%s action=keep_pending",
+                user_id,
+                ROBOT_CYCLE_TIMEOUT_SECONDS,
+                (state.pending_signal or {}).get("symbol"),
+            )
+            return
         state = auto_trader.complete_cycle_without_trade(user_id, "ANALYSIS_TIMEOUT")
         state.blocked_filters = ["ANALYSIS_TIMEOUT"]
         state.block_reasons = ["Tempo máximo da análise excedido; novo ciclo agendado."]
@@ -10354,6 +14177,9 @@ async def robot_worker(user_id: str) -> None:
 
 def ensure_robot_worker(user_id: str) -> None:
     state = auto_trader.get(user_id)
+    # Evita spam de `ensure` quando o runtime já parou (Stop Win/Loss) e o
+    # gateway ainda tem enabled=true fantasma — ver reconcile_*.
+    state = reconcile_gateway_enabled_from_runtime_snapshot(user_id, state)
     if not state.enabled:
         logger.info("[SESSION_RESTORE_SKIPPED] user_id=%s reason=robot_disabled", user_id)
         return
@@ -10502,6 +14328,42 @@ def schedule_robot_tick(user_id: str) -> None:
             logger.exception("[ROBOT_INITIAL_TICK_RECOVERED] user_id=%s", user_id)
 
     asyncio.create_task(run_tick())
+
+
+async def start_robot_worker(user_id: str) -> None:
+    """Sobe o worker após decisão explícita do cliente (`/robot/start`).
+
+    Em modo external o gateway não roda workers, só publica no barramento. O
+    comando precisa ser `start` — nunca `ensure`: só o `start` faz o runtime
+    reler o estado da persistência (`force=True` em `_handle_command`). Com
+    `ensure` o runtime mantinha o `enabled=False` que tinha em memória e
+    respondia `SESSION_RESTORE_SKIPPED reason=robot_disabled`, deixando o
+    painel eternamente em "analisando" sem nunca operar.
+
+    A escrita é aguardada antes de publicar porque `persist_robot` roda em
+    background: publicando na frente dela, o runtime relia o estado anterior
+    (ainda `enabled=False`) e desistia do mesmo jeito.
+    """
+    future = persist_robot(user_id)
+    if future is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                ROBOT_START_PERSIST_WAIT_SECONDS,
+            )
+        except Exception:
+            # Segue e publica assim mesmo: no pior caso o runtime relê o estado
+            # antigo, que é exatamente o comportamento de antes deste fix.
+            logger.warning(
+                "[ROBOT_START_PERSIST_WAIT_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+    if robot_runtime_mode() == "external":
+        robot_bus.publish_command(user_id, "start")
+        logger.info("[ROBOT_WORKER_START_DELEGATED] user_id=%s mode=external", user_id)
+        return
+    ensure_robot_worker(user_id)
 
 
 async def stop_robot_worker(user_id: str) -> None:
@@ -10920,6 +14782,24 @@ async def _robot_state_impl(auth: dict[str, str]) -> JSONResponse:
         connected,
         source,
     )
+    # Em modo external o worker (e o placar vivo) mora no robot-runtime.
+    # Preferir snapshot Redis; se expirou, reidratar placar da persistência.
+    # EXCEÇÃO: desconexão manual — o snapshot Redis pode estar stale
+    # (connected=true) por até 600s; nunca servir isso após Desconectar.
+    if robot_runtime_mode() == "external" and not is_manual_disconnect(user_id):
+        remote = robot_bus.get_snapshot(user_id)
+        if remote is not None and isinstance(remote, dict) and isinstance(remote.get("data"), dict):
+            remote = enrich_robot_snapshot_session_score(user_id, remote)
+            return json_response(
+                200,
+                remote,
+                headers=polling_headers(ROBOT_STATE_MIN_POLL_SECONDS),
+            )
+        rehydrate_score_from_persistence_if_blank(user_id)
+        state = auto_trader.get(user_id)
+    else:
+        rehydrate_score_from_persistence_if_blank(user_id)
+        state = auto_trader.get(user_id)
     return json_response(
         200,
         build_robot_payload(
@@ -10972,18 +14852,30 @@ def build_robot_state_snapshot_payload(user_id: str) -> dict[str, Any]:
     Returns:
         Envelope ``build_robot_payload`` (ok + data).
     """
-    if robot_runtime_mode() == "external":
+    # Mesma regra do GET /robot/state: após Desconectar, não empurrar pelo WS
+    # um snapshot Redis antigo com connected=true.
+    if robot_runtime_mode() == "external" and not is_manual_disconnect(user_id):
         remote = robot_bus.get_snapshot(user_id)
         if remote is not None:
+            if isinstance(remote, dict) and isinstance(remote.get("data"), dict):
+                return enrich_robot_snapshot_session_score(user_id, remote)
             return remote
+    # Snapshot Redis ausente/expirado: não devolver placar 0 se a persistência
+    # ainda tem WIN/LOSS (comum após pausa do worker sem publish).
+    rehydrate_score_from_persistence_if_blank(user_id)
     state = auto_trader.get(user_id)
     account_snapshot = get_cached_account_snapshot(user_id)
-    connected = bool(state.connected or account_snapshot.get("connected") is True)
-    active_mode = state.active_mode or account_snapshot.get("mode")
-    active_mode = str(active_mode).strip().upper() if active_mode else None
-    source = state.connection_status_source or (
-        "cached" if account_snapshot.get("connected") is not None else "memory"
-    )
+    if is_manual_disconnect(user_id):
+        connected = False
+        active_mode = None
+        source = "disconnected"
+    else:
+        connected = bool(state.connected or account_snapshot.get("connected") is True)
+        active_mode = state.active_mode or account_snapshot.get("mode")
+        active_mode = str(active_mode).strip().upper() if active_mode else None
+        source = state.connection_status_source or (
+            "cached" if account_snapshot.get("connected") is not None else "memory"
+        )
     block_reason = real_block_reason(
         state, connected=connected, active_mode=active_mode, user_id=user_id
     )
@@ -10999,9 +14891,9 @@ def build_robot_state_snapshot_payload(user_id: str) -> dict[str, Any]:
         user_id=user_id,
         connected=connected,
         active_mode=active_mode,
-        balance=account_snapshot.get("balance"),
-        currency=account_snapshot.get("currency"),
-        email=account_snapshot.get("email"),
+        balance=None if not connected else account_snapshot.get("balance"),
+        currency=None if not connected else account_snapshot.get("currency"),
+        email=None if not connected else account_snapshot.get("email"),
         connection_checked_at=state.connection_checked_at.isoformat()
         if state.connection_checked_at is not None
         else None,
@@ -11027,6 +14919,9 @@ async def robot_panel_maintenance(user_id: str) -> None:
             exc.__class__.__name__,
         )
     state = auto_trader.get(user_id)
+    if state.unseen_result:
+        auto_trader.acknowledge_unseen_result(user_id)
+        persist_robot(user_id)
     if state.enabled:
         ensure_robot_worker(user_id)
     robot_state_ws_hub.schedule_publish(user_id)
@@ -11239,7 +15134,7 @@ def _merge_robot_history_with_memory(
     """Une histórico persistido com trades ainda só em memória."""
     items_by_order_id: dict[str, dict[str, Any]] = {}
     ordered_items: list[dict[str, Any]] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+    cutoff = history_cutoff(days)
 
     for item in persisted_items:
         order_id = str(item.get("order_id") or "").strip()
@@ -11435,6 +15330,8 @@ async def robot_config(
     user_id = auth["user_id"]
     get_user_robot_state(user_id)
     state = recover_sync_timeout_if_needed(user_id)
+    # Antes do lock/clear: alinha enabled fantasma do gateway com Redis/runtime.
+    state = reconcile_gateway_enabled_from_runtime_snapshot(user_id, state)
     state = clear_stale_open_operation_if_stopped(user_id, state)
     if robot_config_locked(user_id, state):
         logger.warning(
@@ -11472,10 +15369,17 @@ async def robot_config(
         filtered_body["market_mode"] = selectable
     partial_update = RobotConfigUpdate.model_validate(filtered_body)
     if partial_update.entry_value is not None:
-        if partial_update.entry_value < MIN_REAL_ENTRY:
+        account_currency = resolve_user_account_currency(user_id)
+        min_entry = min_real_entry_for_currency(account_currency)
+        if partial_update.entry_value < min_entry:
+            logger.info(
+                "[ENTRY_VALUE_TOO_LOW] user_id=%s value=%s currency=%s min=%s",
+                user_id,
+                partial_update.entry_value,
+                account_currency,
+                min_entry,
+            )
             return json_response(400, build_error("ENTRY_VALUE_TOO_LOW"))
-        if partial_update.entry_value > MAX_REAL_ENTRY:
-            return json_response(400, build_error("ENTRY_VALUE_TOO_HIGH"))
     effective_stop_win_mode = normalize_stop_mode(
         partial_update.stop_win_mode
         if partial_update.stop_win_mode is not None
@@ -11574,6 +15478,9 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
             exc.__class__.__name__,
         )
     state = get_user_robot_state(user_id)
+    # Mesmo split-brain do config: runtime já pausou (Stop Win/Loss) e o Redis
+    # tem enabled=false/STOP_*_HIT, mas o gateway ainda carrega enabled=true.
+    state = reconcile_gateway_enabled_from_runtime_snapshot(user_id, state)
     state.account_mode = "REAL"
     state.allow_real = True
     state.confirm_real = True
@@ -11589,6 +15496,7 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
     if stop_blocks and is_marketing_simulation_session(auth):
         previous_status = state.status
         state = auto_trader.reset_score(user_id)
+        clear_session_score_authority(user_id)
         persist_robot(user_id)
         logger.info(
             "[MARKETING_AUTO_RESET_SCORE_ON_START] user_id=%s previous_status=%s "
@@ -11854,8 +15762,10 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
         user_id,
         state.cycle_minutes,
     )
-    persist_robot(user_id)
-    ensure_robot_worker(user_id)
+    # Snapshot Redis imediato: o painel lê Redis em mode=external e o front
+    # aplicava refetch que ainda via enabled=false até o runtime publicar.
+    control_payload = publish_robot_control_snapshot(user_id, worker_running=True)
+    await start_robot_worker(user_id)
     logger.info(
         "[ROBOT_START_NEW_CYCLE] user_id=%s cycle_id=%s current_cycle_started_at=%s next_cycle_at=%s",
         user_id,
@@ -11870,7 +15780,51 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
         state.cycle_minutes,
     )
     logger.info("[ROBOT START] user_id=%s", user_id)
-    return json_response(200, build_robot_payload(auto_trader.get(user_id), user_id=user_id))
+    return json_response(200, control_payload)
+
+
+@app.post("/robot/live-mode")
+async def robot_live_mode(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    auth: dict[str, str] = Depends(require_headers),
+) -> JSONResponse:
+    """Liga ou desliga o modo LIVE — cadência de demonstração, só marketing.
+
+    O modo afrouxa o portão de qualidade em OTC para o robô entrar com muito
+    mais frequência durante uma transmissão. **Não melhora o resultado**: os
+    ativos OTC são ruído medido (entropia 4,0000 de 4,0000 bits em 282.714
+    velas), então mais entradas significam perder mais rápido, na mesma
+    proporção. É ferramenta de ritmo, não de desempenho.
+
+    Só `account_type=marketing` pode ligar. Cliente pagante recebe 403 — não
+    faria sentido acelerar a perda de quem está operando com o próprio dinheiro.
+
+    Args:
+        payload: ``{"enabled": bool}``.
+        auth: Sessão autenticada.
+
+    Returns:
+        Estado do robô com o novo valor de ``live_demo``.
+    """
+    user_id = auth["user_id"]
+    tipo = str(auth.get("account_type") or "").strip().lower()
+    if tipo != "marketing":
+        logger.warning("[LIVE_MODE_DENIED] user_id=%s account_type=%s", user_id, tipo or "?")
+        return json_response(403, build_error("LIVE_MODE_SOMENTE_MARKETING"))
+
+    ligado = bool(payload.get("enabled"))
+    state = auto_trader.get(user_id)
+    state.live_demo = ligado
+    persist_robot(user_id)
+    # Em `external` quem opera é o robot-runtime, com o estado na memória dele.
+    # Sem este comando o clique só mudava o gateway: o runtime seguia com
+    # `live_demo=False`, regravava False por cima na persistência e publicava
+    # False no snapshot — o botão voltava apagado. Medido em 10/09 19:37–19:47:
+    # 4 cliques `enabled=True`, zero `[LIVE_DEMO_RELEASE]`, robot_states=False.
+    if robot_runtime_mode() == "external":
+        robot_bus.publish_command(user_id, "live_mode", enabled=ligado)
+    logger.warning("[LIVE_MODE_SET] user_id=%s enabled=%s", user_id, ligado)
+    return json_response(200, build_success({"live_demo": ligado}))
 
 
 @app.post("/robot/start")
@@ -11893,9 +15847,13 @@ async def _robot_stop_impl(auth: dict[str, str]) -> JSONResponse:
     logger.info("[ROBOT_STOP_REQUEST] user_id=%s", user_id)
     state = auto_trader.stop(user_id)
     persist_robot(user_id)
+    # Sobrescreve Redis ANTES do cmd ao runtime: senão GET /robot/state e o WS
+    # continuam servindo enabled/worker_running=true (TTL 600s) e o overlay
+    # demora para sair de "Parar Operação".
+    control_payload = publish_robot_control_snapshot(user_id, worker_running=False)
     await stop_robot_worker(user_id)
     logger.info("[ROBOT STOP] user_id=%s", user_id)
-    return json_response(200, build_robot_payload(state, user_id=user_id))
+    return json_response(200, control_payload)
 
 
 @app.post("/robot/stop")
@@ -11921,6 +15879,7 @@ async def robot_reset_cycle(
     user_id = auth["user_id"]
     async with auto_trader.lock(user_id):
         state = auto_trader.reset_cycle(user_id, reset_score=True, reset_daily_profit=True)
+        clear_session_score_authority(user_id)
         robot_persistence.clear_finished_trades(user_id)
         robot_persistence.clear_trade_history(user_id)
         persist_robot(user_id)
@@ -11970,11 +15929,34 @@ async def robot_reset_score(auth: dict[str, str] = Depends(require_headers)) -> 
 
     Não apaga ``robot_trade_history``, ``robot_trades`` nem o histórico
     sintético de marketing — isso fica para ``POST /robot/reset-cycle``.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` o painel lê ``robot:snapshot`` no Redis
+    (publicado pelo runtime). Sem sobrescrever o Redis e sem mandar
+    ``reset_score`` ao runtime, o ``GET /robot/state`` / WS devolvem o placar
+    antigo (TTL 600s) e o botão “Reiniciar placar” parece não funcionar.
     """
     user_id = auth["user_id"]
     async with auto_trader.lock(user_id):
         state = auto_trader.reset_score(user_id)
-        persist_robot(user_id)
+        clear_session_score_authority(user_id)
+        future = persist_robot(user_id)
+    if future is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                ROBOT_START_PERSIST_WAIT_SECONDS,
+            )
+        except Exception:
+            logger.warning(
+                "[ROBOT_RESET_SCORE_PERSIST_WAIT_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+    # Snapshot Redis imediato (mesmo padrão de start/stop/disconnect).
+    control_payload = publish_robot_control_snapshot(user_id)
+    if robot_runtime_mode() == "external":
+        robot_bus.publish_command(user_id, "reset_score")
+        logger.info("[ROBOT_SCORE_RESET_DELEGATED] user_id=%s mode=external", user_id)
     logger.info(
         "[ROBOT_SCORE_RESET] user_id=%s wins=%s losses=%s profit=%s",
         user_id,
@@ -11982,7 +15964,7 @@ async def robot_reset_score(auth: dict[str, str] = Depends(require_headers)) -> 
         state.losses,
         state.profit,
     )
-    return json_response(200, build_robot_payload(state, user_id=user_id))
+    return json_response(200, control_payload)
 
 
 @app.options("/robot/reset-score")
@@ -12124,7 +16106,7 @@ async def _bullex_connect_impl(
 ) -> JSONResponse:
     user_id = auth["user_id"]
     # Conexão pedida pelo cliente: encerra o bloqueio da desconexão manual.
-    bullex_manual_disconnect.discard(user_id)
+    set_manual_disconnect(user_id, False)
     logger.info("[CONNECT_REQUEST] user_id=%s", user_id)
     remaining = bullex_login_rate_limit_remaining()
     if remaining > 0:
@@ -12328,6 +16310,24 @@ async def bullex_connect(
 async def _bullex_status_impl(auth: dict[str, str]) -> JSONResponse:
     user_id = auth["user_id"]
     mark_user_active(user_id)
+    # Decisão explícita do cliente vence qualquer sessão/cache/upstream.
+    # Sem este early-return, um SSID ainda vivo (ou restore_on_demand no
+    # bullex-service) fazia GET /bullex/status devolver connected=true e o
+    # pill voltava para Conectado mesmo com a marca no Redis.
+    if is_manual_disconnect(user_id):
+        return json_response(
+            200,
+            attach_credentials_meta(
+                build_success(
+                    {
+                        "connected": False,
+                        "status": "disconnected",
+                        "connection_status_source": "manual_disconnect",
+                    }
+                ),
+                user_id,
+            ),
+        )
     try:
         status_code, payload = await call_bullex_service("GET", "/sessions/status", user_id)
         payload = normalize_service_payload(payload)
@@ -12339,7 +16339,9 @@ async def _bullex_status_impl(auth: dict[str, str]) -> JSONResponse:
             exc_info=True,
         )
         # Upstream fora: tenta login salvo antes do cache em memória.
-        if await try_auto_reconnect_with_saved_credentials(user_id):
+        # Só com o robô ligado — este é o poll do painel, e abrir a página não
+        # pode logar na corretora sozinho (ver panel_auto_reconnect_allowed).
+        if panel_auto_reconnect_allowed(user_id) and await try_auto_reconnect_with_saved_credentials(user_id):
             restored = await refresh_connected_status_after_auto_reconnect(user_id)
             if restored is not None:
                 return json_response(200, restored)
@@ -12373,7 +16375,8 @@ async def _bullex_status_impl(auth: dict[str, str]) -> JSONResponse:
     if session_dead:
         # Entrada no painel / SSID morto: reconecta com credenciais salvas
         # ANTES de servir cache em memória (que pode mentir "conectado").
-        if await try_auto_reconnect_with_saved_credentials(user_id):
+        # "Entrada no painel" só reconecta com o robô ligado.
+        if panel_auto_reconnect_allowed(user_id) and await try_auto_reconnect_with_saved_credentials(user_id):
             restored = await refresh_connected_status_after_auto_reconnect(user_id)
             if restored is not None:
                 return json_response(200, restored)
@@ -12783,23 +16786,54 @@ async def bullex_disconnect(auth: dict[str, str] = Depends(require_headers)) -> 
     user_id = auth["user_id"]
     # ANTES da chamada: o poll do painel corre em paralelo e poderia disparar o
     # auto-reconnect na janela entre desconectar e marcar.
-    bullex_manual_disconnect.add(user_id)
+    set_manual_disconnect(user_id, True)
     status_code, payload = await call_bullex_service("POST", "/sessions/disconnect", user_id)
     payload = normalize_service_payload(payload)
+    if not payload.get("ok"):
+        # ReadTimeout no hop gateway→bullex-service devolvia 503 e a sessão
+        # seguia VIVA na corretora, mas o painel recebia "desconectado". No
+        # poll seguinte o /sessions/status dizia conectado (com razão) e o
+        # cliente precisava clicar de novo. Uma retentativa resolve o timeout.
+        logger.warning(
+            "[BULLEX_DISCONNECT_RETRY] user_id=%s status_code=%s error=%s",
+            user_id,
+            status_code,
+            payload.get("error"),
+        )
+        status_code, retry_payload = await call_bullex_service(
+            "POST", "/sessions/disconnect", user_id
+        )
+        payload = normalize_service_payload(retry_payload)
     auto_trader.disconnect_account(user_id)
     persist_robot(user_id)
     await stop_robot_worker(user_id)
     await manager.disconnect_user(user_id)
     # Sempre limpa o snapshot local — evita GET /account restaurar "conectado" após o clique.
-    # Credenciais criptografadas PERMANECEM para auto-reconexão (usar DELETE /bullex/credentials).
     try:
         user_store.disconnect(user_id)
     except Exception:
         logger.exception("[BULLEX_DISCONNECT_STORE_FAILED] user_id=%s", user_id)
+    # Apaga a credencial criptografada. Sem ela o auto-reconnect para em
+    # `reason=no_saved_credentials` — é a garantia ESTRUTURAL de que
+    # "Desconectar" não volta sozinho, inclusive de onde a marca do painel não
+    # existe: outro navegador, aba nova ou depois do logout (o
+    # `sessionStorage` do front é apagado no logout). Decisão do dono: o
+    # cliente redigita email/senha para reconectar.
+    if bullex_credentials_service is not None:
+        try:
+            bullex_credentials_service.clear(user_id)
+        except Exception:
+            logger.warning(
+                "[BULLEX_DISCONNECT_CREDENTIALS_CLEAR_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
     # NÃO usar mark_session_failure(force_offline): ele preservava /account REAL
     # e o painel voltava para Conectado com email/saldo "—".
     apply_manual_disconnect_session_state(user_id)
-    logger.info(
+    # Sobrescreve o snapshot Redis stale (connected=true) imediatamente.
+    publish_manual_disconnect_robot_snapshot(user_id)
+    logger.warning(
         "[BULLEX_DISCONNECT] user_id=%s upstream_ok=%s status_code=%s credentials_kept=%s",
         user_id,
         bool(payload.get("ok")),
@@ -12860,8 +16894,29 @@ async def bullex_credentials_forget(
 @app.post("/bullex/reconnect")
 async def bullex_reconnect(auth: dict[str, str] = Depends(require_headers)) -> JSONResponse:
     user_id = auth["user_id"]
-    # Reconexão pedida pelo cliente: encerra o bloqueio da desconexão manual.
-    bullex_manual_disconnect.discard(user_id)
+    # NÃO limpa a marca de desconexão manual. Este endpoint é chamado
+    # AUTOMATICAMENTE pelo painel (`useEnsureBullexSession`, com retry 4x),
+    # sem clique do cliente. Tratar isso como intenção explícita era o bug:
+    # o hook roda ao abrir qualquer página autenticada, apagava a marca
+    # durável do Redis e reconectava com a senha salva. Efeitos relatados:
+    # a conta conectava sozinha ao abrir Configurações, o botão Desconectar
+    # exigia ~3 cliques (uma tentativa em voo chegava depois do clique) e a
+    # conexão voltava após logout/login — o `sessionStorage` que segurava o
+    # front morre no logout, mas a proteção do servidor era apagada por este
+    # POST. Só `POST /bullex/connect` (credenciais enviadas pelo cliente)
+    # encerra o bloqueio.
+    if is_manual_disconnect(user_id):
+        logger.warning(
+            "[BULLEX_RECONNECT_BLOCKED] user_id=%s reason=manual_disconnect",
+            user_id,
+        )
+        return json_response(
+            200,
+            attach_credentials_meta(
+                build_success({"connected": False, "status": "disconnected"}),
+                user_id,
+            ),
+        )
     clear_session_backoff(user_id)
     # Preferência: reconectar sessão viva; se falhar e houver credenciais, faz login novo.
     status_code, payload = await call_bullex_service("POST", "/sessions/reconnect", user_id)
@@ -12896,6 +16951,20 @@ async def bullex_reconnect(auth: dict[str, str] = Depends(require_headers)) -> J
 async def _bullex_account_impl(auth: dict[str, str]) -> JSONResponse:
     user_id = auth["user_id"]
     mark_user_active(user_id)
+    if is_manual_disconnect(user_id):
+        contract = build_real_account_contract(
+            build_success(
+                {
+                    "connected": False,
+                    "status": "disconnected",
+                    "connection_status_source": "manual_disconnect",
+                }
+            )
+        )
+        state = auto_trader.get(user_id)
+        if isinstance(contract.get("data"), dict):
+            contract["data"]["robot"] = build_robot_payload(state, user_id=user_id)["data"]
+        return json_response(200, attach_credentials_meta(contract, user_id))
     try:
         status_code, payload = await call_bullex_service("GET", "/account", user_id)
         payload = normalize_service_payload(
@@ -12909,7 +16978,8 @@ async def _bullex_account_impl(auth: dict[str, str]) -> JSONResponse:
             exc.__class__.__name__,
             exc_info=True,
         )
-        if await try_auto_reconnect_with_saved_credentials(user_id):
+        # Poll do painel: só reconecta sozinho com o robô ligado.
+        if panel_auto_reconnect_allowed(user_id) and await try_auto_reconnect_with_saved_credentials(user_id):
             restored = await refresh_connected_account_after_auto_reconnect(user_id)
             if restored is not None:
                 return json_response(200, restored)
@@ -12963,7 +17033,7 @@ async def _bullex_account_impl(auth: dict[str, str]) -> JSONResponse:
             return json_response(200, attach_credentials_meta(contract, user_id))
         # Conta não REAL / sem saldo: tenta login salvo se a sessão estiver morta.
         if status_code == 404 or is_session_disconnected(payload) or payload_connected_state(payload) is False:
-            if await try_auto_reconnect_with_saved_credentials(user_id):
+            if panel_auto_reconnect_allowed(user_id) and await try_auto_reconnect_with_saved_credentials(user_id):
                 restored = await refresh_connected_account_after_auto_reconnect(user_id)
                 if restored is not None:
                     return json_response(200, restored)
@@ -13004,7 +17074,7 @@ async def _bullex_account_impl(auth: dict[str, str]) -> JSONResponse:
             )["data"]
         return json_response(200, attach_credentials_meta(contract, user_id))
     if status_code == 404 or is_session_disconnected(payload) or payload_connected_state(payload) is False:
-        if await try_auto_reconnect_with_saved_credentials(user_id):
+        if panel_auto_reconnect_allowed(user_id) and await try_auto_reconnect_with_saved_credentials(user_id):
             restored = await refresh_connected_account_after_auto_reconnect(user_id)
             if restored is not None:
                 return json_response(200, restored)
@@ -13249,6 +17319,7 @@ app.include_router(
         marketing_display_sync=sync_marketing_display_to_robot,
         asset_payout_resolver=resolve_marketing_asset_payout,
         robot_history_deleter=delete_marketing_robot_history_item,
+        marketing_score_remover=apply_marketing_score_removal,
         history_batch_loader=load_robot_history_items_for_users,
         access_profile_invalidator=(
             (lambda user_id: supabase_auth_service.invalidate_user(user_id))

@@ -12,6 +12,7 @@ import {
   type FeedbackItem,
   type FeedbackStatus,
 } from "@/lib/api";
+import { formatBrasiliaDate } from "@/lib/brasiliaTime";
 
 export const Route = createFileRoute("/_authenticated/admin/feedbacks")({
   head: () => ({ meta: [{ title: "Feedbacks — Administração ElCapo" }] }),
@@ -244,8 +245,5 @@ function statusLabel(status: FeedbackStatus) {
 }
 
 function formatDate(value: string) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? value
-    : new Intl.DateTimeFormat("pt-BR", { dateStyle: "short" }).format(date);
+  return formatBrasiliaDate(value) || value;
 }

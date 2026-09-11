@@ -113,6 +113,21 @@ export interface RobotState {
   stop_loss_operations: number | null;
   timeframe: string | null;
   market_mode: string | null;
+  /**
+   * Modo LIVE (cadência de demonstração, só conta de marketing). Vem do
+   * servidor para o botão do Shift+O saber se já está ligado — sem isto ele
+   * nascia sempre apagado e o clique seguinte remandava `true`.
+   */
+  live_demo?: boolean;
+  /**
+   * Mercado aberto disponível AGORA, segundo o servidor. Ele cruza a janela
+   * semanal do forex com o que a corretora responde por ativo — então pega
+   * feriado, que o relógio sozinho não pega. `undefined` quando o servidor
+   * ainda não respondeu; nesse caso o painel cai no relógio local.
+   */
+  open_market_available?: boolean;
+  /** `forex_closed` (fora da janela) ou `broker_closed` (corretora fechou). */
+  open_market_closed_reason?: string | null;
   ai_analysis_enabled: boolean;
   ai_confirmation_required: boolean;
   ai_min_confidence: number | null;
@@ -151,6 +166,8 @@ export interface RobotState {
   wins: number;
   losses: number;
   profit: number;
+  /** Timestamp ISO do último Reiniciar placar — evita snapshot Redis atrasado. */
+  stop_reset_at: string | null;
   last_order_error: string | null;
   order_fallback_in_progress: boolean;
   order_fallback_attempt: number;
@@ -519,6 +536,14 @@ export function normalizeRobotState(payload: unknown): RobotState {
     ),
     timeframe: toNullableText(raw.timeframe ?? config.timeframe ?? raw.expiration ?? config.expiration),
     market_mode: toNullableText(raw.market_mode ?? raw.marketMode ?? config.market_mode ?? config.marketMode),
+    live_demo: toBool(raw.live_demo ?? raw.liveDemo ?? config.live_demo ?? config.liveDemo),
+    open_market_available:
+      raw.open_market_available === undefined && raw.openMarketAvailable === undefined
+        ? undefined
+        : toBool(raw.open_market_available ?? raw.openMarketAvailable),
+    open_market_closed_reason: toNullableText(
+      raw.open_market_closed_reason ?? raw.openMarketClosedReason,
+    ),
     ai_analysis_enabled: toBool(
       raw.ai_analysis_enabled ?? raw.aiAnalysisEnabled ?? config.ai_analysis_enabled ?? config.aiAnalysisEnabled,
     ),
@@ -594,6 +619,7 @@ export function normalizeRobotState(payload: unknown): RobotState {
     wins: Math.max(0, toNumber(raw.wins) ?? 0),
     losses: Math.max(0, toNumber(raw.losses) ?? 0),
     profit: toNumber(raw.profit) ?? 0,
+    stop_reset_at: toNullableText(raw.stop_reset_at ?? raw.stopResetAt),
     last_order_error: toNullableText(
       raw.last_order_error ?? raw.lastOrderError ?? raw.order_error ?? raw.orderError,
     ),
@@ -608,6 +634,161 @@ export function normalizeRobotState(payload: unknown): RobotState {
     disconnected,
     fetched_at: Date.now(),
   };
+}
+
+/**
+ * Diz se o overlay deve mostrar a operação como ligada (botão Parar).
+ *
+ * Usa só ``enabled``. ``worker_running`` sozinho após o stop era snapshot Redis
+ * stale (TTL 600s) e mantinha o botão em "Parar Operação" por vários segundos.
+ *
+ * @param state - Estado canônico do robô (ou parcial)
+ * @returns True quando o cliente pediu operação ligada
+ */
+export function isRobotOperationRunning(
+  state?: Pick<RobotState, "enabled" | "worker_running"> | null,
+): boolean {
+  return Boolean(state?.enabled);
+}
+
+function sessionScoreIsBlank(state: Pick<RobotState, "wins" | "losses" | "profit">): boolean {
+  return state.wins === 0 && state.losses === 0 && state.profit === 0;
+}
+
+function sessionScoreHasValue(state: Pick<RobotState, "wins" | "losses" | "profit">): boolean {
+  return state.wins > 0 || state.losses > 0 || state.profit !== 0;
+}
+
+function scoreResetAtMs(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sessionScoreTotal(state: Pick<RobotState, "wins" | "losses">): number {
+  return state.wins + state.losses;
+}
+
+/**
+ * Evita o overlay piscar 0-0 (ou “outro placar”) quando start/stop/refetch
+ * aplica um snapshot de controle sem o placar da sessão.
+ *
+ * O gateway em mode=external devolve `enabled` na hora, mas o `auto_trader`
+ * local muitas vezes ainda está com wins/losses/profit zerados ou atrasados
+ * (ex.: 2x0 com a sessão real em 5x3). O React Query então substituía o
+ * placar vivo até o WS do runtime republicar os números.
+ *
+ * Depois de **Reiniciar placar**, um snapshot Redis/WS atrasado (ainda com
+ * 10x12) não pode desfazer o 0-0: compara `stop_reset_at`.
+ *
+ * A regra "nunca rebaixa" é o oposto do certo quando a queda foi PEDIDA
+ * (exclusão no Shift+O / no Histórico). Quem sabe disso é
+ * `resolveSessionScoreGate`; aqui só chegam as duas decisões prontas —
+ * manter a função pura e testável isolada do `localStorage`.
+ *
+ * @param previous - Estado já exibido no painel
+ * @param incoming - Snapshot novo (mutação, HTTP ou WS)
+ * @param options.allowBlankOverwrite - True só no **Reiniciar placar**
+ * @param options.allowScoreDecrease - True quando a queda é intencional
+ *   (exclusão) e o placar menor do servidor deve valer, inclusive 0-0
+ * @param options.forceScorePreserve - True quando o snapshot recebido é a
+ *   réplica atrasada repetindo o placar de antes da exclusão
+ * @returns Estado com placar da sessão preservado quando o novo vem em branco
+ *   ou claramente atrasado em relação ao exibido
+ */
+export function preserveRobotSessionScore(
+  previous: Pick<RobotState, "wins" | "losses" | "profit" | "stop_reset_at"> | null | undefined,
+  incoming: RobotState,
+  options?: {
+    allowBlankOverwrite?: boolean;
+    allowScoreDecrease?: boolean;
+    forceScorePreserve?: boolean;
+  },
+): RobotState {
+  if (options?.allowBlankOverwrite || !previous) return incoming;
+  if (options?.forceScorePreserve) {
+    return {
+      ...incoming,
+      wins: previous.wins,
+      losses: previous.losses,
+      profit: previous.profit,
+    };
+  }
+  if (options?.allowScoreDecrease) return incoming;
+  if (sessionScoreHasValue(previous) && sessionScoreIsBlank(incoming)) {
+    return {
+      ...incoming,
+      wins: previous.wins,
+      losses: previous.losses,
+      profit: previous.profit,
+    };
+  }
+  if (
+    sessionScoreIsBlank(previous) &&
+    sessionScoreHasValue(incoming) &&
+    scoreResetAtMs(previous.stop_reset_at) > scoreResetAtMs(incoming.stop_reset_at)
+  ) {
+    return {
+      ...incoming,
+      wins: 0,
+      losses: 0,
+      profit: 0,
+      stop_reset_at: previous.stop_reset_at,
+    };
+  }
+  if (
+    sessionScoreHasValue(previous) &&
+    sessionScoreHasValue(incoming) &&
+    sessionScoreTotal(previous) > sessionScoreTotal(incoming)
+  ) {
+    return {
+      ...incoming,
+      wins: previous.wins,
+      losses: previous.losses,
+      profit: previous.profit,
+    };
+  }
+  return incoming;
+}
+
+/**
+ * Grava o placar do Shift+O no estado já exibido no overlay.
+ *
+ * O generate/create do painel marketing não passa por POST /robot/*; sem
+ * este merge o React Query continua com 0-0 até o Redis/WS alcançarem.
+ *
+ * @param previous - Estado já cacheado (ou indefinido)
+ * @param score - Wins/loss/lucro do lote gerado, da operação avulsa ou a remover
+ * @param options.accumulate - True em "Nova operação" (soma no placar atual)
+ * @param options.subtract - True na exclusão (subtrai WIN/LOSS/lucro do overlay)
+ * @returns Estado com o placar aplicado, demais campos preservados
+ */
+export function mergeRobotSessionScore(
+    previous: RobotState | undefined,
+    score: { wins: number; losses: number; profit: number },
+    options?: { accumulate?: boolean; subtract?: boolean },
+): RobotState {
+    const base = previous ?? getStoppedRobotState();
+    const wins = Math.max(0, Math.trunc(Number(score.wins) || 0));
+    const losses = Math.max(0, Math.trunc(Number(score.losses) || 0));
+    const profit = Number.isFinite(Number(score.profit)) ? Number(score.profit) : 0;
+    if (options?.subtract) {
+        return {
+            ...base,
+            wins: Math.max(0, base.wins - wins),
+            losses: Math.max(0, base.losses - losses),
+            profit: Math.round((base.profit - profit) * 100) / 100,
+        };
+    }
+    if (options?.accumulate) {
+        return {
+            ...base,
+            wins: base.wins + wins,
+            losses: base.losses + losses,
+            profit: Math.round((base.profit + profit) * 100) / 100,
+        };
+    }
+    return { ...base, wins, losses, profit };
 }
 
 /** Estado padrão usado quando o robô está parado ou a sessão caiu. */
@@ -640,6 +821,9 @@ export function getStoppedRobotState(disconnected = false): RobotState {
     stop_loss_operations: null,
     timeframe: null,
     market_mode: null,
+    live_demo: false,
+    open_market_available: undefined,
+    open_market_closed_reason: null,
     ai_analysis_enabled: false,
     ai_confirmation_required: false,
     ai_min_confidence: null,
@@ -676,6 +860,7 @@ export function getStoppedRobotState(disconnected = false): RobotState {
     wins: 0,
     losses: 0,
     profit: 0,
+    stop_reset_at: null,
     last_order_error: null,
     order_fallback_in_progress: false,
     order_fallback_attempt: 0,

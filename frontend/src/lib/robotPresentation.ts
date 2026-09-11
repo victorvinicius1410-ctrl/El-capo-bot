@@ -1,5 +1,5 @@
-import type { RobotGaleInfo, RobotSignal, RobotState, RobotTrade } from "./robotState";
-import { liveDisplayCountdownSeconds } from "./robotState";
+import type { RobotGaleInfo, RobotSignal, RobotState, RobotTrade } from "./robotState.ts";
+import { liveDisplayCountdownSeconds } from "./robotState.ts";
 
 export type RobotPresentationKind =
   | "loading"
@@ -24,7 +24,10 @@ export interface RobotPresentation {
 }
 
 const REJECTION_DISPLAY_MS = 5_000;
+/** Tempo máximo no overlay com WIN/LOSS + ativo após o fechamento da operação. */
+export const RESULT_OVERLAY_DISPLAY_MS = 60_000;
 let rejectionMemory: { key: string; reason: string; observedAt: number } | null = null;
+let resultFlashMemory: { key: string; observedAt: number } | null = null;
 
 /** Ajusta o rodapé do overlay conforme a fase da operação. */
 export function formatCountdownFooter(
@@ -60,6 +63,11 @@ export function humanizeRobotReason(reason?: string | null): string {
 /** Zera a memória local de rejeições exibidas (troca de usuário). */
 export function clearRejectionMemory(): void {
   rejectionMemory = null;
+}
+
+/** Zera a âncora local do flash de WIN/LOSS (testes / troca de usuário). */
+export function clearResultFlashMemory(): void {
+  resultFlashMemory = null;
 }
 
 function presentation(
@@ -105,6 +113,37 @@ function rejectionReason(state: RobotState): string {
   return state.last_order_error ?? state.rejection_reason ?? "Ordem recusada pela corretora.";
 }
 
+/** Detecta aviso de saldo insuficiente no estado/erro bruto do robô. */
+export function looksLikeInsufficientBalance(state: RobotState): boolean {
+  if (state.status === "INSUFFICIENT_BALANCE") return true;
+  const status = String(state.status || "").toUpperCase();
+  // Só interpreta erro residual quando o ciclo já parou/recusou — evita
+  // prender o overlay em “Saldo insuficiente” com last_order_error antigo.
+  const sticky = new Set(["ORDER_REJECTED", "BUY_ERROR", "STOPPED", "ERROR", "ACCOUNT_DISCONNECTED"]);
+  if (!sticky.has(status)) return false;
+  const haystack = [
+    state.last_order_error,
+    state.rejection_reason,
+    state.last_rejection_reason,
+    state.status_message,
+    state.operation_message,
+    state.real_block_reason,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  return (
+    haystack.includes("insufficient") ||
+    haystack.includes("saldo insuficiente") ||
+    haystack.includes("sem saldo") ||
+    haystack.includes("funds for this transaction") ||
+    haystack.includes("not enough funds") ||
+    haystack.includes("menor que o valor da entrada")
+  );
+}
+
 function cycleResultLabel(state: RobotState): "WIN" | "LOSS" | "DRAW" | null {
   if (state.cycle_result === "WIN" || state.cycle_result === "GALE_WIN") return "WIN";
   if (state.cycle_result === "LOSS" || state.cycle_result === "GALE_LOSS") return "LOSS";
@@ -121,22 +160,68 @@ function isResultStatus(status: string): boolean {
   return ["WIN", "LOSS", "DRAW", "RESULT_WIN", "RESULT_LOSS", "RESULT_RECEIVED", "GALE_RESULT_RECEIVED"].includes(status);
 }
 
-function shouldShowResult(state: RobotState, now: number): boolean {
-  if (state.unseen_result) {
-    const tradeResult = tradeResultLabel(state.last_trade);
-    if (tradeResult || state.status === "WIN" || state.status === "LOSS" || state.status === "DRAW") {
-      return true;
-    }
+function resultFlashKey(state: RobotState): string {
+  return [
+    state.last_trade?.order_id ?? "-",
+    state.last_trade?.finished_at ?? "-",
+    cycleResultLabel(state) ?? tradeResultLabel(state.last_trade) ?? "-",
+  ].join("|");
+}
+
+function resultFinishedAtMs(state: RobotState): number | null {
+  const finished = Date.parse(state.last_trade?.finished_at ?? "");
+  if (Number.isFinite(finished)) return finished;
+  const until = Date.parse(state.result_display_until ?? "");
+  if (Number.isFinite(until)) return until - RESULT_OVERLAY_DISPLAY_MS;
+  return null;
+}
+
+/**
+ * WIN/LOSS + ativo no overlay por no máximo 60s após o fim da operação.
+ * Não usa `result_display_until` operacional (5s) nem status preso em WIN.
+ */
+export function shouldShowResult(state: RobotState, now: number): boolean {
+  if (state.pending_signal) return false;
+  if (state.operation_in_progress || state.result_waiting) return false;
+  if (
+    [
+      "SIGNAL_FOUND",
+      "WAITING_ENTRY",
+      "WAITING_ENTRY_WINDOW",
+      "WAITING_NEXT_CANDLE_ENTRY",
+      "WAITING_GALE_ENTRY",
+      "BUYING",
+      "SENDING_ORDER",
+      "SENDING_GALE_ORDER",
+      "PENDING_RESULT",
+      "PENDING_GALE_RESULT",
+      "WAITING_RESULT",
+      "ORDER_OPEN",
+    ].includes(state.status)
+  ) {
+    return false;
   }
-  if (state.status === "WIN" || state.status === "LOSS" || state.status === "DRAW") {
-    if (!state.result_display_until) return false;
-    const until = Date.parse(state.result_display_until);
-    return Number.isFinite(until) && now < until;
+  const result = cycleResultLabel(state) ?? tradeResultLabel(state.last_trade);
+  if (!result) return false;
+
+  const finishedAt = resultFinishedAtMs(state);
+  if (finishedAt != null) {
+    return now >= finishedAt && now < finishedAt + RESULT_OVERLAY_DISPLAY_MS;
   }
-  if (isResultStatus(state.status) && !state.result_display_until) return true;
-  if (!state.result_display_until) return false;
-  const until = Date.parse(state.result_display_until);
-  return Number.isFinite(until) && now < until;
+
+  const canAnchor =
+    state.unseen_result ||
+    state.status === "WIN" ||
+    state.status === "LOSS" ||
+    state.status === "DRAW" ||
+    isResultStatus(state.status);
+  if (!canAnchor) return false;
+
+  const key = resultFlashKey(state);
+  if (resultFlashMemory?.key !== key) {
+    resultFlashMemory = { key, observedAt: now };
+  }
+  return now - resultFlashMemory.observedAt < RESULT_OVERLAY_DISPLAY_MS;
 }
 
 function galeInfo(state: RobotState): RobotGaleInfo | null {
@@ -235,8 +320,13 @@ export function getRobotStatusPresentation(
     return presentation("stopped", "Conta Bullex desconectada", "Reconecte para o robo operar");
   }
   const status = state.status;
-  if (status === "INSUFFICIENT_BALANCE") {
-    return presentation("stopped", "Saldo insuficiente", "Você está sem saldo para iniciar. Faça um depósito na Bullex.");
+  if (status === "INSUFFICIENT_BALANCE" || looksLikeInsufficientBalance(state)) {
+    const detail =
+      state.status_message ||
+      state.operation_message ||
+      state.last_order_error ||
+      "Saldo insuficiente. Faça um depósito na Bullex ou reduza o valor da entrada.";
+    return presentation("stopped", "Saldo insuficiente", humanizeRobotReason(detail));
   }
   const trade = state.last_trade;
   // Só o pending_signal representa entrada travada. best_candidate durante
@@ -278,8 +368,14 @@ export function getRobotStatusPresentation(
   }
   if (result && shouldShowResult(state, now)) {
     const title = result === "DRAW" ? "EMPATE" : result;
+    const seeking = state.enabled ? "Buscando melhor oportunidade" : null;
     return {
-      ...presentation("result", title, result === "DRAW" ? "Stake devolvida. Seguindo para a próxima análise." : null),
+      ...presentation(
+        "result",
+        title,
+        result === "DRAW" ? "Stake devolvida. Seguindo para a próxima análise." : null,
+        seeking,
+      ),
       trade,
       signal: trade ? null : signal,
       direction: trade?.direction ?? signal?.direction ?? null,

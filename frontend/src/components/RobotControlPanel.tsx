@@ -2,21 +2,29 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, Loader2, Lock, Save } from "lucide-react";
 import { toast } from "sonner";
 import { MoneyInput } from "@/components/MoneyInput";
-import { useLiveTradingData } from "@/hooks/useLiveTradingData";
+import { MarketModeLockPopover } from "@/components/MarketModeLockPopover";
+import {
+  OPEN_MARKET_MAINTENANCE_SHORT,
+  resolveMarketModeLock,
+} from "@/lib/openMarketMaintenance";
+import { useLiveTradingData, applyRobotMutationToCache } from "@/hooks/useLiveTradingData";
 import { useRobotSettings } from "@/hooks/useRobotSettings";
 import { robotStart, robotStop } from "@/lib/api";
 import { entryValueBalanceError, formatBullExBalance, isBullExConnected } from "@/lib/bullexConnection";
+import { isRobotOperationRunning } from "@/lib/robotState";
 import { useAuth } from "@/lib/useAuth";
+import { useQueryClient } from "@tanstack/react-query";
 import {
-  ENTRY_VALUE_MAX,
-  ENTRY_VALUE_MIN,
   ENTRY_VALUE_STEP,
   ROBOT_TIMEFRAME_OPTIONS,
   STOP_MONEY_MIN,
   STOP_OPERATIONS_MAX,
   STOP_OPERATIONS_MIN,
+  clampEntryValueForCurrency,
   coerceSelectableMarketMode,
   cycleMinutesForTimeframe,
+  entryLimitsForCurrency,
+  entryValueHelperText,
   formatForexOpenCountdown,
   isForexOpenMarketAvailable,
   parseEntryValueInput,
@@ -35,22 +43,31 @@ import {
  */
 export function RobotControlPanel() {
   const { user } = useAuth();
+  const queryClient = useQueryClient();
   const { account, accountStatus, robotState } = useLiveTradingData();
   const { settings, setSettings, saveSettings } = useRobotSettings(user?.id);
   const [pending, setPending] = useState<"save" | "toggle" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const running = Boolean(robotState.data?.enabled || robotState.data?.worker_running);
+  const running = isRobotOperationRunning(robotState.data);
   // Só faz sentido enquanto o robô está parado: assim que religa, o backend
   // limpa a flag e o aviso some sozinho.
   const pausedByMaintenance = Boolean(robotState.data?.paused_by_maintenance) && !running;
   const connected = isBullExConnected({ account: account.data, accountStatus: accountStatus.data });
   const currency = account.data?.currency ?? null;
   const balance = account.data?.balance ?? null;
+  const entryLimits = entryLimitsForCurrency(currency);
   const balanceError = useMemo(
     () => entryValueBalanceError(balance, settings.entryValue),
     [balance, settings.entryValue],
   );
+
+  useEffect(() => {
+    const next = clampEntryValueForCurrency(settings.entryValue, currency);
+    if (next !== settings.entryValue) {
+      setSettings({ ...settings, entryValue: next });
+    }
+  }, [currency, settings, setSettings]);
 
   function patch(patch: Partial<RobotSettings>): void {
     setSettings({ ...settings, ...patch });
@@ -58,10 +75,12 @@ export function RobotControlPanel() {
 
   async function persist(): Promise<boolean> {
     const selectableMode = coerceSelectableMarketMode(settings.marketMode);
-    const toSave =
-      selectableMode === settings.marketMode
+    const toSave = {
+      ...(selectableMode === settings.marketMode
         ? settings
-        : { ...settings, marketMode: selectableMode };
+        : { ...settings, marketMode: selectableMode }),
+      entryValue: clampEntryValueForCurrency(settings.entryValue, currency),
+    };
     if (toSave.marketMode !== settings.marketMode) {
       setSettings(toSave);
     }
@@ -107,6 +126,9 @@ export function RobotControlPanel() {
           toast.error(start.error);
           return;
         }
+        if (user?.id && start.data) {
+          applyRobotMutationToCache(queryClient, user.id, start.data);
+        }
         toast.success("Robô iniciado.");
       } else {
         const stop = await robotStop();
@@ -115,9 +137,12 @@ export function RobotControlPanel() {
           toast.error(stop.error);
           return;
         }
+        if (user?.id && stop.data) {
+          applyRobotMutationToCache(queryClient, user.id, stop.data);
+        }
         toast.success("Robô parado.");
       }
-      await robotState.refetch();
+      void robotState.refetch();
     } finally {
       setPending(null);
     }
@@ -126,7 +151,16 @@ export function RobotControlPanel() {
   const busy = pending !== null;
   const marketModeOptions = useMemo(() => visibleRobotMarketModeOptions(), []);
   const [nowTick, setNowTick] = useState(() => Date.now());
-  const openMarketAvailable = isForexOpenMarketAvailable(new Date(nowTick));
+  // O relógio do navegador só conhece a janela semanal do forex — e erra em
+  // FERIADO, que foi o que enganou a medição de 07/09/2026. O servidor cruza
+  // essa janela com o que a corretora responde por ativo, então sabe mais.
+  // Sem resposta do servidor ainda, o relógio local é o que temos: travar o
+  // painel por falta de dado seria pior que o defeito que isto conserta.
+  const openMarketDoServidor = robotState.data?.open_market_available;
+  const openMarketAvailable =
+    typeof openMarketDoServidor === "boolean"
+      ? openMarketDoServidor
+      : isForexOpenMarketAvailable(new Date(nowTick));
   const openMarketCountdown = formatForexOpenCountdown(new Date(nowTick));
 
   useEffect(() => {
@@ -194,36 +228,49 @@ export function RobotControlPanel() {
           </p>
           <div className="mt-2 grid gap-2 sm:grid-cols-3">
             {marketModeOptions.map((option) => {
-              const locked = option.value === "OPEN" && !openMarketAvailable;
-              const selected = settings.marketMode === option.value && !locked;
-              return (
+              const lock = resolveMarketModeLock(option.value, {
+                openMarketAvailable,
+                forexClosedMessage: openMarketCountdown,
+              });
+              const selected = settings.marketMode === option.value && !lock;
+              const optionButton = (
                 <button
                   key={option.value}
                   type="button"
-                  disabled={busy || running || locked}
+                  // `aria-disabled` em vez de `disabled`: elemento desabilitado
+                  // não dispara hover nem clique, e o cadeado precisa explicar.
+                  disabled={!lock && (busy || running)}
+                  aria-disabled={lock ? true : undefined}
                   onClick={() => {
-                    if (locked) return;
+                    if (lock) return;
                     patch({ marketMode: option.value });
                   }}
-                  title={locked ? (openMarketCountdown ?? "Mercado aberto fechado") : undefined}
                   className={`rounded-xl border px-3 py-3 text-left transition disabled:opacity-50 ${
-                    locked
-                      ? "cursor-not-allowed border-border/60 bg-background/20 text-muted-foreground"
+                    lock
+                      ? "cursor-not-allowed border-border/60 bg-background/20 text-muted-foreground opacity-60"
                       : selected
                         ? "border-[#7ef0f3]/70 bg-[#7ef0f3]/10 text-foreground"
                         : "border-border bg-background/40 text-muted-foreground hover:bg-accent"
                   }`}
                 >
                   <span className="flex items-center gap-1.5 text-sm font-semibold">
-                    {locked ? <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden /> : null}
+                    {lock ? <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden /> : null}
                     {option.label}
                   </span>
                   <span className="mt-1 block text-xs opacity-80">
-                    {locked
-                      ? (openMarketCountdown ?? "Fechado até a sessão forex")
+                    {lock
+                      ? lock.reason === "maintenance"
+                        ? OPEN_MARKET_MAINTENANCE_SHORT
+                        : (openMarketCountdown ?? "Fechado até a sessão forex")
                       : option.description}
                   </span>
                 </button>
+              );
+              if (!lock) return optionButton;
+              return (
+                <MarketModeLockPopover key={option.value} lock={lock}>
+                  {optionButton}
+                </MarketModeLockPopover>
               );
             })}
           </div>
@@ -233,14 +280,13 @@ export function RobotControlPanel() {
           <MoneyInput
             label="Valor por entrada"
             currency={currency}
-            min={ENTRY_VALUE_MIN}
-            max={ENTRY_VALUE_MAX}
+            min={entryLimits.min}
             step={ENTRY_VALUE_STEP}
             value={settings.entryValue}
             disabled={busy || running}
-            helperText="Mínimo R$ 5"
+            helperText={entryValueHelperText(currency)}
             onChange={(value) => {
-              const parsed = parseEntryValueInput(value, settings.entryValue);
+              const parsed = parseEntryValueInput(value, settings.entryValue, currency);
               if (parsed == null) return;
               patch({ entryValue: parsed });
             }}
@@ -433,7 +479,7 @@ function PanelStopField({
           step="any"
           value={moneyValue}
           disabled={disabled}
-          helperText="Mínimo R$ 5"
+          helperText={`Mínimo ${formatBullExBalance(STOP_MONEY_MIN, currency)}`}
           onChange={onMoneyChange}
         />
       ) : (

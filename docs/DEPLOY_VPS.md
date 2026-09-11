@@ -78,10 +78,84 @@ automática de ofertas no produto padrão.
 
 ## Subir / atualizar o backend
 
+**⚠️ SEMPRE inclua `-p elcapooneline` E `--build` no MESMO comando `up`.**
+Rodar `docker compose build` separado (sem `-p elcapooneline`) e depois
+`docker compose -p elcapooneline up -d --force-recreate` **não** atualiza o
+código: o `build` sem `-p` cria uma imagem `backend-*:latest` órfã (nome de
+projeto errado, geralmente derivado do diretório — `backend`), enquanto o
+container real usa a tag `elcapooneline-*:latest`. O `up --force-recreate`
+recria o container com a imagem `elcapooneline-*:latest` **antiga**,
+silenciosamente — sem erro, sem aviso. Incidente 2026-08-18 ~21h: um fix de
+`ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS` foi "deployado" assim, o container
+reiniciou normalmente, mas continuou rodando o valor antigo por ~1h40 até
+alguém notar. Sempre confira depois:
+
+```bash
+docker inspect robot-runtime --format '{{.Config.Image}}'   # deve ser elcapooneline-robot-runtime
+docker exec robot-runtime grep -n "NOME_DA_CONSTANTE" /app/backend/main.py  # bate com o host?
+```
+
 ```bash
 cd /opt/elcapo/backend
 docker compose -p elcapooneline --env-file .env up -d --build
 # ou: /opt/elcapo/scripts/deploy-backend.sh
+
+# Correção só no runtime (NÃO recria bullex-service — preserva sessões):
+docker compose -p elcapooneline --env-file .env up -d --build --no-deps robot-runtime
+# ou, preferível (já valida imagem + religa workers via Supabase):
+#   /opt/elcapo/scripts/deploy-robot-runtime.sh
+# Sem --no-deps o compose sobe o bullex-service junto e derruba as sessões.
+# Sem -p elcapooneline no build (mesmo comando ou anterior), o container fica
+# com o código ANTIGO — ver aviso acima.
+
+# Pool httpx saturado (robô “analisa” e não opera — incidente 2026-08-17/18):
+# NÃO rebuild. Só restart do processo para devolver as conexões.
+docker restart robot-runtime
+# O runtime sobe com worker_start=false. Republicar start de quem estava
+# enabled=True, senão só volta quem abrir o painel:
+#   docker exec webhook-redis redis-cli -n 1 PUBLISH robot:cmd \
+#     '{"user_id":"<UUID>","action":"start"}'
+#
+# ⚠️ NÃO use `robot:snapshot:*` do Redis DB1 como lista de quem publicar —
+# essas chaves têm TTL de 600s e ficam com o `enabled/worker_running` da
+# execução ANTERIOR até expirar, mesmo que o novo container não tenha
+# recriado o worker (dá falso positivo se você checar logo em seguida).
+# ⚠️ NÃO publique em rajada nos primeiros segundos após o restart: se o
+# processo ainda não terminou de assinar o canal `robot:cmd`, o PUBLISH é
+# perdido (Redis pub/sub não é fila — sem subscriber no instante do
+# PUBLISH, a mensagem simplesmente some). Incidente 2026-08-18 ~21h10: de
+# 35 comandos `start` publicados ~15s após o `up`, só ~1 pegou; os outros
+# 34 sumiram sem log nenhum (nem erro, nem [SESSION_CHECK_SKIPPED]).
+# Fonte de verdade para a lista de `enabled=True` é a tabela `robot_states`
+# do Supabase, não o Redis:
+#   curl -sS "$SUPABASE_URL/rest/v1/robot_states?select=user_id&enabled=eq.true" \
+#     -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+# ⚠️ Filtre por UUID (`user_id` que não bate com o formato do Supabase Auth
+# é fixture de teste esquecida — ver incidente 2026-08-18 ~22h18 em
+# ROBO_E_SUPORTE.md). O runtime tem um guard (`_is_valid_account_user_id`
+# em backend/robot_runtime_main.py) que recusa subir worker para essas,
+# mas republicar `start` só para elas é trabalho perdido e, se o guard
+# algum dia for removido/quebrado, é exatamente o que sufocou o
+# `_call_gate` por 40+ min. Ao achar alguma, corrija a causa:
+#   PATCH robot_states?user_id=eq.<id> {"enabled": false}
+# Confirme a criação de cada worker pelo log (não pelo snapshot):
+#   docker logs robot-runtime --since 1m | rg -c "WORKER_CREATED|WORKER_ALREADY_RUNNING"
+# Validar: zero `PoolTimeout` / `ativas=100` e vários `SHARED_MARKET_CACHE_HIT`.
+#
+# `scripts/deploy-robot-runtime.sh` (atualizado 2026-08-18 ~23h10) já faz
+# tudo isso automaticamente: espera aparecer
+# `[ROBOT_RUNTIME] subscribed channel=robot:cmd` no log ANTES de publicar
+# (em vez de um sleep fixo, que se mostrou insuficiente quando há muitos
+# usuários restaurados no boot — 286 states levaram ~36s até o subscribe
+# na recorrência de 23h09), filtra `user_id` não-UUID com aviso em vez de
+# religar, e republica automaticamente quem não confirmou `WORKER_CREATED`/
+# `WORKER_ALREADY_RUNNING` na primeira tentativa. Prefira sempre o script
+# ao invés de publicar manualmente em rajada.
+# A partir de 2026-08-18 o runtime recicla o client **somente** em PoolTimeout
+# (`[BULLEX_HTTP_CLIENT_RECYCLE]`). Recycle em ConnectTimeout piora o handshake.
+# Compra REAL usa pool HTTP próprio (não o semáforo dos candles) e timeout 45s.
+# Se o overlay falhar com TEMPORARY_UNAVAILABLE e o bullex-service tiver
+# REAL BUY SUCCESS no mesmo segundo, ver ROBO_E_SUPORTE.md (incidente 18/08 15:31).
 docker compose -p elcapooneline ps
 curl -sS http://127.0.0.1:8080/health
 curl -sS https://api.elcapobot.online/health
@@ -186,6 +260,20 @@ print(r.json().get('ok'), r.json().get('error'))
 ## DNS
 
 Ver [`DNS.md`](./DNS.md) — tabela pronta para enviar ao responsável do domínio.
+
+## Ambiente staging (teste de estratégia)
+
+Há um segundo sistema isolado em `/opt/elcapo2` no domínio `elcapo2.shop`
+(gateway na porta `8081`, compose `elcapo2staging`). Use-o para testar
+estratégias sem tocar em produção. Banco Supabase **deve ser outro projeto**.
+
+Guia completo: [`STAGING_ELCAPO2.md`](./STAGING_ELCAPO2.md) · DNS:
+[`DNS_ELCAPO2.md`](./DNS_ELCAPO2.md).
+
+```bash
+/opt/elcapo2/scripts/deploy-backend.sh
+curl -sS http://127.0.0.1:8081/health
+```
 
 ## Rollback rápido
 

@@ -94,12 +94,14 @@ class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
         # Client keep-alive compartilhado: limpar entre testes para o patch
         # de ``httpx.AsyncClient`` ser honrado em ``get_bullex_http_client``.
         main._bullex_http_client = None
+        main._bullex_order_http_client = None
 
     def tearDown(self) -> None:
         main.auto_trader = self.old_trader
         main.session_response_cache.clear()
         main.active_users.clear()
         main._bullex_http_client = None
+        main._bullex_order_http_client = None
 
     @staticmethod
     def cache_account(user_id: str, *, balance: float = 42.5) -> None:
@@ -471,14 +473,14 @@ class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["error"], "INSUFFICIENT_BALANCE")
         self.assertEqual(
             payload["message"],
-            "Você está sem saldo para iniciar. Faça um depósito na BullEx.",
+            "Saldo insuficiente. Faça um depósito na BullEx ou reduza o valor da entrada.",
         )
         self.assertEqual(payload["data"]["status"], "INSUFFICIENT_BALANCE")
         self.assertFalse(payload["data"]["enabled"])
         self.assertFalse(payload["data"]["worker_running"])
         self.assertEqual(
             payload["data"]["status_message"],
-            "Você está sem saldo para iniciar. Faça um depósito na BullEx.",
+            "Saldo insuficiente. Faça um depósito na BullEx ou reduza o valor da entrada.",
         )
         worker_start.assert_not_called()
         self.assertNotIn(user_id, main.robot_tasks)
@@ -653,7 +655,7 @@ class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
         state.connected = True
         state.active_mode = "REAL"
         state.connection_checked_at = main.utc_now()
-        state.entry_value = 10
+        state.entry_value = 5
 
         with (
             patch.object(
@@ -666,8 +668,8 @@ class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "connected": True,
                                 "active_mode_from_bullex": "REAL",
-                                "balance_real": 5,
-                                "balance": 5,
+                                "balance_real": 4,
+                                "balance": 4,
                                 "mode": "REAL",
                             }
                         ),
@@ -683,7 +685,7 @@ class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"], "INSUFFICIENT_BALANCE")
-        self.assertEqual(payload["message"], "Seu saldo é menor que o valor da entrada.")
+        self.assertEqual(payload["message"], "Seu saldo é menor que o valor da entrada. Deposite ou diminua a entrada.")
         self.assertEqual(payload["data"]["status"], "INSUFFICIENT_BALANCE")
         self.assertFalse(payload["data"]["enabled"])
         self.assertFalse(payload["data"]["worker_running"])
@@ -696,7 +698,7 @@ class GatewayFastFallbackTests(unittest.IsolatedAsyncioTestCase):
         state.connected = True
         state.active_mode = "REAL"
         state.connection_checked_at = main.utc_now()
-        state.entry_value = 2
+        state.entry_value = 5
 
         with (
             patch.object(

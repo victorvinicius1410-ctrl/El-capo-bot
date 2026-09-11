@@ -153,13 +153,15 @@ Ativos do seletor/pool aleatório: apenas **forex OTC** permitidos no robô
 binário (ex.: EURUSD-OTC). Cripto (BTC/ETH) não entra — não há payout digital
 nesse catálogo e quebrava a geração.
 
-O backend **substitui** o histórico, embaralha WIN/LOSS, atribui `created_at`
-espaçados pela cadência do período com jitter leve (±20%) e sincroniza o robô.
-Limite: 100 operações por geração.
+O backend **acrescenta** as operações geradas ao histórico existente (não
+apaga linhas antigas de `/history` nem de `marketing_simulated_trades`),
+embaralha WIN/LOSS do lote novo, atribui `created_at` espaçados pela cadência
+do período com jitter leve (±20%) e atualiza só o **placar do overlay** para
+o lote gerado. Limite: 100 operações por geração.
 
-Depois de gerar o placar no Shift+O, novas operações ao vivo **somam** o
-resultado real em cima desse placar (não substituem o histórico editável até
-um novo “Gerar” ou edição manual).
+Operações ao vivo continuam **somando** o resultado real em cima do placar
+atual. “Nova operação” no Shift+O também só cria a linha e soma no placar —
+nunca zera o histórico persistido.
 
 ## Arquivos principais
 
@@ -182,7 +184,8 @@ Endpoints `/marketing-simulation/*` exigem sessão marketing. `company_id` e
 - `POST /marketing-simulation/trades` — gera trade (`201`); body opcional:
   `amount`, `payout`, `asset`, `direction`, `result`, `created_at` (ISO8601;
   se omitido, usa o instante atual)
-- `POST /marketing-simulation/generate-history` — substitui o histórico (`201`);
+- `POST /marketing-simulation/generate-history` — **acrescenta** operações (`201`)
+  e aplica um placar novo no overlay; **não** apaga o histórico antigo.
   body: `wins`, `losses`, `amount` (valor de entrada), `period` (`M1`|`M5`|`M15`),
   `asset` opcional; `payout` opcional (se omitido, consulta Bullex)
 - `GET /marketing-simulation/history` — lista (`200`)
@@ -213,6 +216,11 @@ npm test
 
 ## Histórico
 
+- **2026-08-16** — Simular operação / gerar placar **não apaga** o histórico
+  antigo (`robot_trade_history`). O sync faz upsert das linhas novas e o
+  overlay recebe o placar do lote (gerar) ou soma a operação avulsa (criar).
+  A exclusão continua pontual. Incidente: conta Sergio Romero ficou só com
+  operações de 16/08 após um generate que fazia `clear_trade_history`.
 - **2026-08-07** — `POST /robot/start` em conta marketing auto-zera o placar
   (`reset_score` / `stop_reset_at`) quando Stop Win/Loss (placar ou histórico
   do Shift+O) bloquearia o start — corrige 403 `STOP_*_HIT`. Teste:

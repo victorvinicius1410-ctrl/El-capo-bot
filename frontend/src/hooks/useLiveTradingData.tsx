@@ -1,9 +1,17 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import { ApiError, bullexApi, robotState as fetchRobotState, robotSyncConnection, type BullExAccount } from "@/lib/api";
 import {
   getStoppedRobotState,
+  isRobotOperationRunning,
+  mergeRobotSessionScore,
   normalizeRobotState,
+  preserveRobotSessionScore,
   registerRobotStateFailure,
   resetRobotStateBackoff,
   robotStateRefetchInterval,
@@ -12,10 +20,17 @@ import {
 } from "@/lib/robotState";
 import { rememberRobotSettingsFromState } from "@/lib/robotSettings";
 import { connectRobotStateWs } from "@/lib/robotStateWs";
+import { isManualBullexDisconnectActive } from "@/lib/manualBullexDisconnect";
 import { useBullExAccountQuery } from "./useBullExAccount";
 import { useEnsureBullexSession } from "./useEnsureBullexSession";
+import {
+  clearSessionScoreAuthority,
+  markSessionScoreAuthority,
+  resolveSessionScoreGate,
+} from "@/lib/sessionScoreAuthority";
 
 export type { RobotState, RobotTrade } from "@/lib/robotState";
+export { isRobotOperationRunning } from "@/lib/robotState";
 
 export const BULLEX_STATUS_QUERY_KEY = ["bullex-status"] as const;
 export const ROBOT_STATE_QUERY_KEY = ["robot-state"] as const;
@@ -71,7 +86,7 @@ function useBullExStatusQuery({
   });
 }
 
-function applyRobotStateSideEffects(userId: string, normalized: RobotState): void {
+export function applyRobotStateSideEffects(userId: string, normalized: RobotState): void {
   rememberRobotSettingsFromState(userId, {
     entryValue: normalized.entry_value ?? undefined,
     stopWin: normalized.stop_win ?? undefined,
@@ -91,6 +106,99 @@ function applyRobotStateSideEffects(userId: string, normalized: RobotState): voi
   });
 }
 
+export interface ApplyRobotMutationOptions {
+  /** True só em POST /robot/reset-score — permite gravar placar 0-0. */
+  allowBlankOverwrite?: boolean;
+}
+
+function commitRobotStateToCache(
+  queryClient: QueryClient,
+  userId: string,
+  incoming: RobotState,
+  options?: ApplyRobotMutationOptions,
+): RobotState {
+  const previous = queryClient.getQueryData<RobotState>([...ROBOT_STATE_QUERY_KEY, userId]);
+  if (options?.allowBlankOverwrite) {
+    // "Reiniciar placar" substitui qualquer baixa anterior.
+    clearSessionScoreAuthority(userId);
+  }
+  const gate = resolveSessionScoreGate(userId, previous, incoming);
+  const withScore = preserveRobotSessionScore(previous, incoming, {
+    ...options,
+    allowScoreDecrease: gate.allowScoreDecrease,
+    forceScorePreserve: gate.rejectAsStale,
+  });
+  const safeState = isManualBullexDisconnectActive()
+    ? {
+        ...withScore,
+        ...getStoppedRobotState(true),
+        wins: withScore.wins,
+        losses: withScore.losses,
+        profit: withScore.profit,
+      }
+    : withScore;
+  applyRobotStateSideEffects(userId, safeState);
+  resetRobotStateBackoff(userId);
+  queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], safeState);
+  return safeState;
+}
+
+/**
+ * Aplica o payload de POST /robot/start|stop|reset-score no cache do React Query.
+ *
+ * Evita `await refetch()` (RTT extra + risco de ler snapshot Redis antigo
+ * antes do publish do controle). O WS/refetch em background sincronizam depois.
+ *
+ * Start/stop **não** substituem um placar vivo por 0-0 (snapshot de controle
+ * do gateway). Só `allowBlankOverwrite` (Reiniciar placar) zera o overlay.
+ *
+ * @param queryClient - Cliente React Query do painel
+ * @param userId - Usuário autenticado
+ * @param payload - `data` da resposta da mutação (ou envelope completo)
+ * @param options - `allowBlankOverwrite` no reset de placar
+ * @returns Estado canônico gravado no cache
+ */
+export function applyRobotMutationToCache(
+  queryClient: QueryClient,
+  userId: string,
+  payload: unknown,
+  options?: ApplyRobotMutationOptions,
+): RobotState {
+  return commitRobotStateToCache(queryClient, userId, normalizeRobotState(payload), options);
+}
+
+/**
+ * Aplica o placar do Shift+O no overlay imediatamente.
+ *
+ * Generate/create não devolvem `POST /robot/*`; sem isto o Redis/WS ainda
+ * 0-0 apagam o visual até o runtime receber `apply_score`.
+ *
+ * @param queryClient - Cliente React Query do painel
+ * @param userId - Usuário autenticado
+ * @param score - Wins/loss/lucro do lote gerado ou da operação avulsa
+ * @param options.accumulate - True em "Nova operação"
+ * @param options.subtract - True na exclusão do histórico
+ * @returns Estado gravado no cache
+ */
+export function applyRobotSessionScoreToCache(
+  queryClient: QueryClient,
+  userId: string,
+  score: { wins: number; losses: number; profit: number },
+  options?: { accumulate?: boolean; subtract?: boolean },
+): RobotState {
+  const previous = queryClient.getQueryData<RobotState>([...ROBOT_STATE_QUERY_KEY, userId]);
+  const merged = mergeRobotSessionScore(previous, score, options);
+  // Exclusão (ou lote do Shift+O que baixa o total) é queda PEDIDA: sem
+  // registrar, o `preserveRobotSessionScore` do poll/WS seguinte rejeitaria o
+  // placar já corrigido pelo servidor e a operação voltava ao El Capo.
+  if (previous && merged.wins + merged.losses < previous.wins + previous.losses) {
+    markSessionScoreAuthority(userId, previous, merged);
+  }
+  applyRobotStateSideEffects(userId, merged);
+  queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], merged);
+  return merged;
+}
+
 function useRobotStateQuery(
   userId: string | null | undefined,
   isDocumentVisible: boolean,
@@ -107,10 +215,7 @@ function useRobotStateQuery(
       onClose: () => setRobotStateWsLive(false),
       onError: () => setRobotStateWsLive(false),
       onState: (data) => {
-        const normalized = normalizeRobotState(data);
-        applyRobotStateSideEffects(userId, normalized);
-        resetRobotStateBackoff(userId);
-        queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], normalized);
+        commitRobotStateToCache(queryClient, userId, normalizeRobotState(data));
       },
     });
     return () => {
@@ -127,15 +232,31 @@ function useRobotStateQuery(
       if (!response.ok) {
         if (response.code === "SESSION_NOT_FOUND" || response.code === "SESSION_DISCONNECTED") {
           resetRobotStateBackoff(userId);
-          return getStoppedRobotState(true);
+          const previous = queryClient.getQueryData<RobotState>([...ROBOT_STATE_QUERY_KEY, userId]);
+          return preserveRobotSessionScore(previous, getStoppedRobotState(true));
         }
         registerRobotStateFailure(userId);
         throw new ApiError(response.error, response.code);
       }
       resetRobotStateBackoff(userId);
-      const normalized = normalizeRobotState(response.data);
-      applyRobotStateSideEffects(userId, normalized);
-      return normalized;
+      const previous = queryClient.getQueryData<RobotState>([...ROBOT_STATE_QUERY_KEY, userId]);
+      const fresh = normalizeRobotState(response.data);
+      const gate = resolveSessionScoreGate(userId, previous, fresh);
+      const normalized = preserveRobotSessionScore(previous, fresh, {
+        allowScoreDecrease: gate.allowScoreDecrease,
+        forceScorePreserve: gate.rejectAsStale,
+      });
+      const safeState = isManualBullexDisconnectActive()
+        ? {
+            ...normalized,
+            ...getStoppedRobotState(true),
+            wins: normalized.wins,
+            losses: normalized.losses,
+            profit: normalized.profit,
+          }
+        : normalized;
+      applyRobotStateSideEffects(userId, safeState);
+      return safeState;
     },
     enabled: Boolean(userId),
     refetchInterval: (query) =>
@@ -166,12 +287,17 @@ function accountLooksConnected({
   accountStatus?: BullExStatusData;
   connectionStatusSource?: string | null;
 }): boolean {
+  // Desconectar Bullex: não reconciliar o robô como "conectado" nem disparar
+  // sync — o snapshot Redis/WS pode ainda dizer connected=true por alguns s.
+  if (isManualBullexDisconnectActive()) return false;
   if (connectionStatusSource === "cached_grace") return true;
   const status = accountStatus?.status?.toLowerCase();
   if (status === "connected") return true;
   if (account?.connected === true) return true;
   // Backoff: não tratar como offline se ainda temos snapshot de conta.
-  if (status === "backoff") return account?.connected === true;
+  // O caso conectado já retornou acima, então aqui `connected` só pode ser
+  // false/undefined — comparar com `true` era expressão sempre falsa.
+  if (status === "backoff") return false;
   if (account?.connected === false || account?.status === "disconnected") return false;
   return false;
 }
@@ -247,6 +373,7 @@ export function LiveTradingDataProvider({
   useEnsureBullexSession({
     userId,
     connected,
+    robotEnabled: Boolean(robotStateQuery.data?.enabled),
     accountLoading: account.isLoading,
     statusLoading: accountStatus.isLoading,
   });

@@ -9,13 +9,14 @@ para cliente, trial e marketing.
 
 ## Filtros de período
 
-| Botão | `days` | Escopo |
-|-------|--------|--------|
-| Hoje | 1 | Dia corrente |
-| 7 dias | 7 | Última semana |
-| 30 dias | 30 | Último mês |
+Seletor no estilo do Gerenciador de Anúncios da Meta (`DashboardDateFilter`):
+presets + calendário de dois meses + **Atualizar**.
 
-Dados via `GET /robot/history?days=` e `GET /robot/stats?days=` (refresh 30s).
+O `days` enviado a `GET /robot/history` é o recuo até hoje (máx. 90). A tabela
+e os cards filtram no cliente o intervalo escolhido (hoje, ontem, mês passado,
+personalizado).
+
+Detalhes: [`FILTRO_DATAS.md`](./FILTRO_DATAS.md).
 
 ## Cards de resumo
 
@@ -38,6 +39,27 @@ Telemetria persistida em `robot_trade_history.analysis_json` via
 denormalizadas: `backend/migration_named_strategies_analysis.sql`.
 
 Ver também: [`ESTRATEGIAS_NOMEADAS.md`](./ESTRATEGIAS_NOMEADAS.md).
+
+## Gale (martingale): cada entrada é uma linha própria
+
+Quando o Gale está ativo (`martingale_steps > 1`) e a primeira entrada perde,
+o robô lança uma nova ordem (valor multiplicado) na mesma direção. As **duas**
+entradas ficam registradas como linhas **separadas** no histórico, cada uma
+com o `Resultado` real dela — a primeira sempre `LOSS`, a segunda o resultado
+real da corretora (`WIN`/`LOSS`/`DRAW`).
+
+**Importante:** o *badge* de resultado do overlay/placar ao vivo (Visão geral)
+reflete só o resultado da **última** entrada do ciclo (`cycle_result`), não o
+lucro líquido do ciclo. Ou seja: 1ª entrada `LOSS` + Gale `WIN` mostra "WIN" no
+overlay mesmo que o multiplicador do Gale não cubra 100% da perda anterior
+(depende do payout do ativo no momento). Para conferir o resultado líquido
+real de uma sequência de Gale, some a coluna **Lucro/Prejuízo** das duas
+linhas na tabela — não olhe só o rótulo **Resultado** da última.
+
+Isso já gerou relatos de lead ("a operação foi loss e apareceu win") quando na
+verdade era uma sequência Gale sendo lida como uma operação só. Ver também a
+investigação de isolamento de sessão no resultado da ordem em
+[`ROBO_E_SUPORTE.md`](./ROBO_E_SUPORTE.md) §9 (2026-08-07).
 
 ## Conta marketing + Shift+O
 
@@ -81,9 +103,10 @@ próximo carregamento da tela (F5) ou depois de um restart:
 Regra: **toda** exclusão ou sincronização de histórico precisa alinhar as três.
 
 - `delete_marketing_robot_history_item` remove a operação nas três.
-- `sync_marketing_display_to_robot` reescreve `robot_trade_history`, limpa o
-  espelho de restauração e substitui a memória (`auto_trader.replace_history`)
-  pela lista sincronizada.
+- `sync_marketing_display_to_robot` faz **upsert** das operações simuladas
+  em `robot_trade_history` e **mescla** a memória do `auto_trader`. Não chama
+  mais `clear_trade_history` / `clear_finished_trades` — o histórico antigo
+  permanece. O overlay recebe o placar do lote (gerar) ou soma (criar).
 
 ## Operação ao vivo espelhada no Shift+O
 
@@ -120,6 +143,16 @@ Para limpar histórico junto com o ciclo, use o fluxo de
 
 ## Histórico
 
+- **2026-08-16 (simular sem apagar histórico)** — Generate/create de marketing
+  deixam de zerar `robot_trade_history`. Ver `MARKETING_SIMULATION.md`.
+- **2026-08-07 (revisão visual WIN/LOSS + isolamento de sessão)** — Leads
+  relataram operação perdida aparecendo como WIN. Auditoria de 500 operações
+  reais não achou `result`/`profit` inconsistentes, mas achou e corrigiu uma
+  falha de desenho real (`socket_option_closed`/`order_binary` globais entre
+  sessões no `bullex-service` — ver `ROBO_E_SUPORTE.md` §9 e
+  `PERFORMANCE_SISTEMA.md`). Documentado também que o badge do overlay em
+  sequências de Gale reflete só a última entrada, não o líquido do ciclo
+  (ver seção "Gale" acima).
 - **2026-08-03 (lixeira em tela pequena)** — Shift+O ganhou abas Manual /
   Placar / Histórico; coluna Ações sticky à esquerda em `/history`. Ver
   `MARKETING_SIMULATION.md`.

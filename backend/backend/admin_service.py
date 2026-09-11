@@ -892,6 +892,7 @@ class AdminManagementService:
         if account_type == AccountType.TRIAL:
             if trial_days is not None:
                 record.expires_at = now + timedelta(days=trial_days)
+                record.plan_name = f"Teste grátis ({trial_days} dias)"
             record.grant_access = bool(record.expires_at and record.expires_at > now)
         elif account_type == AccountType.CLIENT:
             record.expires_at = None

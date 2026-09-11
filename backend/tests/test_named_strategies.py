@@ -4,6 +4,24 @@ from __future__ import annotations
 
 import unittest
 
+from backend import signal_engine
+
+_VERTEX_ORIGINAL = signal_engine.VERTEX_ENABLED
+
+
+def setUpModule() -> None:
+    """Desliga a Vertex: aqui se testa o motor clássico.
+
+    `VERTEX_ENABLED` vem do ambiente na importação. Com ela ligada o override
+    carimba `confidence_model_version="vertex-v1"` e devolve WAIT fora do
+    extremo, e estes testes falhariam por um motivo que não é o deles.
+    """
+    signal_engine.VERTEX_ENABLED = False
+
+
+def tearDownModule() -> None:
+    signal_engine.VERTEX_ENABLED = _VERTEX_ORIGINAL
+
 from backend.named_strategies import (
     STRATEGY_CANDLE_FLOW,
     STRATEGY_EXHAUSTION_REVERSAL,
@@ -149,7 +167,13 @@ class NamedStrategyDetectionTests(unittest.TestCase):
 
 class NamedStrategyQualityGateTests(unittest.TestCase):
     def test_analyze_signal_uses_classic_strategy_without_named_fields(self) -> None:
-        """Com backup-classic ativo, analyze_signal não anexa estratégias nomeadas."""
+        """Sem `NAMED_STRATEGIES`, o clássico não anexa campos de estratégia.
+
+        Ligado (padrão do sistema 02 desde 04/09), `analyze_signal` anota
+        `strategy_key`/`named_strategies` em toda análise — é assim que o
+        resultado fica atribuível por estratégia no histórico. A anotação
+        acontece mesmo quando nenhuma estratégia libera a entrada.
+        """
         candles = _up_trend(40)
         signal = analyze_signal(
             "EURUSD-OTC",
@@ -159,8 +183,10 @@ class NamedStrategyQualityGateTests(unittest.TestCase):
             payout=90,
         )
         self.assertEqual(signal.get("confidence_model_version"), "backup-classic")
-        self.assertNotIn("strategy_key", signal)
-        self.assertNotIn("named_strategies", signal)
+        # A anotação acontece sempre; o que o flag controla é se alguma
+        # estratégia pode LIBERAR uma entrada que o portão clássico barrou.
+        self.assertIn("named_strategies", signal)
+        self.assertIsInstance(signal["named_strategies"], list)
 
 
 if __name__ == "__main__":

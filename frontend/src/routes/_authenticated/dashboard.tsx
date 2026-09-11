@@ -31,7 +31,8 @@ import {
   isBullExDisconnected,
 } from "@/lib/bullexConnection";
 import { useBullExLoginState } from "@/lib/bullexLoginState";
-import { aggregateDashboardDailyRows } from "@/lib/dashboardDailyStats";
+import { aggregateDashboardDailyRows, filterHistoryByRange } from "@/lib/dashboardDailyStats";
+import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
 import { useAuth } from "@/lib/useAuth";
 
 export const Route = createFileRoute("/_authenticated/dashboard")({
@@ -42,6 +43,9 @@ export const Route = createFileRoute("/_authenticated/dashboard")({
 function Dashboard() {
   const { user } = useAuth();
   const [days, setDays] = useState<RobotHistoryDays>(7);
+  const [range, setRange] = useState<DateRangeValue>(() =>
+    rangeFromPreset("last_7", new Date(), 90),
+  );
   const { account, accountStatus, robotState } = useLiveTradingData();
   const history = useRobotHistory(days);
   const loginFlow = useBullExLoginState(user?.id);
@@ -87,8 +91,13 @@ function Dashboard() {
   const mode = acc?.mode ?? "-";
 
   const dailyRows = useMemo(
-    () => aggregateDashboardDailyRows(history.data ?? [], currency, mode),
-    [history.data, currency, mode],
+    () =>
+      aggregateDashboardDailyRows(
+        filterHistoryByRange(history.data ?? [], range.start, range.end),
+        currency,
+        mode,
+      ),
+    [history.data, currency, mode, range.start, range.end],
   );
 
   const periodResult = dailyRows.reduce((sum, row) => sum + row.result, 0);
@@ -195,7 +204,12 @@ function Dashboard() {
 
           <DashboardDateFilter
             days={days}
-            onChange={setDays}
+            value={range}
+            maxDays={90}
+            onChange={(nextDays, nextRange) => {
+              setDays(nextDays);
+              setRange(nextRange);
+            }}
             isFetching={history.isFetching && !history.isLoading}
           />
         </div>

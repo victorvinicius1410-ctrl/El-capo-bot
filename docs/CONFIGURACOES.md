@@ -44,8 +44,8 @@ Publish deve copiar `public/branding/` para `/var/www/elcapobot/branding/`.
 | Campo | Opções / regra |
 |---|---|
 | Timeframe | M1 / M5 / M15 (monitoramento contínuo por vela; compra 0–5s) |
-| Mercado | OTC / Aberto (cadeado + “Abre em X horas” quando forex fechado) / Ambos (opera sempre em OTC) |
-| Valor por entrada | ≥ R$ 5 (default 5) |
+| Mercado | OTC / Aberto (cadeado + “Abre em X horas” quando forex fechado) / Ambos (com forex aberto: OTC **e** aberto; fechado: só OTC) |
+| Valor por entrada | Mínimo na moeda do saldo: **R$ 5** (BRL) ou **US$ 1** (USD), **sem teto**. Ver `VALOR_ENTRADA.md`. |
 | Stop Win / Stop Loss | Modo **Por valor** (≥ R$ 5) ou **Por operações** (≥ 1 WIN/LOSS). Ver `STOP_WIN_LOSS.md`. |
 | Gale | on/off + quantidade + multiplicador |
 | Ações | Salvar configurações · Iniciar/Parar robô |
@@ -71,6 +71,27 @@ Ver `MARKETING_SIMULATION.md`: a conta marketing usa o mesmo layout de
 configurações. Diferenças: Shift+O para editar métricas; operações ao vivo
 mostram WIN/LOSS real no placar (`marketing_win_rate` só no AUTO do Shift+O).
 
+## Crash Safari/iOS no celular (`Um problema ocorreu repetidamente`)
+
+Sintoma (2026-08-29): ao tocar em **Configurações** no iPhone (Safari), a aba
+fechava com “Um problema ocorreu repetidamente em
+`https://app.elcapobot.online/configuracoes?secao=conta`”.
+
+Causa: a atmosfera visual (`.config-atmosphere`) montava dezenas de camadas
+com `filter: blur(44–64px)`, `mix-blend-mode: screen`, `perspective` +
+animações infinitas. No WebKit mobile isso estoura o processo da página
+(GPU/memória), especialmente junto ao overlay do robô (canvas + filtros).
+
+Correção:
+
+| Camada | Mudança |
+|--------|---------|
+| `configuracoes.tsx` | `useLiteConfigAtmosphere` (`matchMedia max-width: 767px`) — no mobile monta só gradiente + vinheta (`config-atmosphere-lite`) |
+| `styles.css` | `@media (max-width: 767px)` **fora de `@layer`** (o bundler descartava o bloco aninhado): esconde aurora/orbs/grid/sparks, remove `backdrop-filter` das tabs e desliga shimmer/sheen |
+| Teste | `src/lib/configuracoesMobile.test.ts` |
+
+Desktop (≥768px) mantém a atmosfera completa.
+
 ## Flicker "Desconectado" ao entrar/sair desta aba
 
 Sintoma (2026-08-07): ao abrir Conta Corretora ou voltar ao Dashboard, o pill
@@ -93,6 +114,17 @@ Ver também `ROBO_E_SUPORTE.md` §4 e `BULLEX_CREDENCIAIS.md`.
 
 ## Histórico
 
+- **2026-08-29** — Safari/iOS: crash ao abrir Configurações no celular
+  (atmosfera com blur/animações). Atmosfera leve no mobile. Ver seção acima.
+- **2026-08-16** — Só mínimo de entrada (R$ 5 / US$ 1); sem teto.
+  Ver `VALOR_ENTRADA.md`.
+- **2026-08-15** — Valor de entrada limitado a R$ 5 (BRL) ou US$ 1 (USD),
+  na moeda do saldo. Ver `VALOR_ENTRADA.md`.
+- **2026-08-13** — "Pare o robô antes de alterar configurações" no diálogo
+  Iniciar operação com overlay já parado (split-brain gateway vs Redis após
+  Stop Win/Loss). Ver `INICIAR_PARAR_OPERACAO.md`.
+- **2026-08-12** — Desconectar Bullex voltava a "Conectado" por snapshot Redis
+  stale (TTL 600s) + UI ignorando marca manual. Ver `BULLEX_CREDENCIAIS.md`.
 - **2026-08-07 (noite — Desconectar stuck)** — Botão Desconectar parecia
   não funcionar (cache REAL + auto-reconnect + syncing). Ver
   `BULLEX_CREDENCIAIS.md` (incidente disconnect).
@@ -102,6 +134,11 @@ Ver também `ROBO_E_SUPORTE.md` §4 e `BULLEX_CREDENCIAIS.md`.
   `BULLEX_CREDENCIAIS.md` (incidente).
 - **2026-08-07 (noite — flap visual Configurações)** — Corrige Desconectado
   fantasma + atraso de email/saldo ao entrar/sair da aba. Ver seção acima.
+- **2026-08-19** — Aberto com payout timeout (cache vazio) também faz
+  fallback OTC após 3 ciclos sem entrada. Ver `MERCADO_ABERTO.md`.
+- **2026-08-15** — Ambos com forex aberto varre OTC **e** mercado aberto.
+  Aberto com turbo fechado faz fallback OTC para o robô não parar. Ver
+  `MERCADO_ABERTO.md`.
 - **2026-08-07 (noite)** — **Iniciar robô** não bloqueia mais por
   `connected` do poll (backoff/cache falso após stop). O `POST /robot/start`
   valida a Bullex. Ver `ROBO_E_SUPORTE.md`.

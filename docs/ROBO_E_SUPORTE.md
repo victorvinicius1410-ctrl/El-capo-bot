@@ -1,7 +1,7 @@
 # Robô El Capo — Operação contínua, cadência e sessão de suporte
 
 Documento de referência das regras de operação do robô e do modo suporte
-(admin acessando conta de outro usuário). Atualizado em **2026-08-07**.
+(admin acessando conta de outro usuário). Atualizado em **2026-08-21**.
 
 ## 1. Cadência de análise contínua por timeframe
 
@@ -34,6 +34,14 @@ inteira de uma vez (isso fazia perder a janela e o robô “parava” de
 pegar operações após alguns acertos). Em 2026-08-04 a janela passou de
 0–5s para 0–8s para absorver latência de refresh/canal
 (`[ENTRY_WINDOW_MISSED]` em ~6,3s).
+
+**2026-08-21 — relógio não pode adiantar a compra:** entre polls o worker
+estima o horário Bullex (`server_time` + elapsed desde
+`server_time_sampled_at`). Estimativa **não** vira nova âncora
+(`persist_server_clock=False`); amostra absoluta a cada ≤45s
+(`SERVER_CLOCK_RESAMPLE_SECONDS`). Sem isso o drift composto abria a
+janela 0–8s no meio da vela (~45s antes do close no M1). Detalhes:
+`ANALISE_CONTINUA.md` §3.
 
 Sem padrão aprovado, o robô agenda a **próxima janela de análise** da
 vela (não espera minutos extras). Falhas operacionais (candles/sessão)
@@ -179,6 +187,230 @@ Logs úteis (isolamento multi-sessão): `[ACTIVE_MODE_RECOVERED]`, `[ACTIVE_MODE
 
 Testes: `tests/test_real_balance_isolation.py` +
 `tests.test_persistence_restore.SessionPersistenceTests`.
+
+### Overlay “analisando” sem comprar — ANALYSIS_TIMEOUT + pool httpx (2026-08-11)
+
+Sintoma: **vários** clientes com robô ligado, pill Conectado / REAL, overlay
+em “El Capo está analisando o mercado” / “Buscando melhor oportunidade”,
+mas **quase nenhuma ordem**. Snapshots Redis (33 robôs `enabled=True`):
+maioria com `last_analysis_result=ANALYSIS_TIMEOUT`, o resto
+`NO_OPPORTUNITY_FOUND`; `last_entry` de dias atrás.
+
+Logs do `robot-runtime` no mesmo segundo:
+
+```
+[BULLEX_POOL_STATS] path=/candles kind=PoolTimeout total=100 ativas=100 ociosas=0
+[UPSTREAM_ERROR_HANDLED] path=/candles reason=timeout
+```
+
+O `bullex-service` respondia `/health` e `/account` (CPU ~1%). As requests
+de candle **não saíam** do runtime — o pool httpx do processo único estava
+cheio. Causa: cache de `/candles`/`/payouts` era **por usuário**; 33 robôs
+M1 no fechamento da vela + `schedule_background_refresh` por hit × usuário
+disparavam centenas de GETs contra `max_connections=100`. O scan sequencial
+estourava o orçamento e `complete_cycle_without_trade(..., ANALYSIS_TIMEOUT)`.
+
+Correção (2026-08-11) em `backend/main.py` (processo do `robot-runtime`):
+
+1. Cache de mercado **do processo** (`_shared_market_cache`) — 1 fetch de
+   EURUSD-OTC serve os 33 robôs.
+2. Lock por `cache_key` (single-flight) no fechamento da vela.
+3. Refresh de fundo **uma vez por ativo**, só com TTL restante ≤ 20s.
+4. Semáforo `BULLEX_HTTP_MAX_INFLIGHT=40` no hop runtime→bullex-service.
+5. Timeout de candle passa a reutilizar o cache compartilhado.
+
+O cache compartilhado que já existia no `bullex-service` (08/08) continua
+válido — ele só não era atingido quando o pool do runtime saturava.
+Detalhe e validação: `PERFORMANCE_SISTEMA.md` (“Cache compartilhado no
+robot-runtime”). Testes: `tests/test_runtime_shared_market_cache.py`.
+
+Deploy: **só** `robot-runtime` com `--no-deps` (não derrubar
+`bullex-service`). Restart do runtime não religa worker sozinho; publicar
+`start` no Redis para quem estava `enabled=True`, ou o cliente clica
+Iniciar. Trava de manutenção (`paused_by_maintenance`) permanece para
+restart sem lista de recuperação.
+
+### Recorrência 2026-08-17/18 — 14h sem operar (pool saturado de novo)
+
+Sintoma relatado pelos clientes: “parado desde ~23h”. VPS, Nginx, gateway
+(`/health` 200) e `bullex-service` (CPU ~1%) estavam ok. 31–32 robôs
+`enabled=true` / `worker_running=true`, overlay em análise.
+
+Linha do tempo (UTC; BRT = UTC−3):
+
+| UTC | BRT | Evento |
+|---|---|---|
+| 17/08 18:47 | 15:47 | Redeploy gateway + runtime |
+| 17/08 18–21h | 15–18h | Operando (cache hit/store, 28 sucessos na hora 21) |
+| **17/08 22:11:00** | **19:11** | Última `[REAL BUY SUCCESS]` |
+| **17/08 22:11:19** | **19:11** | Primeiro `PoolTimeout total=100 ativas=100` |
+| 17/08 23h → 18/08 12h | 20h → 09h | 0 cache, 0 sucesso, ~4 mil `PoolTimeout`/hora |
+| 18/08 12:49 | 09:49 | `docker restart robot-runtime` + PUBLISH `start` |
+
+Causa: o pool httpx do **processo** `robot-runtime` encheu e não devolveu
+conexões. O cache compartilhado (11/08) depende de GET bem-sucedido para
+popular; com timeout em massa o cache zera e cada robô bate de novo no
+pool — espiral. O `_call_gate` da corretora **não** era o gargalo
+(quase nenhuma compra chegou no `bullex-service` depois das 22:11).
+
+Recuperação:
+
+```bash
+# 1) listar enabled no Redis DB1 (robot:snapshot:*)
+# 2) NÃO rebuild / NÃO restart bullex-service
+docker restart robot-runtime
+# 3) esperar [ROBOT_RUNTIME] subscribed channel=robot:cmd
+# 4) para cada user enabled:
+docker exec webhook-redis redis-cli -n 1 PUBLISH robot:cmd \
+  '{"user_id":"<UUID>","action":"start"}'
+```
+
+Pós-restart: 32 workers, `PoolTimeout=0`, `SHARED_MARKET_CACHE_HIT` de
+volta, candidatos e tentativas de ordem. Timeouts residuais
+(`TimeoutError` / `ConnectTimeout`) podem aparecer no aquecimento — não
+confundir com `kind=PoolTimeout ativas=100`.
+
+**O restart das 12:49 UTC não durou.** Às 13:13 UTC o pool encheu outra vez
+(~24 min); das 14h às 17h UTC de novo 0 cache / 0 compras / ~5 mil
+`PoolTimeout`/hora. 37–38 snapshots em `ANALYSIS_TIMEOUT`.
+
+Correção (18/08 ~17:15 UTC), imagem nova **só** do `robot-runtime`:
+
+1. Pool httpx limitado a **40** conexões (igual ao semáforo in-flight).
+2. `recycle_saturated_bullex_http_client`: **somente** `PoolTimeout`
+   descarta o client vazado e abre outro; cooldown 15s. Log:
+   `[BULLEX_HTTP_CLIENT_RECYCLE]`. Reciclar em `ConnectTimeout` com
+   ativas ≥ 32 **piora** o handshake (incidente da tarde de 18/08).
+3. Testes em `tests/test_runtime_shared_market_cache.py`.
+
+Procedimento permanente: `DEPLOY_VPS.md` (restart só do runtime). Reciclar
+o client em processo é a defesa para não precisar restart a cada ~20 min.
+
+### Overlay “analisando” sem comprar — ciclo 110s + recycle agressivo (2026-08-18 tarde)
+
+Sintoma após o deploy das 17:15 UTC: pool **não** voltou a 100/100, cache
+compartilhado voltou (`SHARED_MARKET_CACHE_HIT`), mas **0**
+`[REAL BUY SUCCESS]`. Overlay em “Buscando melhor oportunidade”.
+Quem ligou o robô via painel via `ANALYSIS_TIMEOUT` ou `NO_OPPORTUNITY_FOUND`.
+
+Três falhas empilhadas (não é o pool 100/100 da noite):
+
+1. **Varredura sequencial lenta.** BOTH = ~20 ativos. Cada GET `/candles`
+   em miss levava 8–12s (`ConnectTimeout`). O ciclo estoura
+   `ROBOT_CYCLE_TIMEOUT_SECONDS=110` no meio da lista.
+2. **Sinal achado e descartado.** Log `[ACTIVE_OK] … CALL confidence=100`
+   no mesmo segundo que `[ROBOT_CYCLE_TIMEOUT] action=reschedule`.
+   `complete_cycle_without_trade(..., ANALYSIS_TIMEOUT)` apagava o
+   candidato (`pending_signal` / melhor ativo).
+3. **Compra REAL com timeout de 5s.** As poucas ordens que chegaram a
+   `POST /orders/buy-real` morriam em `BULLEX_TEMPORARY_UNAVAILABLE`
+   (~7s no log) porque herdavam `BULLEX_UPSTREAM_TIMEOUT_SECONDS=5`.
+4. **Recycle agressivo.** `should_recycle` fechava o client em qualquer
+   timeout com ativas ≥ 32. 52 recycles em ~55 min → mais
+   `ConnectTimeout` → mais recycle.
+
+Correção (18/08 ~18:20 UTC), deploy **só** `robot-runtime --no-deps`:
+
+| Peça | Comportamento |
+|---|---|
+| `should_recycle_bullex_http_client` | Só `httpx.PoolTimeout`. `ConnectTimeout` não fecha o client. |
+| `ROBOT_ANALYSIS_ASSET_TIMEOUT_SECONDS=5` | Antes 18s; cabe mais ativos no orçamento de 110s. |
+| `ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS=85` | Corta a lista se o scan já gastou 85s (`[ANALYSIS_SCAN_BUDGET]`). |
+| `[ANALYSIS_EARLY_STOP]` | Primeiro CALL/PUT com `trade_allowed` encerra o scan. |
+| `[ROBOT_CYCLE_TIMEOUT_KEEP_SIGNAL]` | Timeout do ciclo **não** apaga `pending_signal`. |
+| `BULLEX_BUY_TIMEOUT_SECONDS=45` | `POST /orders/buy-real` e `/orders/buy-demo` (antes 20s). |
+| `get_bullex_order_http_client` | Pool HTTP **só** da compra (8 conexões); não disputa o semáforo dos candles. |
+
+Validar:
+
+```bash
+docker logs robot-runtime --since 10m 2>&1 | rg -c "REAL BUY SUCCESS|ANALYSIS_EARLY_STOP|ROBOT_CYCLE_TIMEOUT|BULLEX_HTTP_CLIENT_RECYCLE|BULLEX_TEMPORARY_UNAVAILABLE"
+# esperado: BUY SUCCESS subindo; CYCLE_TIMEOUT caindo; RECYCLE só com kind=PoolTimeout
+```
+
+Testes: `test_connect_timeout_does_not_recycle_http_client`,
+`test_should_recycle_only_on_pool_timeout`,
+`test_buy_real_uses_extended_timeout`,
+`test_buy_real_bypasses_market_http_semaphore`,
+`test_buy_real_uses_dedicated_order_http_client`,
+`test_scan_stops_after_first_trade_allowed`,
+`test_worker_cycle_timeout_keeps_pending_signal`.
+
+### Overlay marca falha mas a BullEx comprou (2026-08-18 ~15:31 BRT)
+
+Sintoma: `[ORDER_SENT]` seguido de `[ORDER_SEND_FAILED] error=BULLEX_TEMPORARY_UNAVAILABLE`.
+No `bullex-service` o mesmo instante tem `[REAL BUY SUCCESS order_id=…]` e HTTP 200.
+
+Causa: o POST `/orders/buy-real` usava o **mesmo** pool/semáforo dos GETs
+`/candles`. No segundo 0–8 da vela M1 os 38 robôs enchem as 40 vagas; a
+compra espera slot, o `wait_for` de 20s estoura **depois** da corretora
+já ter criado a ordem. O overlay mostra erro; a posição existe na BullEx.
+
+Correção (18/08 ~18:45 UTC), deploy **só** `robot-runtime --no-deps`:
+
+| Peça | Comportamento |
+|---|---|
+| `get_bullex_order_http_client` | Pool httpx separado, 8 conexões |
+| Semáforo | Compra **não** entra em `BULLEX_HTTP_MAX_INFLIGHT` |
+| `BULLEX_BUY_TIMEOUT_SECONDS=45` | Cobre a fila do `_call_gate` da corretora (máx. 3) |
+| Log | `[BUY_HTTP_TIMEOUT]` se ainda estourar |
+
+Não reiniciar `bullex-service`. Validar: `REAL BUY SUCCESS` no **runtime**
+alinhado com o mesmo log no `bullex-service`; zero `ORDER_SEND_FAILED` com
+`TEMPORARY_UNAVAILABLE` no mesmo segundo de um SUCCESS da corretora.
+
+### Overlay analisa, acha 100/87 e não gasta — cache fresco carimbado STALE (2026-08-19 ~02h UTC)
+
+Sintoma: conta de teste (e várias outras) com robô ligado, OTC, REAL,
+conectado. Overlay em “Buscando melhor oportunidade”. Última ordem da
+conta de marketing às **22:53 UTC de 18/08**. Depois: dezenas de
+`[BEST_CANDIDATE]` + `[NO_TRADE]`, `consecutive_no_opportunity_cycles` na
+casa das dezenas. A **frota não estava parada** — outras contas compravam
+no mesmo segundo.
+
+Exemplo 02:18:54 UTC:
+
+- Conta `c3d12a6f-…` **comprou** GBPUSD-OTC CALL 100/87.
+- Conta de teste, no mesmo segundo: `[ACTIVE_CACHE] reason=ANALYSIS_TIMEOUT`,
+  `ASSET_SCORE allowed=False`, depois `STRATEGY_FILTER_PASS score=80`,
+  `BEST_CANDIDATE GBPUSD 100/87 fallback=False`, e **`NO_TRADE`**.
+
+Causa: `scan_local_signals` envolve `analyze_active_signal` em
+`asyncio.wait_for(..., ROBOT_ANALYSIS_ASSET_TIMEOUT_SECONDS=5)`. Se o GET
+estoura, o fallback lia o cache (muitas vezes o **compartilhado ainda no
+TTL de 60s** — o mesmo dado que a outra conta usou para comprar) e
+**forçava** `stale=True`, `from_cache=True`, `market_data_stale=True`,
+`trade_allowed=False` + `STALE_MARKET_DATA`.
+`candidate_meets_cycle_threshold` recusa qualquer um desses flags. O
+`STRATEGY_FILTER_PASS` do recovery **não** atravessa esse portão. Resultado:
+sinal perfeito no overlay, zero gasto.
+
+Não é reincidência dos fixtures UUID, do pool httpx 100/100 nem do
+`CALL_GATE_TIMEOUT`. Guard de UUID ok; containers saudáveis.
+
+Correção (19/08 ~02:30 UTC), deploy **só** `robot-runtime --no-deps`:
+
+| Peça | Comportamento |
+|---|---|
+| `resolve_analysis_timeout_cache` | Prefere cache compartilhado fresco; senão cache pessoal. `is_fresh` = candles ainda no TTL. |
+| Timeout + cache fresco | Analisa o sinal **sem** carimbar STALE. Log: `[ACTIVE_CACHE] reason=ANALYSIS_TIMEOUT_FRESH`. `trade_allowed` vem da estratégia. |
+| Timeout + cache expirado (janela stale) | Mantém o bloqueio antigo (`STALE_MARKET_DATA`, `trade_allowed=False`). |
+| Sem cache | Continua `[ACTIVE_TIMEOUT]` como hoje. |
+
+A estratégia clássica **não muda** — só deixa de tratar cache de 60s como
+dado velho só porque o `wait_for` de 5s estourou.
+
+Validar na conta de teste `81c49f33-3995-42ce-a78c-0fd51f90dd12`:
+
+```bash
+docker logs robot-runtime --since 10m 2>&1 | rg "81c49f33|ANALYSIS_TIMEOUT_FRESH|NO_TRADE|ORDER_SENT|ORDER_ACCEPTED"
+# esperado: ANALYSIS_TIMEOUT_FRESH e/ou SIGNAL_FOUND/ORDER_SENT; NO_TRADE
+# deixa de aparecer no mesmo segundo em que outra conta compra o mesmo 100/87
+```
+
+Testes: `test_analysis_timeout_keeps_fresh_cache_tradeable` e
+`test_analysis_timeout_still_blocks_expired_cache` em
+`tests/test_robot_market_data_resilience.py`.
 
 ### Overlay “analisando” sem comprar — WAITING_RECOVERY sob carga (2026-08-07 tarde)
 
@@ -497,7 +729,8 @@ visual da sessão (`wins` / `losses` / `profit` + histórico em memória).
 Para zerar placar **e** histórico (ciclo novo), use
 `POST /robot/reset-cycle` com `reset_score: true`.
 
-Ver `HISTORICO.md`.
+Ver `HISTORICO.md` e `REINICIAR_PLACAR.md` (correção 2026-08-13: Redis +
+cmd ao runtime + cache do painel).
 
 ## 4. Estabilidade da conexão com a corretora (anti-flap)
 
@@ -701,9 +934,10 @@ Endpoints permitidos durante a sessão de suporte (`support_safe_paths` em
 
 - `GET /me/access`, `GET /admin/support-sessions/current`
 - `GET /bullex/account`, `GET /bullex/status`, `GET /bullex/balance`
-- `GET /robot`, `GET /robot/state`, `GET /robot/history` — leitura do painel
-  do robô (adicionados para o dashboard de suporte renderizar; antes esses
-  GETs retornavam 403 e o frontend exibia "This page didn't load")
+- `GET /robot`, `GET /robot/state`, `GET /robot/history`, `GET /robot/stats`
+  — leitura do painel do robô (o dashboard de suporte precisa desses GETs)
+- `GET /robot/ws-ticket` — canal ao vivo do estado do robô (somente leitura;
+  o WS `/ws/robot-state` autentica pelo ticket já emitido para o usuário-alvo)
 - `POST /bullex/connect`, `POST /bullex/disconnect`, `POST /bullex/reconnect`
   (suporte pode reconectar a corretora do cliente)
 - `GET /bullex/credentials`, `DELETE /bullex/credentials`
@@ -711,6 +945,25 @@ Endpoints permitidos durante a sessão de suporte (`support_safe_paths` em
 
 Tudo o mais (ligar/desligar robô, configuração, reset, ordens, websocket de
 gráfico) continua bloqueado com `403 IMPERSONATION_READ_ONLY` e auditado.
+
+### Frontend (AppShell) na sessão de suporte
+
+`POST /admin/impersonations` + `window.location.assign("/dashboard")` recarrega
+o painel como o lead. O dashboard, Configurações e Histórico chamam
+`useLiveTradingData()`.
+
+| Peça | Comportamento em suporte |
+|------|--------------------------|
+| `LiveTradingDataProvider` | **Monta** (senão o hook explode: “precisa ser usado dentro de LiveTradingDataProvider”) |
+| Overlay flutuante do robô | **Oculto** (`shouldShowRobotOverlay` = false) |
+| Overlay “aguardando aprovação” | **Não aparece** — mesmo lead pendente sem `grant_access` |
+| Aba Robô em Configurações | **Oculta** (`canUseRobotControls(false)`) |
+| Rotas | Só `/dashboard`, `/configuracoes`, `/history` |
+
+Helpers em `frontend/src/lib/adminPresentation.ts`:
+`shouldMountLiveTradingProvider`, `shouldShowRobotOverlay`,
+`shouldTreatSessionAsInactive`. Em `/admin/*` o provider continua **desligado**
+(performance). Testes: `adminPresentation.test.ts`.
 
 ## 7. Configuração de valores (entrada, stop win, stop loss)
 
@@ -766,8 +1019,360 @@ Detalhes: `NARRACAO_ROBO.md` e `ANALISE_CONTINUA.md`.
 O backend ainda envia `next_cycle_at` internamente para o worker; o painel
 só esconde o timer nessa fase.
 
+### Saldo insuficiente (aviso na tela)
+
+Se a Bullex rejeitar a compra com `Insufficient funds` (mesmo com
+`balance=None` no cache), o runtime **para** o robô
+(`INSUFFICIENT_BALANCE`) em vez de só marcar `ORDER_REJECTED` e
+continuar o ciclo. Overlay: título **Saldo insuficiente** + pedido de
+depósito ou redução da entrada. Log:
+`[ORDER_REJECTED_INSUFFICIENT_FUNDS]`. Detalhes: `OVERLAY_ROBO.md` §5.
+
+### Placar sumindo no painel
+
+Causas comuns (2026-08-11):
+
+1. Snapshot Redis expirava (TTL curto) e o gateway em modo `external`
+   devolvia `auto_trader` local com placar 0.
+2. Badges WIN/LOSS sem fundo — contraste fraco no dashboard.
+
+Correção: TTL 600s; `rehydrate_score_from_persistence_if_blank` no
+snapshot/HTTP; `/robot/state` prefere snapshot do runtime; badges com
+fundo. Ver `OVERLAY_ROBO.md` §6.
+
 ## 9. Histórico de mudanças
 
+- **2026-08-21 (compra ~45s antes do fechamento da vela)**
+  - Sintoma: usuário via ordem no meio da vela M1 (~45s antes do close),
+    fora da janela 0–8s de abertura.
+  - Causa: `refresh_entry_window` em cache gravava `server_time` estimado
+    sem renovar âncora; cada poll compostava o elapsed e adiantava o
+    relógio da janela de compra.
+  - Correção: `server_time_sampled_at`, `persist_server_clock=False` no
+    path estimado, resample absoluto a cada 45s. Ver §1 e
+    `ANALISE_CONTINUA.md` §3. Deploy: `robot-runtime --no-deps`.
+- **2026-08-19 ~02h UTC (analisa 100/87 e não gasta — STALE em cache fresco)**
+  - Sintoma: overlay “buscando”; conta de teste sem ordem desde 22:53 UTC
+    18/08; outras contas compravam o mesmo GBPUSD CALL 100/87 no mesmo
+    segundo. Log: `ANALYSIS_TIMEOUT` + `BEST_CANDIDATE` + `NO_TRADE`.
+  - Causa: timeout de 5s no `analyze` carimbava `STALE_MARKET_DATA` mesmo
+    com cache compartilhado ainda no TTL de 60s. O portão recusa stale/
+    `from_cache`. Recovery não atravessa.
+  - Correção: `resolve_analysis_timeout_cache`; cache fresco vira
+    `ANALYSIS_TIMEOUT_FRESH` e permanece `trade_allowed` da estratégia.
+    Cache expirado continua STALE.
+  - Testes: `test_analysis_timeout_keeps_fresh_cache_tradeable`,
+    `test_analysis_timeout_still_blocks_expired_cache`.
+- **2026-08-18 (Shift+O gerava histórico e o overlay do El Capo ficava 0-0)**
+  - Sintoma: conta marketing clicava em Gerar histórico do placar; o painel
+    Shift+O listava as operações, mas WIN/LOSS do robô flutuante não mudava.
+  - Causa: `sync_marketing_display_to_robot` atualizava só a memória do
+    gateway. Em `ROBOT_RUNTIME_MODE=external` o overlay lê Redis do runtime,
+    que seguia 0-0. Ver `MARKETING_SIMULATION.md` e `PLACAR_OVERLAY.md`.
+  - Correção: `publish_marketing_score_to_overlay` + cmd `apply_score` no
+    runtime; front aplica o placar no cache na hora.
+- **2026-08-18 (hydrate do runtime falhava com `quote` indefinido)**
+  - Sintoma: após recreate do `robot-runtime`, `action=start` não criava
+    worker (`SESSION_RESTORE_SKIPPED reason=robot_disabled`) e o log tinha
+    `NameError: name 'quote' is not defined` em `load_trade_history`.
+  - Correção: `from urllib.parse import quote` em `robot_persistence.py`.
+- **2026-08-17 (Acessar conta do lead quebrava o dashboard)**
+  - Sintoma: admin clica “Acessar conta”, o console mostra
+    `[AUTH USER CHANGED]` e em seguida
+    `useLiveTradingData precisa ser usado dentro de LiveTradingDataProvider`.
+  - Causa: `mountLiveTrading = !impersonating && …` desmontava o provider
+    assim que `/me/access` marcava `impersonating: true`, mas o dashboard
+    (e Configurações) continuam chamando o hook. Lead pendente ainda caía
+    no overlay de “aguardando aprovação”.
+  - Correção: provider monta na sessão de suporte; overlay do robô e
+    bloqueio de inativo não. `GET /robot/ws-ticket` entra em
+    `support_safe_paths`. Ver §5.
+- **2026-08-13 (Reiniciar placar não zerava no overlay)**
+  - Sintoma: clique em Reiniciar placar e o WIN/LOSS voltava ao valor antigo.
+  - Causa: mode=external — gateway zerava só memória local; Redis/runtime
+    mantinham o placar; front fazia `await refetch` do snapshot stale.
+  - Correção: `publish_robot_control_snapshot` + cmd `reset_score` ao
+    runtime; `applyRobotMutationToCache` no overlay; rehydrate respeita
+    `stop_reset_at`. Ver `REINICIAR_PLACAR.md`.
+- **2026-08-13 (Iniciar/Parar operação demorava no overlay)**
+  - Sintoma: botão Parar/Iniciar atrasava vários segundos; às vezes ficava em
+    Parar com `enabled=false` e `worker_running=true` no Redis.
+  - Causa: em mode=external o painel lia snapshot Redis stale; o stop do
+    runtime não republicava após sair de `robot_tasks`; o front fazia
+    `await refetch` e usava `enabled || worker_running`.
+  - Correção: `publish_robot_control_snapshot` no start/stop; runtime
+    publica stop antes do cancel; front aplica payload da mutação e usa só
+    `enabled` para o botão. Ver `INICIAR_PARAR_OPERACAO.md`.
+  - Testes: `tests/test_robot_control_snapshot.py`,
+    `robotCountdown.test.ts` (`isRobotOperationRunning`).
+- **2026-08-19 ~19:45 UTC (conta marketing em Mercado aberto, 0 ops o dia todo)**
+  - Sintoma: overlay ativo em “Buscando melhor oportunidade”, forex aberto,
+    `enabled=true`, M1 conservative. Última ordem **18/08 22:53 UTC**.
+    `consecutive_no_opportunity_cycles=248`. A frota em OTC comprava.
+  - Causa: `market_mode=OPEN` varria só pares sem `-OTC`. `/payouts`
+    timeoutava (`payout=None`, `PAYOUT_UNAVAILABLE`). O fallback
+    `OPEN_MARKET_NO_CHANNEL_FALLBACK_OTC` só rodava com canal **conhecido
+    fechado**; cache vazio (`known=0`) deixava o robô no aberto para sempre.
+  - Correção: após 3 ciclos sem entrada com `PAYOUT_UNAVAILABLE` (ou cache
+    de canal vazio), o ciclo OPEN varre OTC. Log
+    `reason=payout_unavailable_on_open_assets`. Ver `MERCADO_ABERTO.md`.
+  - Testes: `tests/test_market_mode_assets.py`.
+- **2026-08-18 ~23:40 UTC (conta `victorvinicius@gmail.com` sem ordem após o
+  deploy do guard — não foi reincidência do `_call_gate`)**
+  - Sintoma: dono da conta marketing (`user_id`
+    `81c49f33-3995-42ce-a78c-0fd51f90dd12`) relatou que o El Capo não
+    operava mais desde o ajuste preventivo das 23h05. Última ordem real
+    dessa conta: **22:53 UTC** (LOSS −20). Sessão Bullex **conectada**
+    (`active_mode=REAL`, `/sessions/status` 200).
+  - O sistema **não** estava parado: no mesmo intervalo outras contas
+    tiveram `[SIGNAL_FOUND]` + `[ORDER_SENT]`/`[ORDER_ACCEPTED]` (ex.:
+    GBPJPY-OTC PUT e EURUSD-OTC CALL). Worker da conta marketing estava
+    ligado (`enabled=true`, `worker_running=true`) e gerava
+    `[BEST_CANDIDATE]` (até confidence 100 / payout 87) seguido de
+    `[NO_TRADE]`.
+  - Causa desta conta (não da frota): `market_mode=BOTH` com sessão
+    forex aberta varre ~20 ativos. Com `[ACTIVE_TIMEOUT]` / payout
+    timeout frequentes nesta sessão, o scan ia a 45–90s
+    (`[ANALYSIS_SCAN_BUDGET]`), o candidato ficava abaixo do portão
+    (`trade_allowed` / `strategy_score` / `STALE_MARKET_DATA`) e
+    `resolve_cycle_entry_candidate` devolvia `None` → `[NO_TRADE]`.
+    Contas que operaram no mesmo horário estavam em **OTC** + M1 +
+    conservative. Ver `MERCADO_ABERTO.md`.
+  - Correção operacional (autorizada pelo dono da conta): `PUBLISH
+    robot:cmd stop` → `market_mode=OTC` em `robot_user_settings` +
+    `robot_states.state`/`state_json` → `PUBLISH start`. Worker
+    confirmado com `ANALYSIS_ASSET_QUEUE market_mode=OTC` (10 pares
+    `*-OTC`). Não alterou a estratégia clássica.
+  - Depois do ajuste o robô analisa de novo a cada vela. Ciclos sem
+    entrada (`NO_PATTERN_FOUND` / score 62–66) são o portão
+    conservative, não pane — a mesma estratégia das contas que
+    operaram quando o setup passou de 90+ com `trade_allowed`.
+- **2026-08-18 ~22:18 UTC (zero sinais em 40+ min para TODOS os usuários —
+  usuários de teste no Supabase de produção sufocando o `_call_gate`)**
+  - Sintoma: usuário reportou "faz 37 minutos e minha conta não teve uma
+    operação". Investigação achou que **nenhum** usuário (nem um só, dos
+    ~41 reais) tinha `[SIGNAL_FOUND]`, `[BEST_CANDIDATE]` nem sequer um
+    candidato rejeitado com filtro nos últimos 40 minutos —
+    `last_rejection_reason=NO_PATTERN_FOUND` com `blocked_filters=[]` em
+    100% dos ciclos, o que na prática significa "nenhum ativo produziu
+    candidato algum", nem para aprovar nem para rejeitar.
+  - Diagnóstico: `[ANALYSIS_SCAN_BUDGET]` disparava em 100% dos ciclos
+    (nunca terminava naturalmente nem parava por `ANALYSIS_EARLY_STOP`).
+    Um único ativo (`ROBOT_ANALYSIS_ASSET_TIMEOUT_SECONDS=5s` nominal)
+    levava **41–47 segundos** para dar `[ACTIVE_TIMEOUT]` — ordem de
+    grandeza maior que o timeout configurado. `[SHARED_MARKET_CACHE_HIT]`
+    estava em **zero** apesar de dezenas de usuários pedindo os mesmos
+    ativos. Teste direto e isolado (`call_bullex_service` na mesma
+    sessão Python do processo, mesmo usuário real, mesmo `endtime`)
+    respondia em 0.2s — ou seja, corretora/rede saudáveis; o problema só
+    aparecia sob concorrência real dos workers.
+  - Causa raiz: a tabela `robot_states` no Supabase de **produção** tinha
+    35 registros de usuários de teste/fixture (`user-window-0`,
+    `user-analysis-error`, `user-demo`, etc. — nomes não-UUID, claramente
+    de `tests/`) com `enabled=true`, rodando workers completos e
+    disputando o `_call_gate` (limite de 3 chamadas simultâneas à
+    corretora, ver "Gargalo do `_call_gate`" em `PERFORMANCE_SISTEMA.md`)
+    lado a lado com os ~39 usuários reais. Isso quase **dobrou** a carga
+    concorrente (72 workers em vez de 39) exatamente no momento em que o
+    cache compartilhado mais precisava respirar, e o cache nunca
+    conseguia ficar "quente" o suficiente para servir hit — toda
+    requisição de `/candles`/`/payouts` tinha que brigar pelo gate=3 do
+    zero. Restart do `robot-runtime` (tentado antes de achar a causa) NÃO
+    resolveu — o problema reapareceu em 1–3 minutos, confirmando que não
+    era um leak transitório do processo e sim carga estrutural.
+  - Violação da LEI 13 (Isolamento de Ambientes): dados de teste nunca
+    deveriam ter `enabled=true` persistido no banco de produção.
+  - Correção: `PUBLISH robot:cmd {"action":"stop"}` para os 35 usuários de
+    teste + `PATCH robot_states SET enabled=false` no Supabase para eles
+    não subirem de novo sozinhos num próximo restart/deploy.
+  - Validação pós-correção (~22:30–22:45 UTC, 39 usuários reais): 96
+    `[BEST_CANDIDATE]` e 119 `[SHARED_MARKET_CACHE_HIT]` em 4 min (antes:
+    zero de ambos por 40+ min); latência média de candle caiu de
+    "nunca completa" para ~1.2–2.3s; 0 `[ENTRY_WINDOW_MISSED]`. Frequência
+    de `[SIGNAL_FOUND]` continuou baixa (0–1 a cada poucos minutos) — isso
+    é esperado da estratégia `conservative` em mercado calmo, não é mais
+    sintoma de falha sistêmica.
+  - Ação preventiva pendente: os registros tinham `created_at=2026-07-21`
+    (não foram escritos por uma execução recente da suíte de testes) —
+    são fixtures antigas, provavelmente de um seed manual ou execução de
+    teste isolada contra o Supabase de produção há quase um mês, que
+    ficaram esquecidas com `enabled=true`. Não há isolamento dev/prod no
+    Supabase hoje: `.env.example` já aponta para o MESMO projeto usado em
+    produção (viola a LEI 13). Recomendado: (1) criar um projeto Supabase
+    separado para testes/dev, (2) auditar a tabela por outras fixtures
+    esquecidas (`bullex_connections`, `robot_trade_history`, etc.).
+  - **Ação preventiva IMPLEMENTADA em 2026-08-18 ~23h05 UTC (defesa em
+    profundidade, independe de limpar o Supabase de novo no futuro):**
+    `_handle_command` em `backend/robot_runtime_main.py` agora recusa
+    `action=start`/`ensure` para qualquer `user_id` que não seja um UUID
+    válido (`_is_valid_account_user_id`, usa `uuid.UUID(...)`), logando
+    `[ROBOT_WORKER_REJECTED_INVALID_USER_ID]` e retornando sem chamar
+    `ensure_robot_worker` nem hidratar a persistência. Todo usuário real
+    chega ao runtime com `user_id` = UUID da sessão Supabase Auth; nenhum
+    fluxo legítimo de `/robot/start` usa outro formato. Mesmo que
+    fixtures voltem a ficar `enabled=true` no Supabase de produção
+    (seed manual, teste rodado sem querer contra prod, etc.), o
+    robot-runtime **não sobe worker real para elas** — o pior caso vira
+    um log de aviso, não uma disputa pelo `_call_gate`. `stop`/
+    `reset_score`/`disconnect` continuam liberados para qualquer formato
+    de id (não criam worker novo). Testes:
+    `tests/test_robot_worker_user_id_guard.py` (7 casos, cobre aceitar
+    UUID real, rejeitar ids de fixture/vazio/não-string, e não regressão
+    das ações que não criam worker). Requer redeploy do `robot-runtime`
+    (`scripts/deploy-robot-runtime.sh`) para entrar em vigor.
+  - **Deploy do guard (2026-08-18 ~23h09–23h11 UTC) reproduziu DOIS
+    problemas já documentados, confirmando que valia a pena corrigi-los
+    de vez:**
+    1. Achou **mais um** fixture `enabled=true` em produção que não tinha
+       sido pego na limpeza das 22h18: `user-analysis-window-missed`,
+       com `last_connected_at` de ~1 min antes (estava rodando de
+       verdade). Desabilitado (`PATCH enabled=false`). Prova de que a
+       limpeza manual pontual não é suficiente — o guard no runtime é a
+       defesa que realmente fecha o buraco independente de quantas
+       fixtures ainda existam ou apareçam.
+    2. O script `scripts/deploy-robot-runtime.sh` publicou os 39 `start`
+       logo depois do health check (~24s pós-`up`), mas o runtime só
+       terminou de restaurar 286 estados e assinar `robot:cmd` aos ~36s
+       — os 39 `PUBLISH` se perderam (0/39 workers confirmados no log),
+       reproduzindo o incidente das 21h10 mesmo com o script "seguro".
+       Corrigido republicando manualmente após confirmar o subscribe
+       (38/38 workers confirmados) e, na sequência, atualizando o
+       próprio script para esperar
+       `[ROBOT_RUNTIME] subscribed channel=robot:cmd` no log antes de
+       publicar (em vez de um sleep fixo) e republicar sozinho quem não
+       confirmar `WORKER_CREATED`/`WORKER_ALREADY_RUNNING` — ver
+       `DEPLOY_VPS.md`.
+    - Validação final pós-fix (23h13, 38 usuários reais): `WORKER_CREATED`
+      37 + `WORKER_ALREADY_RUNNING` 1 = 38/38; `PUBLISH` de teste com
+      `user_id` fake gerou `[ROBOT_WORKER_REJECTED_INVALID_USER_ID]` sem
+      criar worker; 48 `[BEST_CANDIDATE]` e 52 `[SHARED_MARKET_CACHE_HIT]`
+      em 2 min; candles resolvendo em 0–32ms via cache; 1 único
+      `[ENTRY_WINDOW_MISSED]` isolado; 0 `[SIGNAL_FOUND]` (esperado —
+      estratégia `conservative` sem oportunidade no momento, não é
+      sintoma de falha).
+- **2026-08-18 ~21:00 UTC (fix das 19:20 "validado" mas NUNCA rodou em
+  produção — deploy com nome de projeto compose errado)**
+  - Sintoma: usuários continuaram reportando "ainda não está pegando
+    operações" mesmo depois do fix de `ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS`
+    (entrada anterior). `[ENTRY_WINDOW_MISSED]` recorrendo na mesma taxa de
+    antes (~22–30/hora), como se o fix não existisse.
+  - Causa raiz: o deploy foi feito em dois comandos separados —
+    `docker compose build robot-runtime` (sem `-p elcapooneline`, project
+    name inferido do diretório = `backend`) seguido de
+    `docker compose -p elcapooneline up -d --force-recreate --no-deps
+    robot-runtime`. O `build` sem `-p` criou uma imagem órfã
+    `backend-robot-runtime:latest`, nunca usada por nada. O `up` com
+    `-p elcapooneline` reaproveitou a imagem `elcapooneline-robot-runtime:latest`
+    **já existente** (do build de 18/08 tarde, código antigo) porque `up`
+    sem `--build` não rebuilda quando a imagem já existe — recria o
+    container, mas com o binário de sempre. Sem erro, sem warning, container
+    saudável, health check verde. Confirmado com
+    `docker exec robot-runtime grep ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS
+    /app/backend/main.py` → `85.0` (devia ser `45.0`).
+  - Efeito colateral: ao religar os workers via `PUBLISH robot:cmd` logo
+    após o `--force-recreate` (~15s depois), a maioria das mensagens se
+    perdeu — o processo ainda não tinha assinado o canal Redis. O snapshot
+    Redis (`robot:snapshot:*`, TTL 600s) ainda mostrava `worker_running=true`
+    de execução anterior, mascarando o problema (falso positivo na
+    verificação pós-deploy). De 35 `start` publicados, só ~1 pegou; 34
+    ficaram sem worker por >1h sem nenhum log de erro.
+  - Correção: rebuild com `docker compose -p elcapooneline build
+    robot-runtime` (nome de projeto correto no MESMO namespace da imagem
+    usada pelo `up`); confirmar `docker inspect robot-runtime --format
+    '{{.Config.Image}}'` e o valor da constante dentro do container antes de
+    considerar o deploy concluído. Religar workers usando a lista de
+    `enabled=true` do Supabase (`robot_states`), não o snapshot Redis, e
+    confirmar por `[WORKER_CREATED]`/`[WORKER_ALREADY_RUNNING]` no log — não
+    pelo snapshot. Ver checklist em `DEPLOY_VPS.md`.
+  - Validação pós-correção (~21:14–21:40 UTC, 41 usuários reais
+    confirmados com worker rodando): `ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS`
+    confirmado em `45.0` dentro do container; `[ENTRY_WINDOW_MISSED]` caiu
+    para 3 em 15 min (era ~22–30/hora); 9 `WIN` + 5 `LOSS` completados no
+    snapshot; 0 `PoolTimeout`; containers estáveis (`RestartCount=0`).
+  - Lição: **sempre** validar um deploy lendo o código/constante de dentro
+    do container (`docker exec ... grep`), nunca só pelo `docker compose
+    ps`/health check. Health check verde não prova que o código novo está
+    rodando.
+- **2026-08-18 ~19:20 UTC (sinal achado, ordem nunca disparava —
+  `ENTRY_WINDOW_MISSED` em massa)**
+  - Sintoma: após o fix das 18:45, usuários reportaram "ainda não está
+    pegando operações". Logs mostravam `[SIGNAL_FOUND]` seguido minutos
+    depois de `[ENTRY_WINDOW_MISSED]` / `[SIGNAL_EXPIRED]` — o robô achava
+    um candidato válido mas nunca chegava a comprar.
+    `current_candle_seconds` no momento do descarte: 8, 9, 26, 27, 28, 35,
+    36, 37, 48 (a janela de compra é só 0–8s, ver §1).
+  - Causa: `ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS=85` (do fix das 18:20) foi
+    calibrado contra `ROBOT_CYCLE_TIMEOUT_SECONDS=110`, não contra a janela
+    real de entrada. A análise começa entre os segundos 5–20 da vela
+    (`ANALYSIS_WINDOWS`) e só pode comprar nos primeiros 0–8s da vela
+    SEGUINTE (`ENTRY_WINDOWS`). Pior caso: início no segundo 20 só tem
+    `(60-20)+8=48s` até a janela fechar. Com 85s de orçamento o scan
+    terminava rotineiramente 25–40s DENTRO da vela seguinte — a janela já
+    tinha fechado antes mesmo de existir um candidato pronto.
+  - Correção: `ROBOT_ANALYSIS_SCAN_BUDGET_SECONDS` reduzido para **45s**
+    (cabe no pior caso de 48s com folga para montar o candidato e disparar
+    a compra).
+  - Testes: `test_scan_budget_fits_inside_entry_window_worst_case` (trava a
+    relação matemática `SCAN_BUDGET < (TIMEFRAME - ANALYSIS_WINDOW_END) +
+    ENTRY_WINDOW_END` para não regredir).
+  - Validação pós-deploy (~19:30–19:46 UTC, 40 robôs ativos): 0
+    `[ENTRY_WINDOW_MISSED]` (antes: 22 em 60 min). 3 sinais achados, 3
+    ordens enviadas, 3 rejeitadas pela BullEx por "asset is not available"
+    em GBPJPY-OTC — confirmado batendo 1:1 com `bullex-service`
+    (`409 Conflict`, mesmo motivo), ou seja, rejeição real de mercado, não
+    bug do runtime.
+  - Nota: `[ROBOT_CYCLE_TIMEOUT]` (110s) continua ocorrendo com frequência
+    parecida à de antes (~80 em 16 min entre 40 usuários) por overhead fora
+    do scan (checagens de sessão/conta, revalidação de canal). Isso reduz a
+    frequência de novas análises por usuário, mas **não** derruba mais um
+    sinal já encontrado (`should_keep_pending_on_cycle_timeout`). Fica como
+    possível otimização futura, não bloqueia operação.
+- **2026-08-18 ~18:45 UTC (BullEx comprou, overlay falhou)**
+  - Sintoma: `ORDER_SEND_FAILED` / `TEMPORARY_UNAVAILABLE` no runtime;
+    `[REAL BUY SUCCESS]` no `bullex-service` no mesmo instante.
+  - Causa: POST `/orders/buy-real` no pool/semáforo dos candles; timeout 20s.
+  - Correção: client HTTP de ordem (8 conexões), fora do semáforo, timeout 45s.
+  - Testes: `test_buy_real_bypasses_market_http_semaphore`,
+    `test_buy_real_uses_dedicated_order_http_client`.
+- **2026-08-18 ~18:20 UTC (analisa, acha sinal, não compra)**
+  - Sintoma: após o recycle das 17:15, cache ok, 0 compras. `ACTIVE_OK`
+    seguido de `ROBOT_CYCLE_TIMEOUT` no mesmo segundo; buy-real 5s →
+    `BULLEX_TEMPORARY_UNAVAILABLE`.
+  - Causa: scan sequencial 8–12s/ativo estoura 110s; recycle em
+    `ConnectTimeout` piorava o handshake; timeout de compra curto.
+  - Correção: recycle só `PoolTimeout`; early-stop; timeout por ativo 6s;
+    buy-real 20s; timeout do ciclo preserva `pending_signal`.
+  - Testes: `test_scan_stops_after_first_trade_allowed`,
+    `test_worker_cycle_timeout_keeps_pending_signal`,
+    `test_connect_timeout_does_not_recycle_http_client`,
+    `test_buy_real_uses_extended_timeout`.
+- **2026-08-18 tarde (voltou a parar ~24 min após o restart da manhã)**
+  - Mesma espiral: `PoolTimeout` 13:13 UTC, cache zerado, 0 compras até o
+    deploy 17:15 UTC. Código: reciclar client httpx + `max_connections=40`.
+  - Testes: `test_pool_timeout_recycles_http_client` e cooldown.
+- **2026-08-17/18 (14h sem ordem — pool httpx 100/100 de novo)**
+  - Sintoma: clientes desde ~23h BRT 17/08; overlay analisando; API no ar.
+  - Causa: `PoolTimeout ativas=100` no `robot-runtime` a partir de 22:11 UTC;
+    cache compartilhado esvaziou; compras não chegavam no `bullex-service`.
+  - Recuperação: `docker restart robot-runtime` + PUBLISH `start` no Redis
+    DB1 (sem rebuild, sem derrubar sessões). Ver §1 recorrência e
+    `DEPLOY_VPS.md`.
+- **2026-08-11 (saldo insuficiente + placar no overlay)**
+  - Compra REAL com `Insufficient funds` agora para o robô e exibe aviso
+    claro (não fica em loop “analisando”).
+  - Placar: reidratação da persistência + contraste dos badges + TTL
+    snapshot 600s. Testes:
+    `tests/test_insufficient_funds_and_score.py`,
+    `robotPresentation.insufficient.test.ts`.
+- **2026-08-11 (ANALYSIS_TIMEOUT em massa — robô “analisa” e não opera)**
+  - Sintoma: dezenas de contas ligadas, overlay em análise, quase zero
+    ordens. Runtime: `[BULLEX_POOL_STATS] PoolTimeout total=100 ativas=100`.
+  - Causa: cache de candles/payouts só por usuário + refresh por hit;
+    33 robôs M1 esgotavam o pool httpx do `robot-runtime` antes do
+    bullex-service. Ciclo virava `ANALYSIS_TIMEOUT`.
+  - Correção: cache compartilhado + single-flight + refresh coalescido +
+    semáforo 40 no runtime. Ver §1 e `PERFORMANCE_SISTEMA.md`.
+  - Testes: `tests/test_runtime_shared_market_cache.py`.
 - **2026-08-07 (noite — Iniciar Operação derrubava a Bullex)**
   - Sintoma: ao iniciar, painel marcava desconectado / kick na corretora.
   - Causa: auto-reconnect com login novo + `disconnect_account` no start.

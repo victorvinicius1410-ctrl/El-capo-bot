@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { bullexApi } from "@/lib/api";
-import { runAutoReconnectWithRetry, shouldAutoReconnectBullex } from "@/lib/ensureBullexSession";
+import {
+  markManualBullexDisconnect,
+  runAutoReconnectWithRetry,
+  shouldAutoReconnectBullex,
+} from "@/lib/ensureBullexSession";
 import {
   completeBullExLogin,
   failBullExLogin,
@@ -29,11 +33,14 @@ const ROBOT_STATE_QUERY_KEY = ["robot-state"] as const;
 export function useEnsureBullexSession({
   userId,
   connected,
+  robotEnabled,
   accountLoading,
   statusLoading,
 }: {
   userId?: string | null;
   connected: boolean;
+  /** Robô ligado. Com ele desligado, abrir a página NÃO reconecta. */
+  robotEnabled: boolean;
   accountLoading: boolean;
   statusLoading: boolean;
 }): void {
@@ -76,6 +83,7 @@ export function useEnsureBullexSession({
         !shouldAutoReconnectBullex({
           connected: false,
           credentialsSaved,
+          robotEnabled,
           alreadyAttempted,
           pendingConnect: getBullExLoginPending(userId),
           stillLoading: accountLoading || statusLoading,
@@ -89,11 +97,33 @@ export function useEnsureBullexSession({
       startBullExLogin(email, userId);
       // Retry com backoff: uma falha isolada (cooldown de 60s, rate limit da
       // corretora, blip logo após um deploy) não pode exigir clique manual.
-      const response = await runAutoReconnectWithRetry(() => bullexApi.reconnect(), {
-        isCancelled: () => cancelled,
-        onRetryScheduled: () => updateBullExLoginBackendStatus("RECONNECTING", userId),
-      });
+      let blocked = false;
+      const response = await runAutoReconnectWithRetry(
+        async () => {
+          const result = await bullexApi.reconnect();
+          // O gateway RECUSA reconexão automática depois de "Desconectar":
+          // devolve ok:true com connected:false ([BULLEX_RECONNECT_BLOCKED]).
+          // Sem tratar isso, o `ok` do envelope marcava login concluído com a
+          // sessão morta — o painel diria "conectado" sem conexão nenhuma.
+          // Também não faz sentido insistir: a recusa é decisão do cliente.
+          const data = result.data as { connected?: boolean } | undefined;
+          if (result.ok && data?.connected === false) {
+            blocked = true;
+            markManualBullexDisconnect();
+            return { ok: false, error: "Bullex desconectada pelo usuário." };
+          }
+          return result as { ok: boolean; error?: string };
+        },
+        {
+          isCancelled: () => cancelled || blocked,
+          onRetryScheduled: () => updateBullExLoginBackendStatus("RECONNECTING", userId),
+        },
+      );
       if (cancelled) return;
+      if (blocked) {
+        failBullExLogin("Bullex desconectada. Clique em Entrar na Bullex para conectar.", userId);
+        return;
+      }
       if (!response.ok) {
         failBullExLogin(response.error || "Não foi possível reconectar a Bullex.", userId);
         return;
@@ -115,5 +145,5 @@ export function useEnsureBullexSession({
     return () => {
       cancelled = true;
     };
-  }, [accountLoading, connected, queryClient, statusLoading, userId, visibilityNonce]);
+  }, [accountLoading, connected, queryClient, robotEnabled, statusLoading, userId, visibilityNonce]);
 }

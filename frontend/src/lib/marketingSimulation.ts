@@ -55,7 +55,12 @@ export function normalizeMarketingHistory(
       profit: Number(trade.profit) || 0,
       openedAt: createdAt,
       finishedAt: createdAt,
-      timeframe: null,
+      timeframe: trade.timeframe ?? trade.period ?? null,
+      strategyName: trade.strategy_name ?? null,
+      strategyKey: trade.strategy_key ?? null,
+      strategySummary: trade.strategy_summary ?? null,
+      analysisDetail: trade.analysis_detail ?? null,
+      speechPreview: trade.speech_preview ?? null,
     });
   }
   return items.sort((a, b) => String(b.finishedAt ?? "").localeCompare(String(a.finishedAt ?? "")));
@@ -77,4 +82,27 @@ export function normalizeMarketingStats(stats: MarketingSimulationStats | null |
     bestWinStreak: 0,
     bestLossStreak: 0,
   };
+}
+
+/**
+ * Calcula o placar visual (WIN / LOSS / lucro) de um lote do Shift+O.
+ *
+ * Usado para atualizar o overlay do El Capo na hora, sem esperar o Redis.
+ *
+ * @param trades - Operações recém-geradas ou a operação avulsa criada
+ * @returns Contadores no formato do `robotState` do overlay
+ */
+export function overlayScoreFromTrades(
+  trades: Array<{ result?: string; profit?: number }> | null | undefined,
+): { wins: number; losses: number; profit: number } {
+  let wins = 0;
+  let losses = 0;
+  let profit = 0;
+  for (const trade of trades ?? []) {
+    const result = String(trade.result || "").toUpperCase();
+    if (result === "WIN") wins += 1;
+    else if (result === "LOSS") losses += 1;
+    profit += Number(trade.profit) || 0;
+  }
+  return { wins, losses, profit: Math.round(profit * 100) / 100 };
 }

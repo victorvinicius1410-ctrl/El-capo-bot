@@ -10,6 +10,7 @@ import {
   type BillingHistoryItem,
   type BillingPlan,
 } from "@/lib/api";
+import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import {
   isOfficialCaktoCheckoutUrl,
   normalizeListPayload,
@@ -276,8 +277,7 @@ function formatBillingPeriod(months: number) {
 }
 
 function formatDateTime(value: string) {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("pt-BR");
+  return formatBrasiliaDateTime(value) || value;
 }
 
 function humanize(value: string) {

@@ -14,6 +14,14 @@ class TestBullexPanelAutoReconnect(unittest.IsolatedAsyncioTestCase):
         main.bullex_auto_reconnect_at.clear()
         main.bullex_ssid_reconnect_at.clear()
         self.user_id = "panel-auto-reconnect-user"
+        # Regra de 10/08: o poll do painel só reconecta sozinho com o ROBÔ
+        # LIGADO (`panel_auto_reconnect_allowed`). Antes bastava ter
+        # credencial salva, e abrir Configurações logava na corretora sozinho.
+        # Os testes abaixo cobrem o caso legítimo — robô operando, sessão caiu
+        # por conta da corretora. O caso bloqueado tem teste próprio.
+        main.bullex_manual_disconnect.discard(self.user_id)
+        self.addCleanup(main.bullex_manual_disconnect.discard, self.user_id)
+        main.auto_trader.get(self.user_id).enabled = True
 
     async def test_status_auto_reconnects_when_session_dead_and_credentials_saved(self) -> None:
         disconnected = (
@@ -102,6 +110,74 @@ class TestBullexPanelAutoReconnect(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["data"]["connected"])
         auto.assert_awaited_once_with(self.user_id)
         self.assertEqual(service.await_count, 2)
+
+    async def test_status_does_not_auto_reconnect_when_robot_is_off(self) -> None:
+        """Regressão do relato do dono (09/08, repetido em 10/08).
+
+        "Entro no ElCapo, vou na página de configurações e mesmo sem clicar no
+        botão 'Entrar na Bullex' ele conecta sozinho depois de uns segundos."
+        Com o robô desligado, o poll do painel não pode logar na corretora —
+        nem tendo credencial salva.
+        """
+        main.auto_trader.get(self.user_id).enabled = False
+        disconnected = (
+            404,
+            {"ok": False, "data": {"connected": False}, "error": "SESSION_NOT_FOUND"},
+        )
+
+        with (
+            patch.object(main, "call_bullex_service", new=AsyncMock(return_value=disconnected)),
+            patch.object(main, "try_auto_reconnect_with_saved_credentials", new=AsyncMock(return_value=True)) as auto,
+            patch.object(main, "memory_status_fallback", return_value=None),
+            patch.object(main.robot_bus, "is_manual_disconnect", return_value=False),
+        ):
+            response = await main._bullex_status_impl({"user_id": self.user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["data"]["connected"])
+        auto.assert_not_awaited()
+
+    async def test_account_does_not_auto_reconnect_when_robot_is_off(self) -> None:
+        """Mesma regra no /bullex/account — o painel consulta os dois no poll."""
+        main.auto_trader.get(self.user_id).enabled = False
+        disconnected = (
+            404,
+            {"ok": False, "data": {"connected": False}, "error": "SESSION_NOT_FOUND"},
+        )
+
+        with (
+            patch.object(main, "call_bullex_service", new=AsyncMock(return_value=disconnected)),
+            patch.object(main, "try_auto_reconnect_with_saved_credentials", new=AsyncMock(return_value=True)) as auto,
+            patch.object(main, "memory_account_fallback", return_value=None),
+            patch.object(main.robot_bus, "is_manual_disconnect", return_value=False),
+        ):
+            await main._bullex_account_impl({"user_id": self.user_id})
+
+        auto.assert_not_awaited()
+
+    async def test_reconnect_refuses_after_manual_disconnect(self) -> None:
+        """``POST /bullex/reconnect`` é chamado AUTOMATICAMENTE pelo painel.
+
+        Por isso não pode valer como intenção do cliente: era ele que apagava
+        a marca durável no Redis e trazia a conta de volta depois do
+        logout/login (quando o `sessionStorage` do front já tinha sumido).
+        Só ``POST /bullex/connect`` desfaz a desconexão manual.
+        """
+        with (
+            patch.object(main, "call_bullex_service", new=AsyncMock()) as service,
+            patch.object(main, "try_auto_reconnect_with_saved_credentials", new=AsyncMock(return_value=True)) as auto,
+            patch.object(main.robot_bus, "is_manual_disconnect", return_value=True),
+            patch.object(main.robot_bus, "set_manual_disconnect") as clear_mark,
+        ):
+            response = await main.bullex_reconnect({"user_id": self.user_id})
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(payload["data"]["connected"])
+        service.assert_not_awaited()
+        auto.assert_not_awaited()
+        clear_mark.assert_not_called()
 
     async def test_reconnect_uses_saved_credentials_even_without_session_error_code(self) -> None:
         """Fallback de login salvo deve rodar sempre que a sessão não estiver conectada."""

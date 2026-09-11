@@ -88,7 +88,38 @@ No Safari/iOS: recarregar a página (ou limpar cache do site).
 - Forçar canvas em **todos** os browsers — reaparece borda no Windows.
 - Só `<video>` sem canvas no Safari — Mac/celular voltam ao lima.
 
-## 5. Nota Mac/Safari / celular
+## 5. Saldo insuficiente no overlay (2026-08-11)
+
+Quando a Bullex rejeita a compra com `Insufficient funds` (ou o start
+detecta saldo zero / entrada maior que o saldo), o robô **para** com
+status `INSUFFICIENT_BALANCE` e o overlay mostra:
+
+- Título: **Saldo insuficiente**
+- Detalhe: depósito ou redução do valor da entrada
+
+Arquivos:
+
+| Camada | Arquivo | Papel |
+|---|---|---|
+| Runtime | `backend/main.py` | `is_insufficient_funds_error` + stop no buy fail |
+| UI texto | `lib/robotPresentation.ts` | `looksLikeInsufficientBalance` |
+| API codes | `lib/api.ts` | `INSUFFICIENT_BALANCE` / `INSUFFICIENT_FUNDS` |
+
+Antes: rejeição virava só `ORDER_REJECTED` e o ciclo seguia “analisando”
+sem aviso claro.
+
+## 6. Placar WIN/LOSS/Resultado (2026-08-11)
+
+| Problema | Correção |
+|---|---|
+| Snapshot Redis TTL curto (120s) + gateway `external` sem worker → placar 0 | TTL 600s; `rehydrate_score_from_persistence_if_blank` no snapshot/HTTP |
+| `GET /robot/state` no gateway ignorava snapshot do runtime | Prefere `robot_bus.get_snapshot` em modo external |
+| Badges só com glow, sem fundo — sumiam no dashboard | `ScoreBadge` / `ProfitBadge` com borda + fundo escuro |
+
+Testes: `robotPresentation.insufficient.test.ts`,
+`backend/tests/test_insufficient_funds_and_score.py`.
+
+## 7. Nota Mac/Safari / celular
 
 | Antes (bug) | Agora |
 |---|---|
@@ -101,8 +132,42 @@ referência, **não** é a URL ativa.
 Testes: `frontend/src/lib/robotAvatarVisual.test.ts` + bloco em
 `robotNarration.test.ts`.
 
-## 6. Histórico
+## 8. Flash de WIN/LOSS + ativo (2026-08-15)
 
+Depois que a operação fecha, o overlay mostra **WIN** ou **LOSS** e o **ativo**
+por no máximo **60 segundos**. Embaixo, se o robô segue ligado, aparece
+**Buscando melhor oportunidade**. Passado 1 minuto, o resultado e o ativo
+somem e fica só a análise.
+
+| Camada | Constante | Papel |
+|---|---|---|
+| Ciclo operacional | `result_display_until` = **5s** | Libera `prepare_cycle` (não esticar) |
+| Overlay (UI) | `RESULT_OVERLAY_DISPLAY_MS` = **60s** | Cap visual a partir de `last_trade.finished_at` |
+| Payload unseen | `RESULT_OVERLAY_DISPLAY_SECONDS` = **60** | Âncora em `finished_at`, **não** `now+60` a cada serialize |
+
+Problemas que prendiam o sinal na tela:
+
+1. O WebSocket (`robot_panel_maintenance`) não chamava `acknowledge_unseen_result`
+   (só o GET `/robot/state`). Com poll HTTP pausado, `unseen_result` ficava true.
+2. `to_dict` preenchia `result_display_until = now+60s` **em todo snapshot**,
+   renovando o WIN/LOSS para sempre.
+3. O título **LOSS no Gale** usava `last_trade` mesmo depois da análise voltar.
+
+Arquivos: `frontend/src/lib/robotPresentation.ts`, `RobotOverlay.tsx`,
+`backend/auto_trader.py`, `backend/main.py`.
+
+Testes: `robotPresentation.resultFlash.test.ts`,
+`tests/test_unseen_result_offline.py`.
+
+## 9. Histórico
+
+- **2026-08-15 (flash WIN/LOSS 60s)** — Overlay limita resultado+ativo a 1 min
+  e mostra “Buscando melhor oportunidade” embaixo. Ver §8.
+- **2026-08-14 (placar 0-0 no start/stop)** — Snapshot de controle zerava
+  WIN/LOSS no overlay ao iniciar/parar. Ver `PLACAR_OVERLAY.md`.
+- **2026-08-11 (saldo insuficiente + placar)** — Aviso fixo no overlay quando
+  a compra REAL falha por fundos; placar reforçado (reidratação + badges
+  com contraste). Ver §5 e §6.
 - **2026-08-07 (noite+ — Confirmar e iniciar)** — Botão do pop-up reforçado
   (`stopPropagation`, `data-testid`, validação de `enabled`). Start com
   sessão Bullex morta deixa de fingir “sem saldo”. Ver `ROBO_E_SUPORTE.md`

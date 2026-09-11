@@ -268,7 +268,12 @@ class SessionPersistenceTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["order_id"], "order-999")
         self.assertGreaterEqual(buy_calls["count"], 2)
-        self.assertEqual(bullex_main.global_value.balance_id, 1226252784)
+        # Atualizado 2026-09-08: neste caminho o re-pin passou a ser POR
+        # SESSAO (`session.state.balance_id`), nao no global — global
+        # compartilhado vazava o saldo de um usuario para outro. Assertar o
+        # global cobrava de volta o comportamento que o isolamento de sessao
+        # removeu de proposito; ver tests/test_bullexapi_session_isolation.py.
+        self.assertEqual(session.state.balance_id, 1226252784)
         output = "\n".join(logs.output)
         self.assertIn("[REAL_BUY_RETRY_BALANCE]", output)
         self.assertIn("[REAL_BUY_RETRY_PINNED]", output)

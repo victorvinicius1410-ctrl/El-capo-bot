@@ -14,6 +14,24 @@
 export const ROBOT_AVATAR_WEBM_SRC = "/robo-wink-orig.webm";
 
 /**
+ * Mesmo avatar em "pilha": 512x512 de cor em cima, 512x512 do canal alfa em
+ * escala de cinza embaixo (512x1024 no total, sem alfa de verdade).
+ *
+ * O Safari/WebKit **não** suporta transparência em WebM (VP9 com
+ * `ALPHA_MODE=1`): ele descarta o alfa e mostra o fundo verde-oliva do vídeo
+ * como um quadrado feio atrás do robô. Como o alfa vai como imagem normal na
+ * metade de baixo, o canvas remonta a transparência sem depender do codec —
+ * e, por ser um arquivo só, cor e máscara nunca dessincronizam.
+ */
+export const ROBOT_AVATAR_ALPHA_STACK_SRC = "/robo-wink-alpha-stack.webm";
+
+/** Frame único com alfa, para navegador que nem toca WebM (iOS < 17.4). */
+export const ROBOT_AVATAR_STILL_SRC = "/robo-wink-still.png";
+
+/** Lado do quadro de cor (o vídeo empilhado tem o dobro da altura). */
+export const ROBOT_AVATAR_FRAME_SIZE = 512;
+
+/**
  * Filtro oficial (igual ao backup / Windows Chrome).
  * Aplicar na classe `.robot-avatar-video` (vídeo ou canvas).
  */
@@ -28,9 +46,10 @@ export const ROBOT_AVATAR_GLOW_FILTER =
 export const ROBOT_AVATAR_CSS_FILTER = `${ROBOT_AVATAR_COLOR_FILTER} ${ROBOT_AVATAR_GLOW_FILTER}`;
 
 /**
- * Indica se o motor costuma ignorar CSS filter em elementos `<video>`.
- * Nesses casos usamos o pipeline canvas; nos demais, o vídeo direto
- * (visual Windows sem quadro/borda artificial).
+ * Indica se o motor não é confiável para exibir o WebM direto: o WebKit
+ * ignora `filter` em `<video>` **e** descarta o canal alfa do WebM.
+ * Nesses casos usamos o pipeline canvas (que remonta a transparência a
+ * partir do vídeo empilhado); nos demais, o vídeo direto.
  *
  * Args:
  *   userAgent: string do navegador (opcional; default `navigator.userAgent`)

@@ -20,10 +20,10 @@ import {
 } from "@/lib/robotPresentation";
 import {
   DEFAULT_ROBOT_SETTINGS,
-  ENTRY_VALUE_MAX,
-  ENTRY_VALUE_MIN,
   ENTRY_VALUE_STEP,
   STOP_MONEY_MIN,
+  entryLimitsForCurrency,
+  entryValueHelperText,
   parseEntryValueInput,
   parseStopMoneyInput,
   type RobotSettings,
@@ -111,6 +111,17 @@ export function RobotOverlay({
   const [draftSettings, setDraftSettings] = useState<RobotSettings>(settings);
   const [scale, setScale] = useState(ROBOT_OVERLAY_SCALE_DEFAULT);
   const [speechDetailOpen, setSpeechDetailOpen] = useState(false);
+  const lastKnownScoreRef = useRef({ wins: 0, losses: 0, profit: 0 as number | null });
+  if (robotState) {
+    lastKnownScoreRef.current = {
+      wins: robotState.wins,
+      losses: robotState.losses,
+      profit: robotState.profit,
+    };
+  }
+  const scoreWins = robotState?.wins ?? lastKnownScoreRef.current.wins;
+  const scoreLosses = robotState?.losses ?? lastKnownScoreRef.current.losses;
+  const scoreProfit = robotState ? robotState.profit : lastKnownScoreRef.current.profit;
   const now = useNowTicker();
   const presentation = getRobotStatusPresentation(robotState, now);
   const display = buildOverlayDisplay(robotState, presentation, now);
@@ -440,7 +451,7 @@ export function RobotOverlay({
           />
         ) : null}
         <div className="relative grid grid-cols-[72px_110px_72px] items-center gap-2 sm:grid-cols-[92px_170px_92px] sm:gap-4">
-          <ScoreBadge label="WIN" value={robotState?.wins ?? 0} tone="win" />
+          <ScoreBadge label="WIN" value={scoreWins} tone="win" />
           <div className="relative flex justify-center">
             {showSpeechBubble && speechPreview ? (
               <button
@@ -471,7 +482,7 @@ export function RobotOverlay({
             ) : null}
             <RobotAvatarVideo className="h-auto w-[110px] object-contain sm:w-[170px]" />
           </div>
-          <ScoreBadge label="LOSS" value={robotState?.losses ?? 0} tone="loss" />
+          <ScoreBadge label="LOSS" value={scoreLosses} tone="loss" />
         </div>
         {speechDetailOpen && speechSignal ? (
           <div
@@ -519,7 +530,7 @@ export function RobotOverlay({
             </div>
           </div>
         ) : null}
-        <ProfitBadge profit={robotState?.profit} currency={account?.currency} />
+        <ProfitBadge profit={scoreProfit} currency={account?.currency} />
         {!adminModelControls && (onStartOperation || onStopOperation || onResetScore) ? (
           <div
             className="z-10 mt-1 flex flex-col items-center gap-1.5"
@@ -705,16 +716,22 @@ function buildOverlayDisplay(
         })
       : null);
   return {
-    title: overlayTitle(state, presentation.title),
+    title: overlayTitle(state, presentation),
     tone,
     details: detailParts.length > 0 ? <span>{detailParts.join(" | ")}</span> : null,
     footer: normalizeFooter(footer),
   };
 }
 
-function overlayTitle(state: RobotState | null | undefined, title: string): string {
-  if (state?.last_trade?.is_gale && state.last_trade.result === "LOSS") return "LOSS no Gale";
-  return title;
+function overlayTitle(state: RobotState | null | undefined, presentation: RobotPresentation): string {
+  if (
+    presentation.kind === "result" &&
+    state?.last_trade?.is_gale &&
+    (presentation.result === "LOSS" || state.last_trade.result === "LOSS")
+  ) {
+    return "LOSS no Gale";
+  }
+  return presentation.title;
 }
 
 function isRobotLocked(state?: RobotState | null): boolean {
@@ -768,7 +785,7 @@ function RobotConfigMenu({
 
   function updateNumber(field: "stopWin" | "stopLoss" | "entryValue" | "martingaleSteps" | "martingaleMultiplier", raw: string): void {
     if (field === "entryValue") {
-      const parsed = parseEntryValueInput(raw, settings.entryValue);
+      const parsed = parseEntryValueInput(raw, settings.entryValue, accountCurrency);
       if (parsed == null) return;
       onChange({ ...settings, entryValue: parsed });
       return;
@@ -814,7 +831,7 @@ function RobotConfigMenu({
           min={STOP_MONEY_MIN}
           disabled={locked}
           size="compact"
-          helperText="Mínimo R$ 5"
+          helperText={`Mínimo ${formatBullExBalance(STOP_MONEY_MIN, accountCurrency)}`}
           onChange={(value) => updateNumber("stopWin", value)}
         />
         <MoneyInput
@@ -824,17 +841,16 @@ function RobotConfigMenu({
           min={STOP_MONEY_MIN}
           disabled={locked}
           size="compact"
-          helperText="Mínimo R$ 5"
+          helperText={`Mínimo ${formatBullExBalance(STOP_MONEY_MIN, accountCurrency)}`}
           onChange={(value) => updateNumber("stopLoss", value)}
         />
         <MoneyInput
           label="Valor por entrada"
           currency={accountCurrency}
           value={settings.entryValue}
-          min={ENTRY_VALUE_MIN}
-          max={ENTRY_VALUE_MAX}
+          min={entryLimitsForCurrency(accountCurrency).min}
           step={ENTRY_VALUE_STEP}
-          helperText={`Valor minimo: R$ 5\nValor maximo: ${formatBullExBalance(ENTRY_VALUE_MAX, accountCurrency)}`}
+          helperText={entryValueHelperText(accountCurrency)}
           disabled={locked}
           size="compact"
           onChange={(value) => updateNumber("entryValue", value)}
@@ -928,12 +944,15 @@ function CompactNumberField({
 function ScoreBadge({ label, value, tone }: { label: string; value: number; tone: "win" | "loss" }) {
   const toneClass =
     tone === "win"
-      ? "text-primary [text-shadow:0_0_8px_#25dbe0,0_2px_4px_#03070a]"
-      : "text-muted-foreground [text-shadow:0_0_8px_#12343b,0_2px_4px_#03070a]";
+      ? "border-primary/35 bg-[#041218]/90 text-primary [text-shadow:0_0_8px_#25dbe0,0_2px_4px_#03070a]"
+      : "border-border/70 bg-[#0a1216]/90 text-muted-foreground [text-shadow:0_0_8px_#12343b,0_2px_4px_#03070a]";
   return (
-    <div className={`text-center font-black ${toneClass}`}>
+    <div
+      className={`rounded-xl border px-2 py-1.5 text-center font-black shadow-[0_4px_14px_rgba(0,0,0,0.35)] sm:px-3 sm:py-2 ${toneClass}`}
+      aria-label={`${label}: ${value}`}
+    >
       <div className="text-[10px] tracking-[0.22em] sm:text-xs">{label}</div>
-      <div className="text-3xl leading-none sm:text-5xl">{value}</div>
+      <div className="text-3xl leading-none tabular-nums sm:text-5xl">{value}</div>
     </div>
   );
 }
@@ -945,10 +964,13 @@ function ProfitBadge({ profit, currency }: { profit?: number | null; currency?: 
       ? "text-emerald-400 [text-shadow:0_0_10px_rgba(52,211,153,0.55),0_2px_4px_#03070a]"
       : tone === "negative"
         ? "text-rose-400 [text-shadow:0_0_10px_rgba(251,113,133,0.45),0_2px_4px_#03070a]"
-        : "text-foreground/80 [text-shadow:0_2px_4px_#03070a]";
+        : "text-foreground/90 [text-shadow:0_2px_4px_#03070a]";
   const formatted = formatProfitAmount(profit, currency);
   return (
-    <div className="mt-0.5 flex flex-col items-center" aria-label={`Resultado financeiro: ${formatted}`}>
+    <div
+      className="mt-0.5 flex flex-col items-center rounded-xl border border-border/60 bg-[#0a1216]/85 px-3 py-1.5 shadow-[0_4px_14px_rgba(0,0,0,0.3)]"
+      aria-label={`Resultado financeiro: ${formatted}`}
+    >
       <span className="text-[9px] font-semibold uppercase tracking-[0.28em] text-muted-foreground/90 sm:text-[10px]">
         Resultado
       </span>

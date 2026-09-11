@@ -5,44 +5,21 @@ from __future__ import annotations
 import asyncio
 import os
 
-from celery import Celery
-
 from backend.email_models import EmailDeliveryStatus
 from backend.email_repository import SupabaseEmailRepository
 from backend.email_service import EmailConfig, EmailService
-from backend.env_prefix import env_prefixed
-
-
-def _environment_value(name: str, default: str = "") -> str:
-    """Obtém configuração segregada pelo ambiente atual (PROD_/DEV_/STAGING_)."""
-    return env_prefixed(name, default)
-
-
-celery_app = Celery(
-    "elcapo-emails",
-    broker=_environment_value("REDIS_URL", "redis://redis:6379/0"),
-    backend=_environment_value("REDIS_URL", "redis://redis:6379/0"),
-)
-
-# Reutiliza o app do worker de webhooks quando importado no mesmo processo.
-try:
-    from backend.workers.webhook_tasks import celery_app as shared_celery_app
-
-    celery_app = shared_celery_app
-except Exception:
-    celery_app.conf.update(
-        task_serializer="json",
-        result_serializer="json",
-        accept_content=["json"],
-        timezone="UTC",
-        enable_utc=True,
-        task_acks_late=True,
-        worker_prefetch_multiplier=1,
-    )
 
 
 def _service() -> EmailService:
-    """Monta dependências server-only do processo worker."""
+    """
+    Monta dependências server-only do processo worker.
+
+    Returns:
+        EmailService com repositório Supabase e config do ambiente.
+
+    Raises:
+        RuntimeError: Se SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausentes.
+    """
     supabase_url = os.getenv("SUPABASE_URL", "").strip()
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     if not supabase_url or not service_role_key:
@@ -52,6 +29,10 @@ def _service() -> EmailService:
         SupabaseEmailRepository(supabase_url, service_role_key),
         EmailConfig.from_environment(frontend_url),
     )
+
+
+# Sempre reutiliza o app do webhook-worker (mesma fila Redis / mesmo processo).
+from backend.workers.webhook_tasks import celery_app  # noqa: E402
 
 
 @celery_app.task(

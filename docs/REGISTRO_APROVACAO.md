@@ -1,7 +1,8 @@
 # Registro de leads e aprovação administrativa — El Capo
 
 Documentação do cadastro público, fila de aprovação e liberação por dias de acesso
-ou compra de plano. Atualizado em **2026-08-07**.
+ou compra de plano. Para detalhes de exibição de trial nos painéis admin e usuário,
+ver também [`TESTE_GRATIS.md`](./TESTE_GRATIS.md). Atualizado em **2026-08-26**.
 
 ## Objetivo
 
@@ -154,7 +155,38 @@ Migration do índice parcial:
 | `/login`                 | Link “Cadastre-se” |
 | AppShell (lead pendente) | Modal: aguardar admin **ou** ir ao Financeiro |
 | `/payments`              | Banner de aprovação + cards de planos |
-| `/admin/clientes` (menu **Acessos**) | Aba **Pedidos** + botão **Aprovar acesso** (dias); remoção otimista do card ao aprovar |
+| `/admin/clientes` (menu **Acessos**) | Aba **Pedidos** + botão **Aprovar acesso** (dias); remoção otimista do card ao aprovar; busca por nome/email/ID Trader (ver abaixo). Aba **Teste grátis** exibe **dias restantes** e **expira em** derivados de `expires_at`; formulário de edição hidrata os dias reais (ver [`TESTE_GRATIS.md`](./TESTE_GRATIS.md)). |
+
+## Busca de leads (Admin → Acessos)
+
+Campo de busca com lupa no topo de `/admin/clientes`, ao lado das abas de
+segmento (Pedidos/Ativos/Trial/Marketing/Inativos). Filtra **dentro da aba
+atual** por nome, e-mail ou ID Trader.
+
+- **Debounce**: 350ms após o usuário parar de digitar antes de consultar
+  (evita 1 request por tecla).
+- **Contrato**: `GET /admin/clients?segment=...&search=termo` — filtro
+  aplicado no backend (`AdminService.list_clients`), case-insensitive,
+  por `name`, `email` e `trader_id`.
+- **Cache**: `search` normalizado (trim + casefold) entra na chave do cache
+  em memória do backend (`admin_clients_cache.py`) e na `queryKey` do
+  React Query no frontend (`adminClientsQuery.ts`), para não misturar
+  resultados de termos diferentes nem servir cache de uma busca para outra.
+- **Estado vazio**: mensagem específica `Nenhum lead encontrado para "termo"
+  nesta aba.` quando a busca não encontra ninguém.
+- Botão **X** dentro do campo limpa a busca instantaneamente.
+
+### Arquivos da busca
+
+| Camada | Arquivo |
+|--------|---------|
+| Rota | `Backend/backend/admin_router.py` (`search: str \| None` em `GET /admin/clients`) |
+| Filtro | `Backend/backend/admin_service.py` / `Backend/backend/supabase_admin_repository.py` |
+| Cache | `Backend/backend/admin_clients_cache.py` |
+| Cliente API | `Frontend/src/lib/api.ts` (`adminListClients`) |
+| Query/prefetch | `Frontend/src/lib/adminClientsQuery.ts` |
+| UI | `Frontend/src/routes/_authenticated/admin.clientes.tsx` |
+| Testes backend | `Backend/tests/test_admin_client_segments.py`, `Backend/tests/test_admin_clients_cache.py` |
 
 ## Arquivos principais
 

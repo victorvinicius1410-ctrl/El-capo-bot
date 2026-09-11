@@ -1,7 +1,7 @@
 # WebSocket do estado do robô
 
 Canal primário de atualização do painel operacional (`/dashboard`, overlay).
-Atualizado em **2026-08-07**.
+Atualizado em **2026-08-17**.
 
 ## Por que existe
 
@@ -45,6 +45,13 @@ digest e só envia se o payload mudou.
 3. Boot do hub/warmer/relay: `on_event("startup")` + safety-net no middleware
    HTTP (primeiro request) se o startup falhar em silêncio.
 4. Auth cross-subdomínio: preferir `GET /robot/ws-ticket` (ticket na query do WS).
+5. **Start/stop do cliente:** o gateway chama
+   `publish_robot_control_snapshot` imediatamente (mesmo padrão do
+   disconnect). Sem isso o Redis antigo (`worker_running=true`, TTL 600s)
+   mantinha o overlay em "Parar Operação". Ver
+   [`INICIAR_PARAR_OPERACAO.md`](./INICIAR_PARAR_OPERACAO.md).
+
+Atualizado em **2026-08-13**.
 
 ## Frontend
 
@@ -54,7 +61,11 @@ digest e só envia se o payload mudou.
 | `src/hooks/useLiveTradingData.tsx` | Abre WS; `setQueryData` no React Query |
 | `src/lib/robotState.ts` | `robotStateWsLive` pausa `refetchInterval` HTTP |
 
-**Admin:** `AppShell` continua sem `LiveTradingDataProvider` em `/admin/*`.
+**Admin (`/admin/*`):** `AppShell` continua sem `LiveTradingDataProvider`
+(performance da navegação). **Sessão de suporte** (admin dentro da conta do
+lead, rotas `/dashboard` `/configuracoes` `/history`): o provider **monta**,
+porque essas telas chamam `useLiveTradingData()`. O overlay do robô permanece
+oculto. Ver `ROBO_E_SUPORTE.md` §5.
 
 ## Dependência obrigatória no gateway
 

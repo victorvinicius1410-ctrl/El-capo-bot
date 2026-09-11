@@ -63,6 +63,9 @@ export function isBullExConnected({
   cachedGrace = false,
   pendingConnect = false,
 }: ConnectionInput): boolean {
+  // Clique em Desconectar vence grace/cache/status stale — senão o pill
+  // volta para "Conectado" enquanto o refetch ainda traz snapshot antigo.
+  if (isManualBullexDisconnectActive()) return false;
   if (cachedGrace || pendingConnect) return true;
   const status = statusToken(accountStatus?.status);
   // Sinais positivos primeiro: um /account stale com connected:false (backoff)
@@ -77,6 +80,7 @@ export function isBullExConnected({
 
 /** Determina se os sinais de conta indicam desconexão confirmada. */
 export function isBullExDisconnected(input: ConnectionInput): boolean {
+  if (isManualBullexDisconnectActive()) return true;
   if (isBullExConnected(input)) return false;
   // Poll em backoff / grace — banner vermelho não deve aparecer.
   if (isBullExStatusBackoff(input.accountStatus) || input.cachedGrace) return false;

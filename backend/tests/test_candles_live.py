@@ -257,10 +257,21 @@ class CandlesLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("[CANDLES_TIMEOUT_HANDLED]", "\n".join(logs.output))
 
-    async def test_chart_rejects_assets_outside_the_ten_allowed_without_upstream(self) -> None:
+    async def test_chart_rejects_assets_outside_the_allowlist_without_upstream(self) -> None:
+        """Ativo fora da allowlist não pode nem chegar na corretora.
+
+        O símbolo é derivado da allowlist, não escrito à mão: quando o pool foi
+        de 10 para 21 pares em 04/09, o `NZDUSD-OTC` fixo aqui virou um ativo
+        PERMITIDO e o teste passou a falhar sem que ninguém olhasse.
+        """
+        fora = next(
+            symbol
+            for symbol in ("USDRUB-OTC", "NZDJPY-OTC", "AUDNZD-OTC")
+            if symbol not in main.CHART_ALLOWED_ASSET_SET
+        )
         with patch.object(main, "call_bullex_service", new=AsyncMock()) as service:
             response = await main.bullex_candles(
-                active="NZDUSD-OTC",
+                active=fora,
                 timeframe="M1",
                 count=80,
                 auth={"user_id": "chart-asset-user"},

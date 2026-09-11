@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
+from time import monotonic
 from typing import Any
 from urllib.parse import quote
 
@@ -10,6 +11,9 @@ import httpx
 
 
 logger = logging.getLogger("backend-gateway")
+
+# Intervalo entre upserts de garantia da linha em /users para o mesmo usuário.
+USER_ROW_ENSURE_TTL_SECONDS = 600.0
 
 BULLEX_CONNECTION_TABLE = "bullex_connections"
 BULLEX_CONNECTION_FIELDS = (
@@ -369,6 +373,18 @@ class SupabaseUserStore(UserStore):
         return [row for row in rows if isinstance(row, dict)]
 
     def _ensure_user_row(self, user_id: str) -> None:
+        # O upsert em /users rodava antes de TODA leitura e gravação — inclusive
+        # no `get_user` que o robot-runtime chama no event loop. É idempotente,
+        # então basta uma vez por usuário a cada USER_ROW_ENSURE_TTL_SECONDS:
+        # corta metade das idas síncronas ao Supabase sem mudar o contrato
+        # (a linha continua garantida antes de gravar em bullex_connections).
+        ensured = getattr(self, "_ensured_user_rows", None)
+        if ensured is None:
+            ensured = self._ensured_user_rows = {}
+        key = str(user_id)
+        last = ensured.get(key)
+        if last is not None and monotonic() - last < USER_ROW_ENSURE_TTL_SECONDS:
+            return
         body = {"id": user_id}
         self._request(
             "POST",
@@ -376,6 +392,7 @@ class SupabaseUserStore(UserStore):
             json=body,
             extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
         )
+        ensured[key] = monotonic()
 
     def _upsert_connection(self, user_id: str, payload: dict[str, Any]) -> BullExUserRecord:
         diagnostic = self.connection_upsert_diagnostic(user_id, payload)

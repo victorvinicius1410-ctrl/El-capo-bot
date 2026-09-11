@@ -44,8 +44,8 @@ Publish deve copiar `public/branding/` para `/var/www/elcapobot/branding/`.
 | Campo | Opções / regra |
 |---|---|
 | Timeframe | M1 / M5 / M15 (monitoramento contínuo por vela; compra 0–5s) |
-| Mercado | OTC / Aberto (cadeado + “Abre em X horas” quando forex fechado) / Ambos (opera sempre em OTC) |
-| Valor por entrada | ≥ R$ 5 (default 5) |
+| Mercado | OTC / Aberto (cadeado + “Abre em X horas” quando forex fechado) / Ambos (com forex aberto: OTC **e** aberto; fechado: só OTC) |
+| Valor por entrada | Mínimo na moeda do saldo: **R$ 5** (BRL) ou **US$ 1** (USD), **sem teto**. Ver `VALOR_ENTRADA.md`. |
 | Stop Win / Stop Loss | Modo **Por valor** (≥ R$ 5) ou **Por operações** (≥ 1 WIN/LOSS). Ver `STOP_WIN_LOSS.md`. |
 | Gale | on/off + quantidade + multiplicador |
 | Ações | Salvar configurações · Iniciar/Parar robô |
@@ -93,6 +93,15 @@ Ver também `ROBO_E_SUPORTE.md` §4 e `BULLEX_CREDENCIAIS.md`.
 
 ## Histórico
 
+- **2026-08-16** — Só mínimo de entrada (R$ 5 / US$ 1); sem teto.
+  Ver `VALOR_ENTRADA.md`.
+- **2026-08-15** — Valor de entrada limitado a R$ 5 (BRL) ou US$ 1 (USD),
+  na moeda do saldo. Ver `VALOR_ENTRADA.md`.
+- **2026-08-13** — "Pare o robô antes de alterar configurações" no diálogo
+  Iniciar operação com overlay já parado (split-brain gateway vs Redis após
+  Stop Win/Loss). Ver `INICIAR_PARAR_OPERACAO.md`.
+- **2026-08-12** — Desconectar Bullex voltava a "Conectado" por snapshot Redis
+  stale (TTL 600s) + UI ignorando marca manual. Ver `BULLEX_CREDENCIAIS.md`.
 - **2026-08-07 (noite — Desconectar stuck)** — Botão Desconectar parecia
   não funcionar (cache REAL + auto-reconnect + syncing). Ver
   `BULLEX_CREDENCIAIS.md` (incidente disconnect).
@@ -102,6 +111,9 @@ Ver também `ROBO_E_SUPORTE.md` §4 e `BULLEX_CREDENCIAIS.md`.
   `BULLEX_CREDENCIAIS.md` (incidente).
 - **2026-08-07 (noite — flap visual Configurações)** — Corrige Desconectado
   fantasma + atraso de email/saldo ao entrar/sair da aba. Ver seção acima.
+- **2026-08-15** — Ambos com forex aberto varre OTC **e** mercado aberto.
+  Aberto com turbo fechado faz fallback OTC para o robô não parar. Ver
+  `MERCADO_ABERTO.md`.
 - **2026-08-07 (noite)** — **Iniciar robô** não bloqueia mais por
   `connected` do poll (backoff/cache falso após stop). O `POST /robot/start`
   valida a Bullex. Ver `ROBO_E_SUPORTE.md`.

@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import bullexapi.global_value as global_value
+from bullexapi import constants as OP_code
 from bullexapi.stable_api import Bullex
 from bullex_service.session_store import SessionStore, create_session_store
 from bullex_service.proxy_config import proxies_configured, requests_proxies_for_client
@@ -30,6 +31,12 @@ from websocket._exceptions import WebSocketConnectionClosedException
 
 
 logging.basicConfig(level=logging.INFO)
+from bullex_service.digital_orders import (
+    DigitalOrderError,
+    place_digital_order,
+    read_digital_result,
+)
+
 logger = logging.getLogger("bullex-service")
 
 CORS_ALLOWED_ORIGINS_DEFAULT = (
@@ -52,6 +59,14 @@ SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
 SESSION_DISCONNECTED = "SESSION_DISCONNECTED"
 BULLEX_ACTIVE_MODE_NOT_REAL = "BULLEX_ACTIVE_MODE_NOT_REAL"
 ASSET_NOT_ALLOWED = "ASSET_NOT_ALLOWED"
+# Espelho EXATO de `backend.main.BINARY_ALLOWED_ASSETS`. As duas listas são
+# a mesma allowlist em processos diferentes: o gateway decide o que varrer e
+# este serviço decide o que a corretora pode responder. Quando divergem, o
+# gateway pede um ativo que ele considera válido e leva HTTP 400
+# `ASSET_NOT_ALLOWED` da nossa própria porta — foi o que aconteceu com os 11
+# pares de mercado aberto adicionados em 04/09 só no gateway: em 07/09 a
+# conta em `market_mode=OPEN` recebia 400 em EURAUD/EURNZD/AUDCHF/... e caía
+# para OTC todo ciclo. `tests/test_binary_allowlist_parity.py` trava isso.
 BINARY_ALLOWED_ASSETS = [
     "EURUSD",
     "EURUSD-OTC",
@@ -84,6 +99,17 @@ BINARY_ALLOWED_ASSETS = [
     "EURAUD-OTC",
     "EURNZD-OTC",
     "AUDCHF-OTC",
+    "NZDUSD",
+    "AUDCAD",
+    "GBPCAD",
+    "GBPCHF",
+    "GBPAUD",
+    "EURCAD",
+    "CHFJPY",
+    "CADCHF",
+    "EURAUD",
+    "EURNZD",
+    "AUDCHF",
 ]
 BINARY_ALLOWED_ASSET_SET = set(BINARY_ALLOWED_ASSETS)
 SESSION_EXCEPTION_TYPES = (WebSocketConnectionClosedException, ConnectionError, TimeoutError)
@@ -96,7 +122,15 @@ PAYOUT_TTL_SECONDS = 60
 CANDLES_TTL_SECONDS = 60
 STALE_MARKET_DATA_SECONDS = 120
 INSTRUMENTS_CACHE_TTL_SECONDS = 300
-INSTRUMENTS_TIMEOUT_SECONDS = 8
+# O `/assets` devolvia INSTRUMENTS_TIMEOUT em 100% das chamadas, mas **não era
+# falta de tempo**: subir para 25s falhou igual. A causa era
+# `update_ACTIVES_OPCODE` pedir crypto/forex/cfd, que a BullEx não serve
+# (TimeoutError nos três em `GET /instruments/probe`), consumindo o orçamento
+# inteiro. A correção está em `read_assets_uncached`, que agora pede só
+# binary/turbo. O valor volta aos 8s originais: este timeout segura uma thread
+# de requisição em `future.result(...)`, e alargá-lo triplicaria a ocupação do
+# pool httpx numa falha de WS — a condição do PoolTimeout de 08/08.
+INSTRUMENTS_TIMEOUT_SECONDS = int(os.getenv("INSTRUMENTS_TIMEOUT_SECONDS", "8"))
 # Status turbo/binary (canal onde a ordem é enviada). TTL de sucesso mais
 # longo (o gateway já tem cooldown por ativo) e backoff em falha para o
 # get_all_init_v2 não penalizar os /payouts repetidamente.
@@ -230,6 +264,13 @@ class ConnectRequest(BaseModel):
 class ChangeModeRequest(BaseModel):
     mode: str
     confirm_real: bool = True
+
+
+class BuyDigitalRequest(BaseModel):
+    amount: float
+    active: str
+    action: str
+    duration: int = 1
 
 
 class BuyOrderRequest(BaseModel):
@@ -1501,8 +1542,51 @@ def normalize_action(action: str) -> str:
     return normalized
 
 
+# A BullEx nomeia o par de MERCADO ABERTO com sufixo `-op` (`EURUSD-op`), e o
+# par sintetico com `-OTC`. O El Capo usa o nome nu (`EURUSD`) para o mercado
+# aberto em todo o resto do sistema — inclusive nas velas, que funcionam assim.
+# Ate 08/09/2026 essa diferenca fazia o catalogo de opcao ser invisivel: o mapa
+# de canais era indexado por `EURUSD-OP` e a consulta pedia `EURUSD`, entao todo
+# par aberto voltava `payout=None` e morria em PAYOUT_UNAVAILABLE. Medido no
+# mesmo dia: 41 ordens OTC e zero abertas, com EURUSD-op ABERTO e payout 84/85.
+BROKER_OPEN_SUFFIX = "-op"
+
+
 def normalize_binary_active(active: str) -> str:
     return (active or "").strip().upper()
+
+
+def to_internal_active(broker_name: str) -> str:
+    """Nome da corretora -> nome do El Capo (`EURUSD-op` -> `EURUSD`).
+
+    Args:
+        broker_name: Nome como aparece no catalogo da corretora.
+
+    Returns:
+        Nome normalizado usado internamente. `-OTC` e qualquer outro passam
+        intactos.
+    """
+    simbolo = normalize_binary_active(broker_name)
+    sufixo = BROKER_OPEN_SUFFIX.upper()
+    return simbolo[: -len(sufixo)] if simbolo.endswith(sufixo) else simbolo
+
+
+def to_broker_active(active: str) -> str:
+    """Nome do El Capo -> nome da corretora (`EURUSD` -> `EURUSD-op`).
+
+    So o par de mercado aberto ganha sufixo. `-OTC` vai como esta, e e por isso
+    que o caminho OTC nao muda em nada.
+
+    Args:
+        active: Nome interno do ativo.
+
+    Returns:
+        Nome a enviar para a corretora (catalogo de opcao e compra).
+    """
+    simbolo = normalize_binary_active(active)
+    if not simbolo or simbolo.endswith("-OTC") or simbolo.endswith(BROKER_OPEN_SUFFIX.upper()):
+        return active
+    return f"{simbolo}{BROKER_OPEN_SUFFIX}"
 
 
 def ensure_binary_asset_allowed(active: str) -> str:
@@ -2230,7 +2314,20 @@ def instruments_backoff_seconds(failure_count: int) -> int:
 
 
 def read_assets_uncached(client: Bullex) -> list[dict[str, Any]]:
-    client.update_ACTIVES_OPCODE(timeout=INSTRUMENTS_TIMEOUT_SECONDS)
+    """Lê os instrumentos da corretora — só os canais que ela responde.
+
+    `update_ACTIVES_OPCODE` da biblioteca pede binary/turbo e **depois**
+    crypto, forex e cfd, com um deadline compartilhado. Sondados um a um em
+    2026-09-04 (`GET /instruments/probe`), os três últimos deram
+    **TimeoutError** — a BullEx não serve esses canais. Como eles consumiam
+    todo o orçamento, o `/assets` estourava em 100% das chamadas (com 8s e
+    também com 25s), o robô caía na lista fixa `BINARY_ALLOWED_ASSETS` e
+    ninguém nunca conseguia enumerar o que a corretora de fato oferece.
+
+    Aqui só o passo de binary/turbo é executado. Se um dia a corretora passar
+    a servir forex/cfd, a sonda mostra e este trecho volta a incluí-los.
+    """
+    client.get_ALL_Binary_ACTIVES_OPCODE(timeout=INSTRUMENTS_TIMEOUT_SECONDS)
     return normalize_assets(client.get_all_ACTIVES_OPCODE())
 
 
@@ -2331,6 +2428,36 @@ def read_assets(client: Bullex, *, user_id: str) -> list[dict[str, Any]]:
     return clone_assets(state.assets) or []
 
 
+def _payout_turbo_binary(
+    profit_map: dict[str, dict[str, float]],
+    symbol: str,
+    open_turbo: bool | None,
+    open_binary: bool | None,
+) -> float | None:
+    """Payout do canal que esta ABERTO para este ativo.
+
+    Prefere o canal aberto; com os dois abertos fica com o maior. Canal fechado
+    nunca entra — anunciar payout de canal fechado e o caminho direto para
+    "asset is not available at the moment" na hora da compra.
+
+    Args:
+        profit_map: Mapa de ``read_binary_profit_map``.
+        symbol: Ativo no nome interno.
+        open_turbo: Turbo aberto, fechado ou desconhecido.
+        open_binary: Binary aberto, fechado ou desconhecido.
+
+    Returns:
+        Payout em percentual, ou ``None`` quando nenhum canal aberto oferece.
+    """
+    canais = profit_map.get(normalize_binary_active(symbol)) or {}
+    candidatos = [
+        canais.get(nome)
+        for nome, aberto in (("turbo", open_turbo), ("binary", open_binary))
+        if aberto and isinstance(canais.get(nome), (int, float))
+    ]
+    return max(candidatos) if candidatos else None
+
+
 def read_digital_payout(client: Bullex, active: str) -> int | float | None:
     getter = getattr(client, "get_digital_payout", None)
     if not callable(getter):
@@ -2379,7 +2506,10 @@ def parse_binary_open_map(init_result: Any) -> dict[str, dict[str, bool]]:
                 continue
             raw_name = str(active.get("name") or "")
             name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
-            symbol = normalize_binary_active(name)
+            # Indexado pelo NOSSO nome: assim TODA consulta existente
+            # (`/payouts`, portao da compra, resolve_channel_open) volta a
+            # encontrar o par aberto sem precisar mudar cada uma delas.
+            symbol = to_internal_active(name)
             if not symbol:
                 continue
             is_open = bool(active.get("enabled")) and not bool(active.get("is_suspended"))
@@ -2435,6 +2565,72 @@ def read_binary_open_map(client: Bullex, *, user_id: str) -> dict[str, dict[str,
     with _binary_open_cache_lock:
         _binary_open_cache[user_id] = (now + ttl, open_map)
     return open_map
+
+
+_binary_profit_cache: dict[str, tuple[float, dict[str, dict[str, float]]]] = {}
+_binary_profit_cache_lock = Lock()
+
+
+def parse_binary_profit_map(profit_result: Any) -> dict[str, dict[str, float]]:
+    """Converte ``get_all_profit()`` em payout por ativo, no NOSSO nome.
+
+    A corretora devolve fracao (0.84) por canal; aqui vira percentual (84), que
+    e a escala que o robo compara com ``min_payout``.
+
+    Args:
+        profit_result: Retorno bruto de ``client.get_all_profit()``.
+
+    Returns:
+        Mapa ``{ativo: {"turbo": 84.0, "binary": 85.0}}``.
+    """
+    mapa: dict[str, dict[str, float]] = {}
+    if not isinstance(profit_result, dict):
+        return mapa
+    for nome, canais in profit_result.items():
+        if not isinstance(canais, dict):
+            continue
+        simbolo = to_internal_active(str(nome))
+        if not simbolo:
+            continue
+        for canal in ("turbo", "binary"):
+            valor = canais.get(canal)
+            if isinstance(valor, (int, float)) and valor > 0:
+                mapa.setdefault(simbolo, {})[canal] = round(float(valor) * 100, 2)
+    return mapa
+
+
+def read_binary_profit_map(client: Bullex, *, user_id: str) -> dict[str, dict[str, float]]:
+    """Payout turbo/binary por ativo, com o mesmo cache/TTL do mapa de abertura.
+
+    Existe porque ``get_digital_payout`` devolve ``None`` para par de mercado
+    aberto — ele consulta o canal digital, e o par aberto e vendido em
+    turbo/binary. Sem isto o par abria, tinha payout na corretora e mesmo assim
+    morria em PAYOUT_UNAVAILABLE.
+
+    Args:
+        client: Cliente BullEx conectado.
+        user_id: Chave de cache.
+
+    Returns:
+        Mapa de payout por ativo; vazio quando a corretora nao respondeu.
+    """
+    now = time.monotonic()
+    with _binary_profit_cache_lock:
+        cached = _binary_profit_cache.get(user_id)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    try:
+        bruto = client.get_all_profit()
+    except SESSION_EXCEPTION_TYPES:
+        raise
+    except Exception:
+        logger.warning("[BINARY_PROFIT_MAP_ERROR] user_id=%s", user_id, exc_info=True)
+        bruto = None
+    mapa = parse_binary_profit_map(bruto)
+    ttl = BINARY_OPEN_TTL_SECONDS if mapa else BINARY_OPEN_FAILURE_TTL_SECONDS
+    with _binary_profit_cache_lock:
+        _binary_profit_cache[user_id] = (now + ttl, mapa)
+    return mapa
 
 
 def clear_binary_open_cache(user_id: str) -> None:
@@ -2676,6 +2872,63 @@ def connect_session(
         )
 
 
+def _live_server_timestamp(user_id: str) -> float | None:
+    """Relógio da corretora lido direto da sessão viva.
+
+    ``timesync.server_timestamp`` é atributo em memória atualizado pelo
+    heartbeat do WS: ler não custa I/O nem passa pelo gate de chamadas.
+    """
+    try:
+        session = session_manager.get(user_id)
+        if session is None:
+            return None
+        timestamp = float(session.client.get_server_timestamp())
+    except Exception:
+        logger.warning("[LIVE_SERVER_TIME_FAILED] user_id=%s", user_id, exc_info=True)
+        return None
+    return timestamp if timestamp > 0 else None
+
+
+def with_fresh_server_time(payload: dict[str, Any], user_id: str) -> dict[str, Any]:
+    """Reescreve ``server_time`` com leitura viva antes de responder.
+
+    A resposta de ``/sessions/status`` é cacheada por ``SESSION_STATUS_TTL_SECONDS``
+    e re-servida pelo throttle de ``SESSION_STATUS_THROTTLE_SECONDS``. O
+    ``server_time`` congelava DENTRO do payload cacheado: medido em produção
+    2026-09-01, requisições a cada 3s receberam o MESMO timestamp por 58s
+    seguidos (defasagem crescendo de 25s para 73s), enquanto uma leitura fresca
+    ficava 0,15–0,86s atrás do relógio local. Como vários robôs consultam este
+    endpoint continuamente, o throttle mantinha a amostra congelada
+    indefinidamente.
+
+    Esse atraso ia inteiro para a janela de compra: o robô calculava o segundo
+    da vela a partir dele e achava que entrava no segundo 1,8 quando entrava, de
+    fato, no segundo 10,2 (mediana de 209 ordens). A telemetria era derivada do
+    mesmo relógio, então confirmava a si mesma e o defeito ficava invisível.
+
+    O resto do payload continua vindo do cache — ``connected`` e ``active_mode``
+    são o que custa chamada à corretora. O timestamp não custa nada.
+
+    Args:
+        payload: Resposta de ``/sessions/status`` (fresca ou de cache).
+        user_id: Dono da sessão.
+
+    Returns:
+        Payload com ``server_time`` vivo e ``server_time_sampled_at`` carimbado.
+        Devolve o original quando não há sessão conectada para consultar.
+    """
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data.get("connected"):
+        return payload
+    live = _live_server_timestamp(user_id)
+    if live is None:
+        return payload
+    return {
+        **payload,
+        "data": {**data, "server_time": live, "server_time_sampled_at": time.time()},
+    }
+
+
 @app.get("/sessions/status")
 def session_status(
     x_user_id: str | None = Header(default=None),
@@ -2708,6 +2961,8 @@ def session_status(
         cached = session_manager.get_cached_probe(user_id, "/sessions/status", path="/sessions/status")
         if cached is not None:
             status_code, payload = cached
+            # `server_time` NUNCA sai do cache — ver `with_fresh_server_time`.
+            payload = with_fresh_server_time(payload, user_id)
             return JSONResponse(status_code=status_code, content=with_login_progress(payload, user_id))
 
         def operation(current: ManagedSession) -> dict[str, Any]:
@@ -2740,7 +2995,7 @@ def session_status(
                 payload,
                 ttl_seconds=SESSION_STATUS_TTL_SECONDS,
             )
-            return JSONResponse(status_code=200, content=payload)
+            return JSONResponse(status_code=200, content=with_fresh_server_time(payload, user_id))
         except ServiceError as exc:
             if exc.message in {SESSION_NOT_FOUND, SESSION_DISCONNECTED}:
                 status_code = 404 if exc.message == SESSION_NOT_FOUND else 409
@@ -3041,6 +3296,10 @@ def get_payouts(active: str | None = None, x_user_id: str | None = Header(defaul
                 raise ServiceError(SESSION_DISCONNECTED, 409) from exc
 
         open_map = read_binary_open_map(session.client, user_id=user_id)
+        # `get_digital_payout` so enxerga o canal digital, e o par de mercado
+        # aberto e vendido em turbo/binary — por isso ele voltava None e o par
+        # morria em PAYOUT_UNAVAILABLE mesmo estando ABERTO na corretora.
+        profit_map = read_binary_profit_map(session.client, user_id=user_id) if active else {}
         result: list[dict[str, Any]] = []
         for symbol in symbols:
             entry = open_map.get(normalize_binary_active(symbol)) or {}
@@ -3052,7 +3311,12 @@ def get_payouts(active: str | None = None, x_user_id: str | None = Header(defaul
             result.append(
                 {
                     "symbol": symbol,
-                    "payout": read_digital_payout(session.client, symbol) if active else None,
+                    "payout": (
+                        read_digital_payout(session.client, symbol)
+                        or _payout_turbo_binary(profit_map, symbol, open_turbo, open_binary)
+                        if active
+                        else None
+                    ),
                     "type": "digital",
                     "open_turbo": open_turbo,
                     "open_binary": open_binary,
@@ -3156,9 +3420,12 @@ def buy_real(payload: BuyOrderRequest, x_user_id: str | None = Header(default=No
 
         def place_buy() -> tuple[bool, Any]:
             ensure_real_balance_id_for_buy(session, user_id=user_id)
+            # `client.buy` fala com o catalogo turbo/binary, onde o par de
+            # mercado aberto se chama `EURUSD-op`. Mandar `EURUSD` e ordem
+            # recusada. OTC passa intacto por `to_broker_active`.
             return session.client.buy(
                 payload.amount,
-                payload.active,
+                to_broker_active(payload.active),
                 payload.action,
                 payload.expiration,
             )
@@ -3244,6 +3511,314 @@ def buy_real(payload: BuyOrderRequest, x_user_id: str | None = Header(default=No
     return build_success(session_manager.run(user_id, operation))
 
 
+@app.get("/instruments/probe")
+def instruments_probe(x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
+    """Diz quais canais de instrumento a corretora responde, um a um.
+
+    `update_ACTIVES_OPCODE` pede binary/turbo e depois crypto, forex e cfd em
+    sequência, com um deadline compartilhado — se um canal não responde, ele
+    consome o orçamento e o `/assets` inteiro estoura. Foi o que aconteceu:
+    `INSTRUMENTS_TIMEOUT` em 100% das chamadas, com 8s e também com 25s.
+
+    Esta sonda testa cada canal isolado e com timeout curto, então distingue
+    "a corretora é lenta" de "a corretora não oferece este canal" — que é a
+    pergunta que decide se dá para operar CFD/forex além da opção binária.
+
+    Args:
+        x_user_id: Dono da sessão conectada.
+
+    Returns:
+        Envelope com ``{canal: {"respondeu": bool, "itens": int, "erro": str}}``.
+    """
+    user_id = require_user_id(x_user_id)
+
+    def operation(session: ManagedSession) -> dict[str, Any]:
+        ensure_session_ready(session)
+        resultado: dict[str, Any] = {}
+        for canal in ("crypto", "forex", "cfd"):
+            inicio = time.monotonic()
+            try:
+                dados = session.client.get_instruments(canal, timeout=6)
+            except Exception as exc:  # noqa: BLE001 - a sonda nunca derruba a sessão
+                resultado[canal] = {
+                    "respondeu": False,
+                    "itens": 0,
+                    "erro": type(exc).__name__,
+                    "ms": int((time.monotonic() - inicio) * 1000),
+                }
+                continue
+            itens = 0
+            if isinstance(dados, dict):
+                lista = (dados.get("instruments") or dados.get("msg") or {})
+                if isinstance(lista, dict):
+                    lista = lista.get("instruments") or []
+                itens = len(lista) if isinstance(lista, list) else 0
+            resultado[canal] = {
+                "respondeu": dados is not None,
+                "itens": itens,
+                "erro": None,
+                "ms": int((time.monotonic() - inicio) * 1000),
+            }
+        return resultado
+
+    return build_success(session_manager.run(user_id, operation))
+
+
+@app.get("/catalog/probe")
+def catalog_probe(
+    digital_timeout: float = 20.0,
+    other_timeout: float = 20.0,
+    x_user_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Dump read-only do catálogo REAL da corretora, canal por canal.
+
+    Responde a pergunta que nenhum log responde: a BullEx oferece par de
+    mercado aberto (não-OTC) e, se oferece, em QUAL canal — turbo, binary,
+    digital ou só forex/CFD. Até aqui só perguntávamos "o EURUSD está no mapa?"
+    e tratávamos a ausência como "fechado"; nunca olhamos o que o mapa TEM.
+
+    Não filtra por ``BINARY_ALLOWED_ASSETS`` de propósito — a allowlist é nossa,
+    e o objetivo aqui é justamente ver o que existe fora dela.
+
+    Args:
+        digital_timeout: Espera do catálogo digital (a lib usa 30s fixos por
+            dentro; este valor limita a nossa thread).
+        other_timeout: Orçamento para crypto/forex/cfd somados.
+        x_user_id: Dono da sessão conectada.
+
+    Returns:
+        Envelope com um bloco por canal: itens, quantos são não-OTC e amostra.
+    """
+    user_id = require_user_id(x_user_id)
+
+    def _split(nomes: list[str]) -> dict[str, Any]:
+        otc = sorted({n for n in nomes if "OTC" in n.upper()})
+        aberto = sorted({n for n in nomes if "OTC" not in n.upper()})
+        return {
+            "total": len(nomes),
+            "otc": len(otc),
+            "nao_otc": len(aberto),
+            "nao_otc_nomes": aberto,
+            "otc_amostra": otc[:8],
+        }
+
+    def operation(session: ManagedSession) -> dict[str, Any]:
+        ensure_session_ready(session)
+        client = session.client
+        resultado: dict[str, Any] = {}
+
+        # 1) turbo / binary — é o que `client.buy()` usa.
+        try:
+            init = client.get_all_init_v2(timeout=15)
+        except Exception as exc:  # noqa: BLE001 - sonda nunca derruba a sessão
+            init = None
+            resultado["init_v2_erro"] = type(exc).__name__
+        for canal in ("turbo", "binary"):
+            secao = (init or {}).get(canal) if isinstance(init, dict) else None
+            if not isinstance(secao, dict) or not isinstance(secao.get("actives"), dict):
+                resultado[canal] = {"respondeu": False}
+                continue
+            nomes: list[str] = []
+            abertos: list[str] = []
+            for ativo in secao["actives"].values():
+                if not isinstance(ativo, dict):
+                    continue
+                bruto = str(ativo.get("name") or "")
+                nome = bruto.split(".", 1)[1] if "." in bruto else bruto
+                if not nome:
+                    continue
+                nomes.append(nome)
+                if bool(ativo.get("enabled")) and not bool(ativo.get("is_suspended")):
+                    abertos.append(nome)
+            bloco = {"respondeu": True, **_split(nomes)}
+            bloco["abertos_agora"] = len(abertos)
+            bloco["abertos_nao_otc"] = sorted(
+                {n for n in abertos if "OTC" not in n.upper()}
+            )
+            resultado[canal] = bloco
+
+        # 2) digital — canal separado, com agenda de abertura por ativo.
+        try:
+            dados = client.get_digital_underlying_list_data()
+        except Exception as exc:  # noqa: BLE001
+            dados = None
+            resultado["digital_erro"] = type(exc).__name__
+        lista = (dados or {}).get("underlying") if isinstance(dados, dict) else None
+        if isinstance(lista, list):
+            nomes = [str(item.get("underlying") or "") for item in lista if isinstance(item, dict)]
+            nomes = [n for n in nomes if n]
+            agora = time.time()
+            abertos = []
+            for item in lista:
+                if not isinstance(item, dict):
+                    continue
+                nome = str(item.get("underlying") or "")
+                for janela in item.get("schedule") or []:
+                    if not isinstance(janela, dict):
+                        continue
+                    if float(janela.get("open") or 0) < agora < float(janela.get("close") or 0):
+                        abertos.append(nome)
+                        break
+            bloco = {"respondeu": True, **_split(nomes)}
+            bloco["abertos_agora"] = len(set(abertos))
+            bloco["abertos_nao_otc"] = sorted(
+                {n for n in abertos if "OTC" not in n.upper()}
+            )
+            resultado["digital"] = bloco
+        else:
+            resultado["digital"] = {"respondeu": False}
+
+        # 3) forex / cfd / crypto — instrumentos não-binários (o que o dono viu
+        #    na tela da corretora). Orçamento compartilhado, como na lib.
+        prazo = time.time() + float(other_timeout)
+        for canal in ("forex", "cfd", "crypto"):
+            restante = prazo - time.time()
+            if restante <= 0:
+                resultado[canal] = {"respondeu": False, "erro": "SEM_ORCAMENTO"}
+                continue
+            try:
+                dados = client.get_instruments(canal, timeout=restante)
+            except Exception as exc:  # noqa: BLE001
+                resultado[canal] = {"respondeu": False, "erro": type(exc).__name__}
+                continue
+            itens = (dados or {}).get("instruments") if isinstance(dados, dict) else None
+            if not isinstance(itens, list):
+                resultado[canal] = {"respondeu": dados is not None, "total": 0}
+                continue
+            nomes = [str(i.get("name") or "") for i in itens if isinstance(i, dict)]
+            nomes = [n for n in nomes if n]
+            agora = time.time()
+            abertos = []
+            for i in itens:
+                if not isinstance(i, dict):
+                    continue
+                for janela in i.get("schedule") or []:
+                    if not isinstance(janela, dict):
+                        continue
+                    if float(janela.get("open") or 0) < agora < float(janela.get("close") or 0):
+                        abertos.append(str(i.get("name") or ""))
+                        break
+            bloco = {"respondeu": True, **_split(nomes)}
+            bloco["abertos_agora"] = len(set(abertos))
+            resultado[canal] = bloco
+
+        # 4) payout por ativo, do jeito que o robô pergunta (`get_all_profit`).
+        try:
+            lucros = client.get_all_profit()
+        except Exception as exc:  # noqa: BLE001
+            lucros = None
+            resultado["profit_erro"] = type(exc).__name__
+        if isinstance(lucros, dict):
+            amostra: dict[str, Any] = {}
+            for nome, valores in lucros.items():
+                if not isinstance(valores, dict):
+                    continue
+                if "OTC" in str(nome).upper() and len(amostra) > 40:
+                    continue
+                amostra[str(nome)] = {
+                    k: (round(float(v) * 100) if isinstance(v, (int, float)) else v)
+                    for k, v in valores.items()
+                }
+            resultado["profit"] = {
+                "respondeu": True,
+                "total": len(lucros),
+                "nao_otc": sorted(
+                    {str(n) for n in lucros if "OTC" not in str(n).upper()}
+                ),
+                "por_ativo": amostra,
+            }
+        else:
+            resultado["profit"] = {"respondeu": False}
+
+        return resultado
+
+    return build_success(
+        session_manager.run(
+            user_id,
+            operation,
+            disconnect_on_error=False,
+            timeout_seconds=float(digital_timeout) + float(other_timeout) + 40.0,
+            gate_timeout=60.0,
+        )
+    )
+
+
+@app.post("/orders/buy-digital")
+def buy_digital(payload: BuyDigitalRequest, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
+    """Compra no canal DIGITAL — o único aberto nos ativos de mercado aberto.
+
+    O ``/orders/buy-real`` manda por ``client.buy()``, que é turbo/binary. Nos
+    pares abertos esse canal fica fechado enquanto o digital responde payout
+    82–88, e a ordem morre em "asset is not available at the moment". Este
+    endpoint é o caminho que faltava.
+
+    Args:
+        payload: Ativo, valor, direção e duração em minutos.
+        x_user_id: Dono da sessão.
+
+    Returns:
+        Envelope padrão com ``order_id`` e ``channel="digital"``.
+
+    Raises:
+        ServiceError: Se o canal digital recusar ou não responder a tempo.
+    """
+    user_id = require_user_id(x_user_id)
+    active = ensure_binary_asset_allowed(payload.active)
+
+    def operation(session: ManagedSession) -> dict[str, Any]:
+        ensure_session_ready(session)
+        force_real_mode(session, user_id=user_id)
+        try:
+            active_id = OP_code.ACTIVES[active]
+        except KeyError as exc:
+            raise ServiceError(f"DIGITAL_ACTIVE_UNKNOWN:{active}", 400) from exc
+        try:
+            ok, order_id = place_digital_order(
+                session.client,
+                active=active,
+                active_id=active_id,
+                amount=float(payload.amount),
+                action=str(payload.action),
+                duration_minutes=int(payload.duration),
+            )
+        except DigitalOrderError as exc:
+            raise ServiceError(str(exc), 409) from exc
+        except ValueError as exc:
+            raise ServiceError(str(exc), 400) from exc
+        if not ok:
+            logger.warning("[DIGITAL_BUY_BLOCKED] user_id=%s active=%s motivo=%s", user_id, active, order_id)
+            raise ServiceError(f"DIGITAL_BUY_REJECTED:{order_id}", 409)
+        logger.info("[DIGITAL_BUY_SUCCESS] user_id=%s active=%s order_id=%s", user_id, active, order_id)
+        return {
+            "mode": "REAL",
+            "channel": "digital",
+            "order_id": order_id,
+            "active": active,
+            "amount": payload.amount,
+            "action": payload.action,
+            "expiration": payload.duration,
+        }
+
+    return build_success(session_manager.run(user_id, operation))
+
+
+@app.get("/orders/{order_id}/digital-result")
+def digital_result(order_id: str, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
+    """Resultado de uma ordem digital, sem bloquear.
+
+    A ``check_win_digital_v2`` da biblioteca faz espera ocupada até a posição
+    fechar. Aqui a leitura é um retrato: devolve ``PENDING_RESULT`` enquanto a
+    posição estiver aberta e quem chama volta a perguntar.
+    """
+    user_id = require_user_id(x_user_id)
+
+    def operation(session: ManagedSession) -> dict[str, Any]:
+        ensure_session_ready(session)
+        return read_digital_result(session.client, parse_order_id(order_id))
+
+    return build_success(session_manager.run(user_id, operation))
+
+
 @app.get("/orders/{order_id}/result")
 def order_result(order_id: str, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
     user_id = require_user_id(x_user_id)
@@ -3261,6 +3836,14 @@ def order_result(order_id: str, x_user_id: str | None = Header(default=None)) ->
         if closed_order is None:
             closed_order = order_binary.get(str(parsed_order_id))
         if not isinstance(closed_order, dict):
+            # Ordem do canal DIGITAL não aparece em socket_option_closed nem em
+            # order_binary. Sem esta consulta ela ficaria PENDING_RESULT para
+            # sempre: o gateway só chama `/orders/{id}/result`, então a
+            # operação nunca viraria win/loose no histórico e o ciclo travaria
+            # em SKIP_ANALYSIS_WAITING_RESULT.
+            digital = read_digital_result(session.client, parsed_order_id)
+            if digital.get("result") != "PENDING_RESULT":
+                return digital
             return {"order_id": parsed_order_id, "result": "PENDING_RESULT", "profit": None}
         message = closed_order.get("msg") if isinstance(closed_order.get("msg"), dict) else closed_order
         if not isinstance(message, dict):

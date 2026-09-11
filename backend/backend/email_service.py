@@ -10,7 +10,9 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -24,6 +26,7 @@ from backend.email_models import (
     RenderedEmail,
 )
 from backend.email_repository import EmailRepository, new_template_id
+from backend.email_templates_default import DEFAULT_BODIES, DEFAULT_SUBJECTS
 from backend.webhook_models import DomainEvent, DomainEventType
 
 
@@ -40,11 +43,18 @@ TEMPLATE_VARIABLE_DESCRIPTIONS: dict[str, str] = {
     "first_access_url": "Link para definir senha no primeiro acesso",
     "first_access_block": (
         "Bloco HTML com o link de 1º acesso (só aparece quando há link; "
-        "vazio em renovações de clientes já cadastrados)"
+        "vazio quando a conta já existia — nesses casos use purchase.existing_account)"
     ),
     "recovery_url": "Link de recuperação de senha",
     "expires_at": "Data/hora de expiração (ISO)",
     "expires_in_seconds": "Segundos até expirar o link",
+    "amount_display": "Valor já formatado para exibição (ex.: R$ 147,90)",
+    "plan_name_display": "Nome do plano com fallback quando o evento não traz plano",
+    "expires_at_br": "Data/hora de expiração em pt-BR (ex.: 15/09/2026 às 23:59)",
+    "expires_in_human": "Validade do link por extenso (ex.: 1 hora)",
+    "first_access_cta_url": (
+        "Destino do botão de 1º acesso: o link de senha, ou o login quando não houver"
+    ),
     "login_url": "URL de login do painel",
     "company_name": "Nome da empresa (ElCapo AutoBot)",
     "event_type": "Código do evento que disparou o e-mail",
@@ -56,6 +66,7 @@ AVAILABLE_TEMPLATE_VARIABLES: tuple[str, ...] = tuple(TEMPLATE_VARIABLE_DESCRIPT
 
 EVENT_LABELS: dict[DomainEventType, str] = {
     DomainEventType.PURCHASE_COMPLETED: "Compra / boas-vindas",
+    DomainEventType.PURCHASE_EXISTING_ACCOUNT: "Compra (já tinha conta)",
     DomainEventType.SUBSCRIPTION_RENEWED: "Assinatura renovada",
     DomainEventType.SUBSCRIPTION_CANCELED: "Assinatura cancelada",
     DomainEventType.PAYMENT_REFUNDED: "Reembolso",
@@ -66,106 +77,104 @@ EVENT_LABELS: dict[DomainEventType, str] = {
     DomainEventType.PASSWORD_RECOVERY_REQUESTED: "Recuperação de senha",
 }
 
-DEFAULT_SUBJECTS: dict[DomainEventType, str] = {
-    DomainEventType.PURCHASE_COMPLETED: "Bem-vindo ao ElCapo AutoBot",
-    DomainEventType.SUBSCRIPTION_RENEWED: "Assinatura renovada — ElCapo",
-    DomainEventType.SUBSCRIPTION_CANCELED: "Assinatura cancelada — ElCapo",
-    DomainEventType.PAYMENT_REFUNDED: "Reembolso confirmado — ElCapo",
-    DomainEventType.PAYMENT_CHARGEBACK: "Atualização de pagamento — ElCapo",
-    DomainEventType.SUBSCRIPTION_PAYMENT_FAILED: "Falha no pagamento — ElCapo",
-    DomainEventType.TRIAL_STARTED: "Seu teste grátis começou — ElCapo",
-    DomainEventType.TRIAL_ENDED: "Seu teste grátis encerrou — ElCapo",
-    DomainEventType.PASSWORD_RECOVERY_REQUESTED: "Redefinir senha — ElCapo",
-}
+ENABLED_ON_SEED: frozenset[DomainEventType] = frozenset(DomainEventType)
+"""Todos os eventos canônicos nascem com envio ligado.
 
-DEFAULT_HTML_SHELL = """<!DOCTYPE html>
-<html lang="pt-BR">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width"></head>
-<body style="margin:0;padding:0;background:#0b1220;font-family:Arial,Helvetica,sans-serif;color:#e8f7f8;">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0b1220;padding:32px 16px;">
-    <tr><td align="center">
-      <table role="presentation" width="560" cellspacing="0" cellpadding="0" style="background:#121a2b;border:1px solid #1e3a4a;border-radius:12px;overflow:hidden;">
-        <tr><td style="padding:28px 28px 8px;font-size:22px;font-weight:700;color:#7ef0f3;">ElCapo AutoBot</td></tr>
-        <tr><td style="padding:8px 28px 24px;font-size:15px;line-height:1.55;color:#c9e4e6;">
-          {body}
-        </td></tr>
-        <tr><td style="padding:16px 28px 28px;font-size:12px;color:#6f8b8e;">
-          Este email foi enviado automaticamente. Não compartilhe links de acesso.
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+Cada evento tem um HTML de fábrica pronto em
+:mod:`backend.email_templates_default`; um tenant novo já se comunica em todo o
+ciclo de vida do cliente sem depender de configuração manual. Desligar um envio
+continua sendo uma decisão explícita do admin em Admin -> E-mails.
+"""
 
-DEFAULT_BODIES: dict[DomainEventType, str] = {
-    DomainEventType.PURCHASE_COMPLETED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Sua compra do plano <strong>{{plan_name}}</strong> foi confirmada"
-            " ({{amount}} {{currency}}).<br><br>"
-            "{{first_access_block}}"
-            'Acesse o painel: <a href="{{login_url}}" style="color:#7ef0f3;">{{login_url}}</a>'
-        )
-    ),
-    DomainEventType.SUBSCRIPTION_RENEWED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Sua assinatura <strong>{{plan_name}}</strong> foi renovada"
-            " ({{amount}} {{currency}})."
-        )
-    ),
-    DomainEventType.SUBSCRIPTION_CANCELED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Sua assinatura <strong>{{plan_name}}</strong> foi cancelada."
-            " Você pode reativar em <a href=\"{{login_url}}\" style=\"color:#7ef0f3;\">{{login_url}}</a>."
-        )
-    ),
-    DomainEventType.PAYMENT_REFUNDED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Confirmamos o reembolso de {{amount}} {{currency}}."
-        )
-    ),
-    DomainEventType.PAYMENT_CHARGEBACK: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Registramos uma contestação de {{amount}} {{currency}}."
-            " Se precisar de suporte, responda este email."
-        )
-    ),
-    DomainEventType.SUBSCRIPTION_PAYMENT_FAILED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Não foi possível processar o pagamento de <strong>{{plan_name}}</strong>."
-            " Atualize seus dados em <a href=\"{{login_url}}\" style=\"color:#7ef0f3;\">{{login_url}}</a>."
-        )
-    ),
-    DomainEventType.TRIAL_STARTED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Seu teste grátis está ativo até <strong>{{expires_at}}</strong>."
-            " Entre em <a href=\"{{login_url}}\" style=\"color:#7ef0f3;\">{{login_url}}</a>."
-        )
-    ),
-    DomainEventType.TRIAL_ENDED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Seu teste grátis encerrou. Escolha uma oferta em"
-            " <a href=\"{{login_url}}\" style=\"color:#7ef0f3;\">{{login_url}}</a>."
-        )
-    ),
-    DomainEventType.PASSWORD_RECOVERY_REQUESTED: DEFAULT_HTML_SHELL.format(
-        body=(
-            "Olá <strong>{{customer_name}}</strong>,<br><br>"
-            "Recebemos um pedido para redefinir sua senha.<br>"
-            'Use este link (válido por {{expires_in_seconds}}s):'
-            ' <a href="{{recovery_url}}" style="color:#7ef0f3;">{{recovery_url}}</a><br><br>'
-            "Se não foi você, ignore este email."
-        )
-    ),
-}
+FACTORY_RENEWAL_MARK = "RENOVAÇÃO CONFIRMADA"
+FACTORY_RENEWAL_SNIPPET = "Sua assinatura <strong>{{plan_name}}</strong> foi renovada"
+
+
+AMOUNT_FALLBACK = "—"
+PLAN_FALLBACK = "ElCapo AutoBot"
+EXPIRY_FALLBACK = "tempo limitado"
+SAO_PAULO_TZ = ZoneInfo("America/Sao_Paulo")
+
+
+def format_amount(amount: Any, currency: Any) -> str:
+    """
+    Formata valor + moeda para leitura humana no corpo do e-mail.
+
+    O payload dos webhooks entrega ``amount`` como float (``147.9``) e
+    ``currency`` como código ISO (``BRL``), o que renderizava "BRL 147.9" para o
+    cliente. Aqui vira "R$ 147,90".
+
+    Args:
+        amount: Valor bruto do evento (float, str ou None).
+        currency: Código da moeda, ou vazio.
+
+    Returns:
+        Valor pronto para exibição, ou ``—`` quando o evento não tem valor.
+    """
+    raw = str(amount or "").strip()
+    if not raw:
+        return AMOUNT_FALLBACK
+    try:
+        value = Decimal(raw).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return raw
+    code = str(currency or "").strip().upper()
+    grouped = f"{value:,.2f}"
+    if code in ("BRL", ""):
+        # 1,234.56 -> 1.234,56
+        return "R$ " + grouped.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+    return f"{code} {grouped}"
+
+
+def format_datetime_br(value: Any) -> str:
+    """
+    Converte um instante ISO em data/hora de Brasília por extenso.
+
+    Args:
+        value: Timestamp ISO-8601 do evento, ou None.
+
+    Returns:
+        ``15/09/2026 às 23:59`` ou ``—`` quando não há data no evento.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return AMOUNT_FALLBACK
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = parsed.astimezone(SAO_PAULO_TZ)
+    return local.strftime("%d/%m/%Y às %H:%M")
+
+
+def format_duration_br(seconds: Any) -> str:
+    """
+    Descreve uma validade em segundos com palavras (para links de senha).
+
+    Args:
+        seconds: Janela de validade do link, em segundos.
+
+    Returns:
+        ``1 hora``, ``30 minutos``, ``2 dias``… ou ``tempo limitado``.
+    """
+    try:
+        total = int(float(str(seconds).strip()))
+    except (TypeError, ValueError):
+        return EXPIRY_FALLBACK
+    if total <= 0:
+        return EXPIRY_FALLBACK
+    if total < 60:
+        return f"{total} segundo" + ("s" if total != 1 else "")
+    if total < 3600:
+        minutes = total // 60
+        return f"{minutes} minuto" + ("s" if minutes != 1 else "")
+    if total < 86400:
+        hours = total // 3600
+        return f"{hours} hora" + ("s" if hours != 1 else "")
+    days = total // 86400
+    return f"{days} dia" + ("s" if days != 1 else "")
 
 
 class EmailError(Exception):
@@ -390,6 +399,8 @@ class EmailService:
             template = existing.get(event_type)
             if template is None:
                 template = await self._seed_default(actor.company_id, event_type)
+            else:
+                template = await self._upgrade_factory_template(template)
             result.append(template)
         return result
 
@@ -527,7 +538,11 @@ class EmailService:
         if not self.config.enabled:
             return None
         template = await self.repository.get_template(event.company_id, event.event_type)
-        if template is None or not template.is_enabled:
+        if template is None:
+            template = await self._seed_default(event.company_id, event.event_type)
+        else:
+            template = await self._upgrade_factory_template(template)
+        if not template.is_enabled:
             return None
         customer = event.payload.get("customer") or {}
         recipient = str(customer.get("email") or "").strip().lower()
@@ -571,15 +586,13 @@ class EmailService:
                 extra={"request_id": event.request_id, "error_code": type(exc).__name__},
                 exc_info=True,
             )
-            # Fallback local: envia no processo se o broker falhar em development.
-            if os.getenv("APP_ENV", "development").lower() != "production":
-                return await self.deliver_now(
-                    delivery,
-                    recipient_email=recipient,
-                    html_body=rendered.html_body,
-                    subject=rendered.subject,
-                )
-            raise EmailDeliveryError("QUEUE_FAILED") from exc
+            # Fallback: envia no processo atual para não deixar status=pending eterno.
+            return await self.deliver_now(
+                delivery,
+                recipient_email=recipient,
+                html_body=rendered.html_body,
+                subject=rendered.subject,
+            )
         return delivery
 
     async def deliver_now(
@@ -652,15 +665,63 @@ class EmailService:
         limit: int = 20,
         offset: int = 0,
     ) -> list[EmailDelivery]:
-        """Lista entregas sanitizadas do tenant."""
+        """
+        Lista entregas sanitizadas do tenant.
+
+        Reconcilia pendentes órfãos (0 tentativas e idade alta): esses registros
+        nunca foram despachados pelo worker e passam a `failed` com
+        `DISPATCH_TIMEOUT`, para a UI não mentir "Pendente" como se ainda
+        fossem sair.
+        """
         self._require(actor, AdminPermission.EMAILS_VIEW)
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
-        return await self.repository.list_deliveries(
+        items = await self.repository.list_deliveries(
             actor.company_id,
             limit=limit,
             offset=offset,
         )
+        return await self._reconcile_orphan_pending(items)
+
+    async def _reconcile_orphan_pending(
+        self,
+        items: list[EmailDelivery],
+        *,
+        older_than_seconds: int = 300,
+    ) -> list[EmailDelivery]:
+        """
+        Marca como falha entregas pending que nunca tiveram tentativa de envio.
+
+        Args:
+            items: Entregas retornadas do repositório.
+            older_than_seconds: Idade mínima para considerar órfã (padrão 5 min).
+
+        Returns:
+            Lista possivelmente atualizada (mesma ordem).
+        """
+        now = datetime.now(timezone.utc)
+        reconciled: list[EmailDelivery] = []
+        for item in items:
+            age = (now - item.created_at).total_seconds()
+            if (
+                item.status == EmailDeliveryStatus.PENDING
+                and item.attempt_count == 0
+                and age >= older_than_seconds
+            ):
+                item.status = EmailDeliveryStatus.FAILED
+                item.last_error_code = "DISPATCH_TIMEOUT"
+                item.updated_at = now
+                item = await self.repository.save_delivery(item)
+                logger.warning(
+                    "email.orphan_pending_marked_failed",
+                    extra={
+                        "request_id": item.request_id,
+                        "delivery_id": item.id,
+                        "event_type": item.event_type.value,
+                    },
+                )
+            reconciled.append(item)
+        return reconciled
 
     @staticmethod
     def _build_first_access_block(first_access_url: Any) -> str:
@@ -711,6 +772,17 @@ class EmailService:
             "checkout_url": str(data.get("checkout_url") or ""),
             "support_url": str(data.get("support_url") or ""),
         }
+        # Versões prontas para leitura: o motor de render não tem filtros, então
+        # a formatação precisa chegar pronta como variável.
+        variables["amount_display"] = format_amount(data.get("amount"), data.get("currency"))
+        variables["plan_name_display"] = variables["plan_name"] or PLAN_FALLBACK
+        variables["expires_at_br"] = format_datetime_br(data.get("expires_at"))
+        variables["expires_in_human"] = format_duration_br(data.get("expires_in_seconds"))
+        # O botão de 1º acesso nunca pode virar href="": sem link de senha,
+        # o destino útil é a tela de login.
+        variables["first_access_cta_url"] = (
+            variables["first_access_url"] or variables["login_url"]
+        )
         # Aliases amigáveis usados no admin (mesmos valores).
         variables["name"] = variables["customer_name"]
         variables["email"] = variables["customer_email"]
@@ -751,7 +823,7 @@ class EmailService:
         company_id: str,
         event_type: DomainEventType,
     ) -> EmailTemplate:
-        """Persiste template padrão desativado."""
+        """Persiste template padrão; compra e renovação nascem ativos."""
         now = datetime.now(timezone.utc)
         template = EmailTemplate(
             id=new_template_id(),
@@ -759,11 +831,42 @@ class EmailService:
             event_type=event_type,
             subject=DEFAULT_SUBJECTS[event_type],
             html_body=DEFAULT_BODIES[event_type],
-            is_enabled=False,
+            is_enabled=event_type in ENABLED_ON_SEED,
             created_at=now,
             updated_at=now,
         )
         return await self.repository.upsert_template(template)
+
+    async def _upgrade_factory_template(self, template: EmailTemplate) -> EmailTemplate:
+        """
+        Atualiza o HTML de fábrica da renovação (versão curta, desligada).
+
+        Não altera templates que o admin já personalizou.
+
+        Args:
+            template: Template persistido do tenant.
+
+        Returns:
+            Template atualizado ou o original.
+        """
+        if template.event_type != DomainEventType.SUBSCRIPTION_RENEWED:
+            return template
+        if FACTORY_RENEWAL_MARK in template.html_body:
+            return template
+        if FACTORY_RENEWAL_SNIPPET not in template.html_body:
+            return template
+        now = datetime.now(timezone.utc)
+        upgraded = EmailTemplate(
+            id=template.id,
+            company_id=template.company_id,
+            event_type=template.event_type,
+            subject=DEFAULT_SUBJECTS[template.event_type],
+            html_body=DEFAULT_BODIES[template.event_type],
+            is_enabled=True,
+            created_at=template.created_at,
+            updated_at=now,
+        )
+        return await self.repository.upsert_template(upgraded)
 
     async def _create_delivery(
         self,

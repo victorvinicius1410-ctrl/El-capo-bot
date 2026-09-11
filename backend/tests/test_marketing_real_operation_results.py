@@ -12,11 +12,20 @@ from backend.auto_trader import AutoTrader
 from backend.robot_persistence import SQLiteRobotPersistence
 
 
+# Usuários fixos usados pelos testes desta suíte (estado no Redis é global).
+MARKETING_FIXTURE_USER_IDS = (
+    "marketing-live-loss",
+    "marketing-live-win",
+    "marketing-scoreboard",
+    "marketing-delete-ghost",
+)
+
+
 class MarketingRealOperationResultTests(unittest.IsolatedAsyncioTestCase):
     """Garante que Shift+O edita métricas, mas operar usa resultado real."""
 
     async def asyncSetUp(self) -> None:
-        self.directory = tempfile.TemporaryDirectory()
+        self.directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.old_persistence = main.robot_persistence
         self.old_trader = main.auto_trader
         self.old_admin = main.admin_repository
@@ -26,6 +35,10 @@ class MarketingRealOperationResultTests(unittest.IsolatedAsyncioTestCase):
         )
         main.auto_trader = AutoTrader()
         main._marketing_override_by_user.clear()
+        # A marca de baixa intencional vive no Redis compartilhado (TTL 120s):
+        # sem limpar, o placar de uma execução anterior vaza para esta.
+        for fixture_user in MARKETING_FIXTURE_USER_IDS:
+            main.clear_session_score_authority(fixture_user)
         self.saved_trades: list[dict[str, Any]] = []
         saved_trades = self.saved_trades
 

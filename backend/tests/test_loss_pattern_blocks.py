@@ -300,6 +300,9 @@ class FrequencyRecoveryTests(unittest.TestCase):
     """Após seca longa, libera filtros de frequência (não anti-loss)."""
 
     def test_recovery_softens_price_action_and_trend_clear(self) -> None:
+        # Recovery estrito (2026-09-03): só TREND_CLEAR é dispensado. Com
+        # RECOVERY_STRICT=false o comportamento antigo volta e o teste original
+        # continua valendo — por isso as duas afirmações são condicionais.
         signal = _base_continuation_signal(
             price_action_setup="WEAK",
             trend="SIDEWAYS",
@@ -323,9 +326,20 @@ class FrequencyRecoveryTests(unittest.TestCase):
             for name in recovered["blocked_filters"]
             if name in main.effective_critical_trade_blocks(frequency_recovery=True)
         ]
-        self.assertNotIn("PRICE_ACTION_SETUP", hard)
         self.assertNotIn("TREND_CLEAR", hard)
+        if signal_engine.RECOVERY_STRICT:
+            self.assertIn("PRICE_ACTION_SETUP", hard)
+        else:
+            self.assertNotIn("PRICE_ACTION_SETUP", hard)
         self.assertNotIn("LAST_3_ALIGNMENT", signal_engine.FREQUENCY_RECOVERY_SOFT_BLOCKS)
+        self.assertNotIn("CANDLE_STRENGTH", main.CRITICAL_TRADE_BLOCKS)
+        self.assertNotIn("CALL_CHASE", main.CRITICAL_TRADE_BLOCKS)
+        self.assertNotIn("REPEAT_ENTRY", main.CRITICAL_TRADE_BLOCKS)
+        self.assertNotIn("PUT_CHASE", main.CRITICAL_TRADE_BLOCKS)
+        self.assertNotIn("WEAK_PUT", main.CRITICAL_TRADE_BLOCKS)
+        self.assertNotIn("DOJI_FILTER", main.RECOVERY_NON_RELAXABLE_TRADE_BLOCKS)
+        self.assertFalse(signal_engine.WEAK_PUT_HARD_BLOCK)
+        self.assertFalse(signal_engine.CALL_CHASE_HARD_BLOCK)
 
 
 class ClassifyNoOpportunityReasonTests(unittest.TestCase):
