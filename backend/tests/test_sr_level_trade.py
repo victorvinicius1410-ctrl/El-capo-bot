@@ -16,6 +16,7 @@ from unittest import mock
 from backend import main, signal_engine, sr_level_trade
 from backend.sr_level_trade import (
     LEVEL_WICK_AGAINST,
+    LEVEL_WICK_SEQUENCE,
     SR_LEVEL_MAX_PER_HOUR,
     LEVEL_WICK_OK,
     LEVEL_WICK_TWO_SIDED,
@@ -50,6 +51,39 @@ def serie(n: int = 140) -> list[dict[str, float]]:
     return velas
 
 
+def _caminha(velas: list[dict[str, float]], destino: float, passo: float) -> list[dict[str, float]]:
+    """Anda com o preço até `destino` em velas de corpo cheio, sem criar extremo novo.
+
+    Serve para deixar o MOVIMENTO explícito nos testes: subindo, só a
+    resistência à frente vale; descendo, só o suporte.
+    """
+    velas = list(velas)
+    preco = velas[-1]["close"]
+    t = velas[-1]["from"]
+    while abs(destino - preco) > passo:
+        proximo = preco + passo if destino > preco else preco - passo
+        t += 60
+        velas.append(_vela(preco, proximo, t))
+        preco = round(proximo, 6)
+    if abs(destino - preco) > 1e-9:
+        velas.append(_vela(preco, destino, t + 60))
+    return velas
+
+
+def subindo_ate(preco: float) -> list[dict[str, float]]:
+    """Série com os níveis antigos em ALTO/BAIXO e o preço SUBINDO até `preco`."""
+    base = serie()
+    meio = (ALTO + BAIXO) / 2
+    return _caminha(_caminha(base, meio, PASSO), preco, PASSO / 2)
+
+
+def descendo_ate(preco: float) -> list[dict[str, float]]:
+    """Idem, com o preço DESCENDO até `preco`."""
+    base = serie()
+    meio = (ALTO + BAIXO) / 2
+    return _caminha(_caminha(base, meio, PASSO), preco, PASSO / 2)
+
+
 def com_preco(preco: float, velas=None) -> list[dict[str, float]]:
     """A série mais a vela atual (em formação) no preço pedido."""
     velas = velas or serie()
@@ -70,26 +104,60 @@ def fechadas_em(preco: float, velas=None) -> list[dict[str, float]]:
 
 class NivelPertoTest(unittest.TestCase):
     def test_perto_da_resistencia_e_venda(self) -> None:
-        veredito = find_level_trade(com_preco(ALTO - 0.00005))
+        veredito = find_level_trade(com_preco(ALTO - 0.00005, subindo_ate(ALTO - 0.1 * PASSO)))
         self.assertIsNotNone(veredito)
         self.assertEqual(veredito["direction"], "PUT")
         self.assertEqual(veredito["side"], "RESISTENCIA")
         self.assertAlmostEqual(veredito["level"], ALTO, places=5)
 
     def test_perto_do_suporte_e_compra(self) -> None:
-        veredito = find_level_trade(com_preco(BAIXO + 0.00005))
+        veredito = find_level_trade(com_preco(BAIXO + 0.00005, descendo_ate(BAIXO + 0.1 * PASSO)))
         self.assertIsNotNone(veredito)
         self.assertEqual(veredito["direction"], "CALL")
         self.assertEqual(veredito["side"], "SUPORTE")
 
     def test_nao_precisa_estar_grudado(self) -> None:
         """Regra do dono: "se estiver próximo, pode operar, não precisa grudar"."""
-        veredito = find_level_trade(com_preco(ALTO - 0.4 * PASSO))
+        # ~0,3 ATR do nível: longe de grudar, dentro do "perto" (0,5 ATR).
+        veredito = find_level_trade(com_preco(ALTO - 0.25 * PASSO, subindo_ate(ALTO - 0.3 * PASSO)))
+        self.assertIsNotNone(veredito)
+        self.assertGreater(abs(veredito["distance_atr"]), 0.15)
         self.assertIsNotNone(veredito)
         self.assertEqual(veredito["direction"], "PUT")
 
+    def test_suporte_atras_de_preco_que_sobe_nao_e_compra(self) -> None:
+        """O caso do vídeo (CHFJPY 12/09 15:44): preço subindo, suporte atrás.
+
+        O robô comprava por causa do fundo logo abaixo, com resistência à
+        frente. Agora, subindo, só a resistência acima vale.
+        """
+        velas = com_preco(ALTO - 0.3 * PASSO, subindo_ate(ALTO - 0.35 * PASSO))
+        veredito = find_level_trade(velas)
+        self.assertIsNotNone(veredito)
+        self.assertEqual(veredito["direction"], "PUT")
+        self.assertEqual(veredito["side"], "RESISTENCIA")
+        self.assertGreater(veredito["movement_atr"], 0)
+
+    def test_resistencia_atras_de_preco_que_desce_nao_e_venda(self) -> None:
+        velas = com_preco(BAIXO + 0.3 * PASSO, descendo_ate(BAIXO + 0.35 * PASSO))
+        veredito = find_level_trade(velas)
+        self.assertIsNotNone(veredito)
+        self.assertEqual(veredito["direction"], "CALL")
+        self.assertEqual(veredito["side"], "SUPORTE")
+
+    def test_extremo_recem_criado_nao_e_nivel(self) -> None:
+        """Mínima nova feita pela vela que acabou de fechar não é suporte.
+
+        Caso EURAUD 12/09 00:37: preço caindo 2,8 ATR, o robô comprou na mínima
+        nova. Nível é o que já se provou, não o extremo do movimento em curso.
+        """
+        velas = descendo_ate(BAIXO - 2 * PASSO)   # rompe e faz mínima nova
+        preco = velas[-1]["close"]
+        self.assertIsNone(find_level_trade(com_preco(preco, velas)))
+
     def test_longe_de_tudo_nao_e_sinal(self) -> None:
-        self.assertIsNone(find_level_trade(com_preco((ALTO + BAIXO) / 2)))
+        meio = (ALTO + BAIXO) / 2
+        self.assertIsNone(find_level_trade(com_preco(meio, _caminha(serie(), meio, PASSO / 4))))
 
     def test_nivel_rompido_deixa_de_ser_nivel(self) -> None:
         self.assertIsNone(find_level_trade(com_preco(ALTO + 1.5 * PASSO)))
@@ -116,8 +184,11 @@ class NivelPertoTest(unittest.TestCase):
 
     def test_espremido_entre_os_dois_lados_nao_opera(self) -> None:
         meio = (ALTO + BAIXO) / 2
-        with mock.patch.object(sr_level_trade, "SR_LEVEL_PROXIMITY_ATR", 10.0):
-            self.assertIsNone(find_level_trade(com_preco(meio)))
+        velas = com_preco(meio, _caminha(serie(), meio, PASSO / 4))
+        with mock.patch.object(sr_level_trade, "SR_LEVEL_PROXIMITY_ATR", 10.0), mock.patch.object(
+            sr_level_trade, "SR_LEVEL_TREND_ATR", 99.0
+        ):
+            self.assertIsNone(find_level_trade(velas))
 
     def test_desligado_nao_devolve_nada(self) -> None:
         with mock.patch.object(sr_level_trade, "SR_LEVEL_TRADE_ENABLED", False):
@@ -146,6 +217,32 @@ class PavioNoNivelTest(unittest.TestCase):
         self.assertFalse(pode)
         self.assertEqual(motivo, LEVEL_WICK_AGAINST)
 
+    def test_velas_seguidas_cheias_de_pavio_barram(self) -> None:
+        """Dono, 12/09: "pegou operação em uma vela que deixou bastante pavio".
+
+        Caso real USDCAD 15:58: as 3 velas anteriores com 57%, 84% e 49% de
+        pavio. O pavio CONTRA a entrada era pequeno, então a regra direcional
+        sozinha liberava. Mercado indeciso barra, de qualquer lado.
+        """
+        velas = serie()
+        # duas das três últimas com pavio grande A FAVOR da compra (embaixo)
+        for i in (-1, -3):
+            base = velas[i]["open"]
+            velas[i] = {"from": velas[i]["from"], "open": base, "close": base + 0.2 * PASSO,
+                        "max": base + 0.25 * PASSO, "min": base - 0.6 * PASSO}
+        velas = descendo_ate(BAIXO + 0.2 * PASSO)[:-3] + velas[-3:]
+        pode, motivo = level_wick_ok(com_preco(velas[-1]["close"], velas), "CALL")
+        self.assertFalse(pode)
+        self.assertEqual(motivo, LEVEL_WICK_SEQUENCE)
+
+    def test_um_pavio_de_rejeicao_sozinho_continua_liberando(self) -> None:
+        velas = serie()
+        base = velas[-1]["open"]
+        velas[-1] = {"from": velas[-1]["from"], "open": base, "close": base + 0.3 * PASSO,
+                     "max": base + 0.35 * PASSO, "min": base - 0.55 * PASSO}
+        pode, motivo = level_wick_ok(com_preco(velas[-1]["close"], velas), "CALL")
+        self.assertTrue(pode, motivo)
+
     def test_vela_indecisa_dos_dois_lados_barra(self) -> None:
         meio = ALTO - 0.5 * PASSO
         velas = self._com_ultima(meio - 0.05 * PASSO, meio + 0.05 * PASSO, meio + 0.45 * PASSO, meio - 0.45 * PASSO)
@@ -155,11 +252,11 @@ class PavioNoNivelTest(unittest.TestCase):
 
 
 class MotorDecidePeloNivelTest(unittest.TestCase):
-    def _analisa(self, preco):
-        return signal_engine.analyze_signal("EURUSD-OTC", com_preco(preco), "M1", payout=87.0)
+    def _analisa(self, preco, velas=None):
+        return signal_engine.analyze_signal("EURUSD-OTC", com_preco(preco, velas), "M1", payout=87.0)
 
     def test_na_resistencia_o_sinal_vira_venda(self) -> None:
-        sinal = self._analisa(ALTO - 0.00005)
+        sinal = self._analisa(ALTO - 0.00005, subindo_ate(ALTO - 0.1 * PASSO))
         self.assertEqual(sinal["signal"], "PUT")
         self.assertEqual(sinal["strategy_key"], STRATEGY_SR_LEVEL)
         self.assertTrue(sinal["trade_allowed"])
@@ -167,7 +264,7 @@ class MotorDecidePeloNivelTest(unittest.TestCase):
         self.assertTrue(is_level_candidate(sinal))
 
     def test_no_suporte_o_sinal_vira_compra(self) -> None:
-        sinal = self._analisa(BAIXO + 0.00005)
+        sinal = self._analisa(BAIXO + 0.00005, descendo_ate(BAIXO + 0.1 * PASSO))
         self.assertEqual(sinal["signal"], "CALL")
         self.assertEqual(sinal["sr_level"]["side"], "SUPORTE")
 

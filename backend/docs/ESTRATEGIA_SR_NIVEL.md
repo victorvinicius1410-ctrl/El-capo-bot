@@ -30,6 +30,15 @@ velas, pivôs de 1 toque em 60 velas, e a máxima/mínima das últimas 30.
 
 - preço a até `SR_LEVEL_PROXIMITY_ATR` (0,5 ATR) de uma resistência → **PUT**;
   de um suporte → **CALL**;
+- **só vale o nível À FRENTE do movimento** (`SR_LEVEL_TREND_ATR`, 0,3 ATR nas
+  últimas 3 velas): preço subindo opera a resistência acima (venda), descendo
+  opera o suporte abaixo (compra). Suporte atrás de um preço que sobe não é
+  compra — foi por ignorar isso que o robô comprou na CHFJPY 12/09 15:44 com
+  +1,94 ATR de alta e resistência 0,42 ATR acima (vídeo de cliente; a venda
+  teria ganho);
+- **o nível tem de ser anterior** (`SR_LEVEL_MIN_AGE`, 3 velas desde o último
+  toque): o extremo que a vela recém-fechada criou é o movimento em curso, não
+  um nível (caso EURAUD 12/09 00:37, compra na mínima nova caindo 2,8 ATR);
 - **a última vela não pode ter passado da linha**: se ela fechou do outro lado
   do nível, virou rompimento e não se opera (`SR_LEVEL_BREAK_ATR=0`, decisão do
   dono em 11/09 23h, depois de 9 perdas de um único sinal assim). Furar com o
@@ -49,9 +58,13 @@ velas, pivôs de 1 toque em 60 velas, e a máxima/mínima das últimas 30.
 
 Direcional, porque no nível o pavio a favor é a confirmação:
 
-- pavio de cima na resistência (venda) ou de baixo no suporte (compra) → libera;
+- um pavio de rejeição a favor da entrada → libera (é a confirmação);
 - pavio **contra** a entrada ≥ 40% do range → barra;
 - vela indecisa, com pavio ≥ 30% dos dois lados → barra;
+- **2 das 3 últimas velas com 50%+ de pavio** → barra, de qualquer lado
+  (`SR_LEVEL_WICK_SEQUENCE_*`). É o "cheio de pavio" que o cliente vê; caso
+  real USDCAD 12/09 15:58, com 57%, 84% e 49% nas três anteriores e pavio
+  contra pequeno — a regra direcional sozinha liberava;
 - vela com range < 0,3 ATR não conta (é ruído de tick).
 
 ## Onde entra no código
@@ -82,9 +95,12 @@ ordem é aceita. Cancelamento de filtro virou ciclo sem oportunidade, não
 Backtest em **21 pares OTC, ~60 dias de velas M1 reais** (361.094 minutos
 avaliados, entrada na abertura da vela seguinte, expiração de 1 minuto):
 
-| "perto do nível" | minutos com entrada (por par) | acerto |
+| regra | minutos com entrada (por par) | acerto |
 |---|---|---|
-| 0,50 ATR (regra atual, sem passar da linha) | 40,9% | **49,94%** |
+| **atual: à frente + idade 3 + pavio em sequência** | **15,6%** | **49,86%** |
+| à frente + idade 3 | 24,9% | 49,90% |
+| v1 de 11/09 (nível mais perto) | 40,9% | 49,94% |
+| 0,50 ATR (v1, sem passar da linha) | 40,9% | **49,94%** |
 | 0,25 ATR (idem) | 25,6% | **50,03%** |
 | 0,50 ATR aceitando passar 0,15 ATR da linha | 44,1% | 49,94% |
 | 0,25 ATR aceitando passar 0,15 ATR da linha | 31,4% | 50,07% |
@@ -100,7 +116,9 @@ todo o resto do OTC (ver `docs/` e a varredura de 31/08). Restringir o nível
 **não melhora o acerto, só reduz o volume** — e o volume é o que define a perda
 em dinheiro (−6,5% do valor apostado por entrada, na média).
 
-"Passou da linha" tira ~7% das entradas e não muda o acerto — serve para não
+**Nenhuma das regras novas muda o acerto** (49,86% contra 49,94%): elas cortam
+volume e dão coerência com o que o cliente vê no gráfico, que é a reclamação
+real. "Passou da linha" tira ~7% das entradas e não muda o acerto — serve para não
 comprar no meio do rompimento, que foi o padrão das 9 perdas de um sinal só.
 
 Decisão do dono em 11/09, depois de ver os primeiros 12 minutos no ar (15
@@ -115,6 +133,6 @@ sinal de nível a ~54 ordens/hora no sistema, e cada conta a 3.
   `SR_LEVEL_WICK_AGAINST_RATIO`, `SR_LEVEL_WICK_TWO_SIDED_RATIO` — limites.
 - `WICK_FILTER=false` — desliga também o pavio do nível.
 
-Testes: `tests/test_sr_level_trade.py` (31),
+Testes: `tests/test_sr_level_trade.py` (36),
 `tests/test_entry_filter_cancel_message.py` (3),
 `frontend/src/lib/robotPresentation.anuncio.test.ts` (5).
