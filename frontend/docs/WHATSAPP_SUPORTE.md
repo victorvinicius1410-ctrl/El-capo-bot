@@ -28,16 +28,16 @@ exibição do número. Agora o número aparece primeiro dentro do pop-up.
 
 | Campo | Valor |
 |---|---|
-| Exibido ao usuário | `+55 81 8999-8378` |
-| Formato E.164 (sem `+`, usado no link) | `558189998378` |
-| Link `wa.me` | `https://wa.me/558189998378` |
+| Exibido ao usuário | `+55 81 98998-4096` |
+| Formato E.164 (sem `+`, usado no link) | `5581989984096` |
+| Link `wa.me` | `https://wa.me/5581989984096` |
 
 Para trocar o número no futuro, edite **apenas** as três constantes no topo de
 `__root.tsx`:
 
 ```ts
-const WHATSAPP_NUMBER = "558189998378"; // DDI(55) + DDD(81) + número
-const WHATSAPP_DISPLAY = "+55 81 8999-8378"; // como aparece no pop-up
+const WHATSAPP_NUMBER = "5581989984096"; // DDI(55) + DDD(81) + número
+const WHATSAPP_DISPLAY = "+55 81 98998-4096"; // como aparece no pop-up
 const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER}`;
 ```
 
@@ -90,6 +90,8 @@ robô.
 
 ## 8. Histórico
 
+- **2026-09-13** — Número de suporte atualizado para `+55 81 98998-4096`
+  (`5581989984096`). Estrutura do pop-up inalterada.
 - **2026-08-07** — Troca do botão de link direto (`<a target="_blank">`) por
   pop-up (`Dialog`) exibindo o número antes de redirecionar. Número
   atualizado para `+55 81 8999-8378` (`558189998378`).

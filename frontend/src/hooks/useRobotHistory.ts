@@ -28,6 +28,8 @@ export interface RobotHistoryItem {
   strategySummary: string | null;
   analysisDetail: string | null;
   speechPreview: string | null;
+  /** Operação feita com o Modo Estudo ligado (`analysis_json.study_mode`). */
+  studyMode: boolean;
 }
 
 export interface RobotStats {
@@ -198,6 +200,7 @@ function normalizeHistoryItem(input: unknown): RobotHistoryItem | null {
         analysis.speech_preview ??
         analysis.speechPreview,
     ),
+    studyMode: (value.study_mode ?? analysis.study_mode) === true,
   };
 }
 

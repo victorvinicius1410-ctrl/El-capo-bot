@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { Bot, Eye, EyeOff, Loader2, Lock, Mail, ShieldCheck, Zap } from "lucide-react";
-import { loginWithPassword, requestPasswordRecovery } from "@/lib/api";
+import { loginWithPassword } from "@/lib/api";
 import { refreshAuthSession } from "@/lib/useAuth";
 
 export const Route = createFileRoute("/login")({
@@ -15,9 +15,7 @@ function LoginPage() {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [recovering, setRecovering] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [recoveryMessage, setRecoveryMessage] = useState<string | null>(null);
 
   useEffect(() => {
     refreshAuthSession().then((user) => {
@@ -38,20 +36,6 @@ function LoginPage() {
     } finally {
       setSubmitting(false);
     }
-  }
-
-  async function handleRecovery(): Promise<void> {
-    if (!email.trim()) {
-      setError("Informe seu email antes de solicitar a recuperação.");
-      return;
-    }
-    setRecovering(true);
-    setError(null);
-    setRecoveryMessage(null);
-    const response = await requestPasswordRecovery(email.trim().toLowerCase());
-    if (response.ok) setRecoveryMessage(response.data.message);
-    else setError(response.error);
-    setRecovering(false);
   }
 
   return (
@@ -148,30 +132,18 @@ function LoginPage() {
                   </button>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  void handleRecovery();
-                }}
-                disabled={recovering}
-                className="ml-auto flex text-xs font-semibold text-primary hover:underline disabled:opacity-60"
+              <Link
+                to="/forgot-password"
+                className="ml-auto flex text-xs font-semibold text-primary hover:underline"
               >
-                {recovering ? "Solicitando..." : "Esqueci minha senha"}
-              </button>
+                Esqueci minha senha
+              </Link>
               {error ? (
                 <div
                   role="alert"
                   className="rounded-xl border border-destructive/35 bg-destructive/10 px-3.5 py-3 text-sm text-destructive"
                 >
                   {error}
-                </div>
-              ) : null}
-              {recoveryMessage ? (
-                <div
-                  role="status"
-                  className="rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-3.5 py-3 text-sm text-emerald-200"
-                >
-                  {recoveryMessage}
                 </div>
               ) : null}
               <button type="submit" disabled={submitting} className="login-submit">

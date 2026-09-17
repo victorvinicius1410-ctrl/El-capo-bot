@@ -42,6 +42,11 @@ export interface RobotTrade {
   payout: number | null;
   strategy_score: number | null;
   strategy_name: string | null;
+  /** Campos da fala: o Modo Estudo narra o win a partir do `last_trade`. */
+  strategy_key: string | null;
+  strategy_summary: string | null;
+  analysis_detail: string | null;
+  speech_preview: string | null;
   used_strategies: string[];
   strategy_reason: string | null;
   entry_reason: string | null;
@@ -119,6 +124,11 @@ export interface RobotState {
    * nascia sempre apagado e o clique seguinte remandava `true`.
    */
   live_demo?: boolean;
+  /**
+   * Modo Estudo (17/09/2026, só marketing). Só vale com `live_demo` ligado —
+   * use `isStudyActive` em `studyMode.ts`, nunca este campo sozinho.
+   */
+  study_mode?: boolean;
   /**
    * Mercado aberto disponível AGORA, segundo o servidor. Ele cruza a janela
    * semanal do forex com o que a corretora responde por ativo — então pega
@@ -391,6 +401,12 @@ function normalizeTrade(value: unknown): RobotTrade | null {
     payout: toPercent(raw.payout),
     strategy_score: toNumber(raw.strategy_score ?? raw.strategyScore ?? raw.score),
     strategy_name: toNullableText(raw.strategy_name ?? raw.strategyName ?? raw.strategy),
+    strategy_key: toNullableText(raw.strategy_key ?? raw.strategyKey),
+    strategy_summary: toMultilineText(raw.strategy_summary ?? raw.strategySummary),
+    analysis_detail: toMultilineText(raw.analysis_detail ?? raw.analysisDetail),
+    speech_preview: toNullableText(
+      raw.speech_preview ?? raw.speechPreview ?? raw.narrator_text ?? raw.narratorText,
+    ),
     used_strategies: toStringList(
       raw.used_strategies ?? raw.usedStrategies ?? raw.strategies_used ?? raw.strategiesUsed ??
         raw.strategies ?? raw.strategy_name ?? raw.strategyName ?? raw.strategy,
@@ -537,6 +553,7 @@ export function normalizeRobotState(payload: unknown): RobotState {
     timeframe: toNullableText(raw.timeframe ?? config.timeframe ?? raw.expiration ?? config.expiration),
     market_mode: toNullableText(raw.market_mode ?? raw.marketMode ?? config.market_mode ?? config.marketMode),
     live_demo: toBool(raw.live_demo ?? raw.liveDemo ?? config.live_demo ?? config.liveDemo),
+    study_mode: toBool(raw.study_mode ?? raw.studyMode ?? config.study_mode ?? config.studyMode),
     open_market_available:
       raw.open_market_available === undefined && raw.openMarketAvailable === undefined
         ? undefined
@@ -822,6 +839,7 @@ export function getStoppedRobotState(disconnected = false): RobotState {
     timeframe: null,
     market_mode: null,
     live_demo: false,
+    study_mode: false,
     open_market_available: undefined,
     open_market_closed_reason: null,
     ai_analysis_enabled: false,

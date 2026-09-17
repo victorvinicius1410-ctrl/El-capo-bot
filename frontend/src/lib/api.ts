@@ -640,6 +640,10 @@ export async function createSessionFromTokens(tokens: {
         status: response.status,
       };
     }
+    // A visita ao link de recuperacao comeca sem cookie, entao o gate de sessao
+    // ja cacheou `null` por 120s. Sem limpar aqui, o PATCH seguinte devolve
+    // NO_AUTH sem sequer chamar o backend.
+    clearSessionIdentityCache();
     await refreshAuthSession();
     return { ok: true, data: body.data?.user as { id: string; email?: string } };
   } catch (error) {
@@ -911,6 +915,12 @@ export const robotStop = () => apiRequest("/robot/stop", { method: "POST" });
  */
 export const robotLiveMode = (enabled: boolean) =>
   apiRequest("/robot/live-mode", { method: "POST", body: JSON.stringify({ enabled }) });
+/**
+ * Liga/desliga o Modo Estudo (só marketing, só vale com o LIVE ligado).
+ * O backend devolve 403 `STUDY_MODE_SOMENTE_MARKETING` para as demais contas.
+ */
+export const robotStudyMode = (enabled: boolean) =>
+  apiRequest("/robot/study-mode", { method: "POST", body: JSON.stringify({ enabled }) });
 export const robotResetCycle = () => apiRequest("/robot/reset-cycle", { method: "POST" });
 export const robotResetScore = () => apiRequest("/robot/reset-score", { method: "POST" });
 export const robotSyncConnection = () => apiRequest("/robot/sync-connection", { method: "POST" });

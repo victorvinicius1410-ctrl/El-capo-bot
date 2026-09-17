@@ -27,8 +27,8 @@ import { cn } from "@/lib/utils";
 import appCss from "@/styles.css?url";
 
 // Numero oficial de suporte via WhatsApp (DDD 81). Ver `docs/WHATSAPP_SUPORTE.md`.
-const WHATSAPP_NUMBER = "558189998378";
-const WHATSAPP_DISPLAY = "+55 81 8999-8378";
+const WHATSAPP_NUMBER = "5581989984096";
+const WHATSAPP_DISPLAY = "+55 81 98998-4096";
 const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER}`;
 
 interface RouterContext {
@@ -63,6 +63,13 @@ export const Route = createRootRouteWithContext<RouterContext>()({
       {
         rel: "stylesheet",
         href: "https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap",
+      },
+      // Tipografia da landing page (rota `/`): Inter Tight nos títulos, Inter no
+      // corpo e IBM Plex Mono nos rótulos/números. A Outfit acima segue servindo
+      // o painel logado — não remover.
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Inter+Tight:wght@600;700;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap",
       },
       { rel: "stylesheet", href: appCss },
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
@@ -151,9 +158,7 @@ function AuthUserBoundary({ children }: { children: ReactNode }) {
 
     const finishLocalReset = () => {
       try {
-        resetBullExLoginState(
-          previousUserId === undefined ? null : previousUserId,
-        );
+        resetBullExLoginState(previousUserId === undefined ? null : previousUserId);
         resetBullExLoginState(userId);
         resetRobotSettingsState();
         clearRejectionMemory();
@@ -214,7 +219,7 @@ function WhatsAppButton() {
         type="button"
         onClick={() => setOpen(true)}
         aria-label={`Falar pelo WhatsApp no numero ${WHATSAPP_DISPLAY}`}
-        className="fixed bottom-4 right-4 z-[60] flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-xl transition hover:scale-105 hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/80"
+        className="app-wa-float fixed bottom-4 right-4 z-[60] flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-xl transition hover:scale-105 hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/80"
       >
         <WhatsAppIcon />
       </button>
@@ -257,7 +262,9 @@ function NotFound() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <div className="max-w-md text-center">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">Pagina nao encontrada</h1>
+        <h1 className="text-xl font-semibold tracking-tight text-foreground">
+          Pagina nao encontrada
+        </h1>
         <p className="mt-2 text-sm text-muted-foreground">
           A pagina que voce procura nao existe ou foi movida.
         </p>

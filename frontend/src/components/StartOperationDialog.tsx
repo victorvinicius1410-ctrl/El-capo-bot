@@ -85,8 +85,12 @@ function pickOperationConfig(settings: RobotSettings): OperationConfig {
   };
 }
 
-function mergeOperationConfig(config: OperationConfig, base?: RobotSettings): RobotSettings {
-  return normalizeRobotSettings({ ...(base ?? DEFAULT_ROBOT_SETTINGS), ...config });
+function mergeOperationConfig(
+  config: OperationConfig,
+  base?: RobotSettings,
+  currency?: string | null,
+): RobotSettings {
+  return normalizeRobotSettings({ ...(base ?? DEFAULT_ROBOT_SETTINGS), ...config }, currency);
 }
 
 function loadLastOperationConfig(userId: string | null | undefined): OperationConfig | null {
@@ -247,7 +251,7 @@ export function StartOperationDialog({
         entryValue: clampEntryValueForCurrency(draft.entryValue, accountCurrency),
         marketMode: coerceSelectableMarketMode(draft.marketMode),
       };
-      const nextSettings = mergeOperationConfig(safeDraft, settings);
+      const nextSettings = mergeOperationConfig(safeDraft, settings, accountCurrency);
       setSettings(nextSettings);
       persistLastOperationConfig(userId, safeDraft);
       const configResponse = await robotConfig({

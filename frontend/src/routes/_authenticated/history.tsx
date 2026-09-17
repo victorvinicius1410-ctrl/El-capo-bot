@@ -33,7 +33,11 @@ import {
   ApiError,
   marketingDeleteTrade,
 } from "@/lib/api";
-import { applyRobotSessionScoreToCache, ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
+import {
+  applyRobotSessionScoreToCache,
+  ROBOT_STATE_QUERY_KEY,
+  useLiveTradingData,
+} from "@/hooks/useLiveTradingData";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
 import { useMarketingPanel } from "@/lib/marketingPanelContext";
 import {
@@ -46,6 +50,7 @@ import { useAuth } from "@/lib/useAuth";
 import { computeRobotStatsFromItems, filterHistoryByRange } from "@/lib/dashboardDailyStats";
 import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
+import { filterStudyHistory, isStudyActive, studyHiddenNotice } from "@/lib/studyMode";
 
 export const Route = createFileRoute("/_authenticated/history")({
   head: () => ({ meta: [{ title: "Histórico - ElCapo AutoBot" }] }),
@@ -59,7 +64,15 @@ function HistoryPage() {
   );
   const [analysisItem, setAnalysisItem] = useState<RobotHistoryItem | null>(null);
   const history = useRobotHistory(days);
-  const items = filterHistoryByRange(history.data ?? [], range.start, range.end);
+  const { robotState } = useLiveTradingData();
+  // Modo Estudo: esconde os losses do estudo enquanto ele estiver ligado, e o
+  // aviso abaixo diz quantos. Desligou, a lista volta inteira.
+  const study = filterStudyHistory(
+    filterHistoryByRange(history.data ?? [], range.start, range.end),
+    isStudyActive(robotState.data),
+  );
+  const items = study.items;
+  const studyNotice = studyHiddenNotice(study.hidden);
   const stats = computeRobotStatsFromItems(items);
   const error = history.error;
   const isRefreshing = history.isFetching;
@@ -133,6 +146,16 @@ function HistoryPage() {
         <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive-foreground">
           <strong>Não foi possível carregar o histórico.</strong>{" "}
           {error instanceof Error ? error.message : "Erro na API."}
+        </div>
+      ) : null}
+
+      {studyNotice ? (
+        <div
+          className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm font-semibold text-amber-300"
+          role="status"
+        >
+          {studyNotice}. Os números abaixo não incluem essas operações; todas continuam gravadas e voltam
+          quando o estudo for desligado.
         </div>
       ) : null}
 

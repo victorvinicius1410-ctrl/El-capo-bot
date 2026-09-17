@@ -3,6 +3,7 @@ import { RotateCcw, Settings, Volume2, VolumeX, X } from "lucide-react";
 import { toast } from "sonner";
 import { MoneyInput } from "./MoneyInput";
 import { RobotAvatarVideo } from "./RobotAvatarVideo";
+import { StudyModeSeal } from "./StudyModeSeal";
 import type { BullExAccount } from "@/lib/api";
 import { formatBullExBalance, formatProfitAmount, profitTone } from "@/lib/bullexConnection";
 import {
@@ -18,6 +19,7 @@ import {
   getRobotStatusPresentation,
   type RobotPresentation,
 } from "@/lib/robotPresentation";
+import { isStudyActive } from "@/lib/studyMode";
 import {
   DEFAULT_ROBOT_SETTINGS,
   ENTRY_VALUE_STEP,
@@ -124,22 +126,51 @@ export function RobotOverlay({
   const scoreProfit = robotState ? robotState.profit : lastKnownScoreRef.current.profit;
   const now = useNowTicker();
   const presentation = getRobotStatusPresentation(robotState, now);
-  const display = buildOverlayDisplay(robotState, presentation, now);
+  // Modo Estudo: sem balão, sem LOSS e sem lucro; o selo ocupa o lugar do LOSS.
+  const study = isStudyActive(robotState);
+  const display = buildOverlayDisplay(robotState, presentation, now, study);
   const locked = isRobotLocked(robotState);
   // Só pending_signal = entrada travada. best_candidate/last_signal na análise
   // mentiam o balão ("vou de CALL…") e a ordem depois não saía.
-  const speechSignal = robotState?.pending_signal ?? null;
+  const speechSignal = study ? null : (robotState?.pending_signal ?? null);
   const speechPreview = speechSignal?.speech_preview?.trim() || speechSignal?.strategy_summary?.trim() || null;
-  const speechDetail =
-    speechSignal?.analysis_detail?.trim() ||
-    speechSignal?.strategy_reason?.trim() ||
-    speechSignal?.reason?.trim() ||
-    null;
   const showSpeechBubble =
     Boolean(speechPreview) &&
     ["SIGNAL_FOUND", "WAITING_ENTRY", "WAITING_ENTRY_WINDOW", "WAITING_NEXT_CANDLE_ENTRY", "BUYING", "SENDING_ORDER"].includes(
       robotState?.status ?? "",
     );
+  // No estudo a explicação vem do win que acabou de fechar.
+  const studyWinTrade = study && presentation.result === "WIN" ? presentation.trade : null;
+  const speechView = speechSignal
+    ? {
+        symbol: speechSignal.symbol,
+        direction: speechSignal.direction,
+        strategyName: speechSignal.strategy_name,
+        preview: speechPreview,
+        detail:
+          speechSignal.analysis_detail?.trim() ||
+          speechSignal.strategy_reason?.trim() ||
+          speechSignal.reason?.trim() ||
+          null,
+      }
+    : studyWinTrade
+      ? {
+          symbol: studyWinTrade.active,
+          direction: studyWinTrade.direction,
+          strategyName: studyWinTrade.strategy_name,
+          preview: studyWinTrade.speech_preview?.trim() || studyWinTrade.strategy_summary?.trim() || null,
+          detail:
+            studyWinTrade.analysis_detail?.trim() ||
+            studyWinTrade.strategy_reason?.trim() ||
+            studyWinTrade.entry_reason?.trim() ||
+            null,
+        }
+      : null;
+  // A janela fecha junto com o que ela explica; senão reabria sozinha no próximo win.
+  const hasSpeechView = Boolean(speechView);
+  useEffect(() => {
+    if (!hasSpeechView) setSpeechDetailOpen(false);
+  }, [hasSpeechView]);
 
   useEffect(() => {
     if (configOpen) return;
@@ -482,9 +513,9 @@ export function RobotOverlay({
             ) : null}
             <RobotAvatarVideo className="h-auto w-[110px] object-contain sm:w-[170px]" />
           </div>
-          <ScoreBadge label="LOSS" value={scoreLosses} tone="loss" />
+          {study ? <StudyModeSeal /> : <ScoreBadge label="LOSS" value={scoreLosses} tone="loss" />}
         </div>
-        {speechDetailOpen && speechSignal ? (
+        {speechDetailOpen && speechView ? (
           <div
             className="fixed inset-0 z-[90] flex items-center justify-center bg-black/55 p-4"
             role="dialog"
@@ -504,7 +535,7 @@ export function RobotOverlay({
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-wide text-primary">El Capo</p>
                   <h3 className="text-base font-semibold text-foreground">
-                    {speechSignal.symbol} · {speechSignal.direction}
+                    {speechView.symbol} · {speechView.direction}
                   </h3>
                 </div>
                 <button
@@ -517,20 +548,20 @@ export function RobotOverlay({
                 </button>
               </div>
               <p className="text-sm font-semibold text-foreground">
-                {speechSignal.strategy_name || "Estratégia selecionada"}
+                {speechView.strategyName || "Estratégia selecionada"}
               </p>
-              {speechPreview ? (
+              {speechView.preview ? (
                 <p className="mt-2 rounded-xl border border-border bg-muted/40 px-3 py-2 text-sm italic text-foreground">
-                  “{speechPreview}”
+                  “{speechView.preview}”
                 </p>
               ) : null}
               <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-foreground">
-                {speechDetail || "Sem detalhe técnico disponível para esta entrada."}
+                {speechView.detail || "Sem detalhe técnico disponível para esta entrada."}
               </p>
             </div>
           </div>
         ) : null}
-        <ProfitBadge profit={scoreProfit} currency={account?.currency} />
+        {study ? null : <ProfitBadge profit={scoreProfit} currency={account?.currency} />}
         {!adminModelControls && (onStartOperation || onStopOperation || onResetScore) ? (
           <div
             className="z-10 mt-1 flex flex-col items-center gap-1.5"
@@ -595,7 +626,20 @@ export function RobotOverlay({
               {display.details}
             </div>
           ) : null}
-          {display.footer ? (
+          {display.footer && studyWinTrade ? (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setSpeechDetailOpen(true);
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+              className="pointer-events-auto mt-1 line-clamp-2 cursor-pointer text-[11px] font-semibold leading-tight underline-offset-2 hover:underline sm:text-xs"
+              title="Clique para ver a análise completa"
+            >
+              {display.footer}
+            </button>
+          ) : display.footer ? (
             <p className="mt-1 whitespace-nowrap text-[11px] font-semibold leading-tight sm:text-xs">
               {display.footer}
             </p>
@@ -690,6 +734,7 @@ function buildOverlayDisplay(
   state: RobotState | null | undefined,
   presentation: RobotPresentation,
   now = Date.now(),
+  study = false,
 ): OverlayDisplay {
   const isWin = presentation.result === "WIN";
   const isDraw = presentation.result === "DRAW";
@@ -707,8 +752,11 @@ function buildOverlayDisplay(
           : "";
   const countdown = countdownText(state, now);
   const detailParts = collectDetailParts(presentation);
-  const footer =
-    presentation.footer ??
+  // Estudo: sem contagem (ela entregaria a operação aberta); o rodapé é o
+  // texto neutro ou a estratégia do win.
+  const footer = study
+    ? presentation.detail
+    : presentation.footer ??
     (countdown !== "-"
       ? formatCountdownFooter(countdown, {
           operationInProgress: Boolean(state?.operation_in_progress),

@@ -1,5 +1,6 @@
 import type { RobotGaleInfo, RobotSignal, RobotState, RobotTrade } from "./robotState.ts";
 import { liveDisplayCountdownSeconds } from "./robotState.ts";
+import { STUDY_IDLE_DETAIL, STUDY_IDLE_TITLE, isStudyActive, studyWinDetail } from "./studyMode.ts";
 
 export type RobotPresentationKind =
   | "loading"
@@ -224,6 +225,17 @@ export function shouldShowResult(state: RobotState, now: number): boolean {
   return now - resultFlashMemory.observedAt < RESULT_OVERLAY_DISPLAY_MS;
 }
 
+/**
+ * Etapa do gale para o texto do painel ("Gale 2 preparado").
+ *
+ * Com "Quantidade de Gales" maior que 1 o ciclo pode abrir G1, G2, G3... e o
+ * painel dizia "Gale 1" fixo em todas elas.
+ */
+function galeStepLabel(state: RobotState): number {
+  const step = state.gale_step ?? state.last_trade?.gale_step ?? 1;
+  return step >= 1 ? step : 1;
+}
+
 function galeInfo(state: RobotState): RobotGaleInfo | null {
   const active = state.gale_active ?? state.last_trade?.active;
   const direction = state.gale_direction ?? state.last_trade?.direction;
@@ -311,6 +323,28 @@ function waitingNextCyclePresentation(state: RobotState, now = Date.now()): Robo
  * @param now Timestamp atual, usado para exibição temporária de resultados.
  */
 export function getRobotStatusPresentation(
+  state: RobotState | null | undefined,
+  now: number,
+  options: Record<string, unknown> = {},
+): RobotPresentation {
+  const base = baseRobotStatusPresentation(state, now, options);
+  if (!isStudyActive(state)) return base;
+  return studyPresentation(base);
+}
+
+/**
+ * Modo Estudo: só o win aparece, com a estratégia. Parado, desconectado, saldo
+ * e stop seguem como estão — são avisos de segurança da banca, não operação.
+ */
+function studyPresentation(base: RobotPresentation): RobotPresentation {
+  if (base.kind === "loading" || base.kind === "stopped") return base;
+  if (base.kind === "result" && base.result === "WIN") {
+    return { ...base, detail: studyWinDetail(base.trade), footer: null, signal: null };
+  }
+  return presentation("analyzing", STUDY_IDLE_TITLE, STUDY_IDLE_DETAIL);
+}
+
+function baseRobotStatusPresentation(
   state: RobotState | null | undefined,
   now: number,
   _options: Record<string, unknown> = {},
@@ -415,7 +449,12 @@ export function getRobotStatusPresentation(
   if (status === "WAITING_GALE_ENTRY" || state.gale_pending) {
     const gale = galeInfo(state);
     return {
-      ...presentation("gale", "Gale preparado", null, "Entrada no início da próxima vela"),
+      ...presentation(
+        "gale",
+        `Gale ${galeStepLabel(state)} preparado`,
+        null,
+        "Entrada no início da próxima vela",
+      ),
       gale,
       direction: gale?.direction ?? null,
     };
@@ -427,7 +466,7 @@ export function getRobotStatusPresentation(
   if (status === "PENDING_GALE_RESULT") {
     const gale = galeInfo(state);
     return {
-      ...presentation("operation", "Aguardando resultado do Gale 1"),
+      ...presentation("operation", `Aguardando resultado do Gale ${galeStepLabel(state)}`),
       gale,
       direction: gale?.direction ?? null,
     };

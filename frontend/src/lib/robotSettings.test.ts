@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it, beforeEach } from "node:test";
 import {
   DEFAULT_ENTRY_VALUE,
+  ENTRY_VALUE_ABSOLUTE_MIN,
   ENTRY_VALUE_MIN,
+  ENTRY_VALUE_MIN_BRL,
   ENTRY_VALUE_MIN_USD,
   STOP_MONEY_MIN,
   STOP_OPERATIONS_MIN,
   clampEntryValueForCurrency,
   coerceSelectableMarketMode,
+  entryLimitsForCurrency,
+  entryValueHelperText,
   formatForexOpenCountdown,
   getRobotSettingsSnapshot,
   hoursUntilForexOpenMarket,
@@ -254,5 +258,42 @@ describe("robotSettings mercado aberto / OTC", () => {
     const wednesday = new Date(Date.UTC(2026, 6, 22, 12, 0, 0));
     assert.equal(coerceSelectableMarketMode("OTC", wednesday), "OTC");
     assert.equal(coerceSelectableMarketMode("BOTH", wednesday), "BOTH");
+  });
+});
+
+describe("robotSettings mínimo por moeda da conta", () => {
+  it("cobra R$ 5 quando a conta é em real", () => {
+    const limits = entryLimitsForCurrency("BRL");
+    assert.equal(limits.min, ENTRY_VALUE_MIN_BRL);
+    assert.equal(limits.defaultValue, ENTRY_VALUE_MIN_BRL);
+    assert.equal(limits.currencyKnown, true);
+    assert.equal(normalizeRobotSettings({ entryValue: 1 }, "BRL").entryValue, 5);
+    assert.equal(normalizeRobotSettings({ entryValue: 4.99 }, "BRL").entryValue, 5);
+    assert.equal(normalizeRobotSettings({ entryValue: 20 }, "BRL").entryValue, 20);
+  });
+
+  it("cobra US$ 1 quando a conta é em dólar", () => {
+    const limits = entryLimitsForCurrency("USD");
+    assert.equal(limits.min, ENTRY_VALUE_MIN_USD);
+    assert.equal(limits.defaultValue, ENTRY_VALUE_MIN_USD);
+    assert.equal(limits.currencyKnown, true);
+    assert.equal(normalizeRobotSettings({ entryValue: 1 }, "USD").entryValue, 1);
+    assert.equal(normalizeRobotSettings({ entryValue: 0.5 }, "USD").entryValue, 1);
+  });
+
+  it("moeda desconhecida é piso de armazenamento, não mínimo da conta", () => {
+    const limits = entryLimitsForCurrency(null);
+    assert.equal(limits.min, ENTRY_VALUE_ABSOLUTE_MIN);
+    assert.equal(limits.defaultValue, DEFAULT_ENTRY_VALUE);
+    assert.equal(limits.currencyKnown, false);
+    assert.equal(entryLimitsForCurrency("").currencyKnown, false);
+    assert.equal(normalizeRobotSettings({ entryValue: 1 }).entryValue, 1);
+  });
+
+  it("não anuncia R$ 1 enquanto a moeda é desconhecida", () => {
+    assert.equal(entryValueHelperText(null), "Mínimo conforme a moeda da conta conectada");
+    assert.equal(entryValueHelperText(""), "Mínimo conforme a moeda da conta conectada");
+    assert.ok(entryValueHelperText("BRL").includes("5,00"));
+    assert.ok(entryValueHelperText("USD").includes("1.00"));
   });
 });

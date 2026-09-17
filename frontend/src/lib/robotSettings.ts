@@ -34,12 +34,24 @@ export const ENTRY_VALUE_MIN_BRL = 5;
 /** Entrada em USD: mínimo US$ 1, sem teto. */
 export const ENTRY_VALUE_MIN_USD = 1;
 export const ENTRY_VALUE_MIN = ENTRY_VALUE_MIN_BRL;
+/**
+ * Piso absoluto do armazenamento local, válido enquanto a moeda é desconhecida.
+ *
+ * Não é o mínimo operacional de ninguém: é só o menor valor que alguma moeda
+ * aceita (US$ 1), para o store não subir US$ 1 para 5 antes do snapshot da
+ * conta chegar. O mínimo que vale de verdade é sempre o da moeda conhecida —
+ * ver `entryLimitsForCurrency`.
+ */
+export const ENTRY_VALUE_ABSOLUTE_MIN = ENTRY_VALUE_MIN_USD;
 export const ENTRY_VALUE_STEP = 0.01;
 export const DEFAULT_ENTRY_VALUE = ENTRY_VALUE_MIN_BRL;
 
 export interface EntryValueLimits {
+  /** Mínimo cobrado. Com moeda desconhecida é só o piso de armazenamento. */
   min: number;
   defaultValue: number;
+  /** `false` enquanto o snapshot da conta não disse a moeda. */
+  currencyKnown: boolean;
 }
 
 /**
@@ -47,20 +59,36 @@ export interface EntryValueLimits {
  *
  * Args:
  *   currency: Código da conta conectada (BRL ou USD). Vazio/nulo não assume BRL,
- *     para não subir US$ 1 para 5 enquanto o snapshot ainda não chegou.
+ *     para não subir US$ 1 para 5 enquanto o snapshot ainda não chegou — nesse
+ *     caso vem `currencyKnown: false` e o `min` é só o piso de armazenamento,
+ *     que a interface não deve anunciar como mínimo da conta.
  *
  * Returns:
- *   Mínimo e default (R$ 5 ou US$ 1). Não há máximo.
+ *   Mínimo e default (R$ 5 em BRL, US$ 1 em USD). Não há máximo.
  */
 export function entryLimitsForCurrency(currency?: string | null): EntryValueLimits {
   const raw = String(currency ?? "").trim();
   if (!raw) {
-    return { min: ENTRY_VALUE_MIN_USD, defaultValue: DEFAULT_ENTRY_VALUE };
+    // Default 5 (e não 1) de propósito: quando não há valor algum, 5 é o único
+    // número que serve nas duas moedas — em USD é aceito, em BRL é o mínimo.
+    return {
+      min: ENTRY_VALUE_ABSOLUTE_MIN,
+      defaultValue: DEFAULT_ENTRY_VALUE,
+      currencyKnown: false,
+    };
   }
   if (normalizeAccountCurrency(raw) === "USD") {
-    return { min: ENTRY_VALUE_MIN_USD, defaultValue: ENTRY_VALUE_MIN_USD };
+    return {
+      min: ENTRY_VALUE_MIN_USD,
+      defaultValue: ENTRY_VALUE_MIN_USD,
+      currencyKnown: true,
+    };
   }
-  return { min: ENTRY_VALUE_MIN_BRL, defaultValue: ENTRY_VALUE_MIN_BRL };
+  return {
+    min: ENTRY_VALUE_MIN_BRL,
+    defaultValue: ENTRY_VALUE_MIN_BRL,
+    currencyKnown: true,
+  };
 }
 
 /**
@@ -74,9 +102,14 @@ export function clampEntryValueForCurrency(value: number, currency?: string | nu
 
 /**
  * Texto de ajuda do campo de entrada, já na moeda da conta.
+ *
+ * Sem moeda conhecida não inventa número: anunciar "Mínimo R$ 1,00" (o piso de
+ * armazenamento formatado no default BRL) era falso nas duas moedas e o
+ * backend recusava o valor com `ENTRY_VALUE_TOO_LOW`.
  */
 export function entryValueHelperText(currency?: string | null): string {
   const limits = entryLimitsForCurrency(currency);
+  if (!limits.currencyKnown) return "Mínimo conforme a moeda da conta conectada";
   return `Mínimo ${formatBullExBalance(limits.min, currency)}`;
 }
 
@@ -258,11 +291,24 @@ export function stopModeLabel(value?: string | null): string {
 
 type RawSettings = Partial<Record<keyof RobotSettings, unknown>> & { g1?: unknown };
 
-/** Sanitiza valores vindos do backend ou do armazenamento local. */
-export function normalizeRobotSettings(input?: RawSettings | null): RobotSettings {
+/**
+ * Sanitiza valores vindos do backend ou do armazenamento local.
+ *
+ * Args:
+ *   input: Campos crus (poll, localStorage, diálogo).
+ *   currency: Moeda da conta, quando já conhecida. Informe sempre que tiver —
+ *     é o que faz a entrada de conta em real respeitar os R$ 5. Sem ela vale
+ *     só o piso de armazenamento (`ENTRY_VALUE_ABSOLUTE_MIN`), porque o store
+ *     global é compartilhado e não conhece a conta conectada.
+ */
+export function normalizeRobotSettings(
+  input?: RawSettings | null,
+  currency?: string | null,
+): RobotSettings {
   const defaults = DEFAULT_ROBOT_SETTINGS;
+  const entryMin = entryLimitsForCurrency(currency).min;
   return {
-    entryValue: moneyAtLeast(input?.entryValue, defaults.entryValue, ENTRY_VALUE_MIN_USD),
+    entryValue: moneyAtLeast(input?.entryValue, defaults.entryValue, entryMin),
     stopWin: moneyAtLeast(input?.stopWin, defaults.stopWin, STOP_MONEY_MIN),
     stopLoss: moneyAtLeast(input?.stopLoss, defaults.stopLoss, STOP_MONEY_MIN),
     stopWinMode: normalizeStopMode(input?.stopWinMode as string | undefined),
@@ -434,11 +480,18 @@ function operationalSettingsEqual(a: RobotSettings, b: RobotSettings): boolean {
  * Campos `null`/`undefined`/vazios são ignorados para não resetar a UI para
  * defaults (M1/OTC) quando o poll devolve estado incompleto.
  */
-function pickPresentRobotSettings(input?: RawSettings | null): Partial<RobotSettings> {
+function pickPresentRobotSettings(
+  input?: RawSettings | null,
+  currency?: string | null,
+): Partial<RobotSettings> {
   if (!input) return {};
   const present: Partial<RobotSettings> = {};
   if (input.entryValue != null && input.entryValue !== "") {
-    present.entryValue = moneyAtLeast(input.entryValue, DEFAULT_ENTRY_VALUE, ENTRY_VALUE_MIN_USD);
+    present.entryValue = moneyAtLeast(
+      input.entryValue,
+      DEFAULT_ENTRY_VALUE,
+      entryLimitsForCurrency(currency).min,
+    );
   }
   if (input.stopWin != null && input.stopWin !== "") {
     present.stopWin = moneyAtLeast(input.stopWin, DEFAULT_ROBOT_SETTINGS.stopWin, STOP_MONEY_MIN);

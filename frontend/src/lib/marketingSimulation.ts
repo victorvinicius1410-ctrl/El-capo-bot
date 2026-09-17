@@ -61,6 +61,7 @@ export function normalizeMarketingHistory(
       strategySummary: trade.strategy_summary ?? null,
       analysisDetail: trade.analysis_detail ?? null,
       speechPreview: trade.speech_preview ?? null,
+      studyMode: false,
     });
   }
   return items.sort((a, b) => String(b.finishedAt ?? "").localeCompare(String(a.finishedAt ?? "")));

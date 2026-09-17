@@ -2,10 +2,22 @@ import { cleanAnalysisForSpeech } from "./analysisSpeech";
 import { formatMoneyForSpeech } from "./bullexConnection";
 import { humanizeRobotReason } from "./robotPresentation";
 import type { RobotResultVoice, RobotSignal, RobotState, RobotTrade } from "./robotState";
+import { isStudyActive, studyWinSpeech } from "./studyMode";
 export { SPEECH_CHUNK_MAX_CHARS, splitSpeechChunks } from "./speechChunks";
 
-const GALE_WIN_SPEECH = "Gale 1 fechou no win. Recuperação concluída.";
-const GALE_LOSS_SPEECH = "Gale 1 fechou no los. Ciclo finalizado. Mantém o gerenciamento.";
+/**
+ * Etapa do gale para a fala. Com "Quantidade de Gales" acima de 1 o ciclo
+ * pode abrir G1, G2, G3..., e a narração dizia "Gale 1" em todas elas.
+ */
+function galeStep(state: RobotState): number {
+  const step = state.gale_step ?? state.last_trade?.gale_step ?? 1;
+  return step >= 1 ? step : 1;
+}
+
+const galeWinSpeech = (step: number): string =>
+  `Gale ${step} fechou no win. Recuperação concluída.`;
+const galeLossSpeech = (step: number): string =>
+  `Gale ${step} fechou no los. Ciclo finalizado. Mantém o gerenciamento.`;
 
 export const ROBOT_START_VOICEOVER_SRC = "/robot-voiceover.mp3";
 
@@ -129,6 +141,10 @@ export function buildRobotNarrationEvents(
     return events;
   }
 
+  // Modo Estudo: silêncio em análise, entrada, gale, rejeição e loss. Só o
+  // win é falado, com a estratégia. Stop e boas-vindas (acima) continuam.
+  if (isStudyActive(state)) return studyNarrationEvents(state);
+
   if (includeOpeningVoiceover && startSequence > 0) {
     events.push({
       key: `ROBOT_STARTED_VOICEOVER|${startSequence}`,
@@ -181,18 +197,25 @@ export function buildRobotNarrationEvents(
     });
   }
   if (status === "WAITING_GALE_ENTRY") {
+    const step = galeStep(state);
     events.push({
       key: galeKey(state, orderId, "WAITING_GALE_ENTRY"),
-      text: "Deu los na entrada inicial. Gale 1 preparado no mesmo ativo e na mesma direção.",
+      text:
+        step <= 1
+          ? "Deu los na entrada inicial. Gale 1 preparado no mesmo ativo e na mesma direção."
+          : `Deu los no Gale ${step - 1}. Gale ${step} preparado no mesmo ativo e na mesma direção.`,
     });
   }
   if (status === "SENDING_GALE_ORDER") {
-    events.push({ key: galeKey(state, orderId, "SENDING_GALE_ORDER"), text: "Entrando no Gale 1 agora." });
+    events.push({
+      key: galeKey(state, orderId, "SENDING_GALE_ORDER"),
+      text: `Entrando no Gale ${galeStep(state)} agora.`,
+    });
   }
   if (status === "PENDING_GALE_RESULT") {
     events.push({
       key: galeKey(state, orderId, "PENDING_GALE_RESULT"),
-      text: "Agora é só aguardar o resultado do Gale 1.",
+      text: `Agora é só aguardar o resultado do Gale ${galeStep(state)}.`,
     });
   }
   if (
@@ -250,14 +273,50 @@ export function buildRobotNarrationEvents(
       });
     }
     if (narrateGale && state.cycle_result === "GALE_WIN") {
-      resultEvents.push({ key: galeKey(state, orderId, "GALE_WIN"), text: GALE_WIN_SPEECH });
+      resultEvents.push({
+        key: galeKey(state, orderId, "GALE_WIN"),
+        text: galeWinSpeech(galeStep(state)),
+      });
     }
     if (narrateGale && state.cycle_result === "GALE_LOSS") {
-      resultEvents.push({ key: galeKey(state, orderId, "GALE_LOSS"), text: GALE_LOSS_SPEECH });
+      resultEvents.push({
+        key: galeKey(state, orderId, "GALE_LOSS"),
+        text: galeLossSpeech(galeStep(state)),
+      });
     }
   }
   // Placar/resultado primeiro: se o narrador estiver ocupado, o hook preempta.
   return dedupeEvents([...resultEvents, ...events]);
+}
+
+/** Fala do win no Modo Estudo: ativo, direção, estratégia e análise. */
+function studyNarrationEvents(state: RobotState): RobotNarrationEvent[] {
+  const win = studyWinSpeech(state);
+  if (!win) return [];
+  const trade = win.trade;
+  const parts: string[] = [
+    win.cycle === "GALE_WIN" ? `Gale ${win.galeStep} fechou no win.` : "Fechou no win.",
+  ];
+  if (trade) {
+    parts.push(`Ativo: ${speakSymbol(trade.active)}. Direção: ${speakDirection(trade.direction)}.`);
+    if (trade.strategy_name) {
+      parts.push(`Estratégia: ${reasonForSpeech(trade.strategy_name)}.`);
+    }
+    const analise = analysisSentence({
+      strategy_summary: trade.strategy_summary,
+      speech_preview: trade.speech_preview,
+      strategy_reason: trade.strategy_reason,
+      reason: trade.entry_reason ?? trade.analysis_detail,
+    });
+    if (analise) parts.push(analise.trim());
+  }
+  parts.push(`Placar: ${win.wins === 1 ? "1 win" : `${win.wins} wins`}.`);
+  return [
+    {
+      key: resultEventKey(win.cycle, win.orderId, win.wins, win.losses),
+      text: parts.join(" "),
+    },
+  ];
 }
 
 function hasNoOpportunity(state: RobotState): boolean {
@@ -329,8 +388,9 @@ function resultVoiceEvent(
   const key = resultEventKey(cycle, voice.order_id, voice.wins, voice.losses);
   const money = formatMoneyForSpeech(voice.profit, currency);
   const score = speakScore(voice.wins, voice.losses);
-  if (cycle === "GALE_WIN") return { key, text: GALE_WIN_SPEECH };
-  if (cycle === "GALE_LOSS") return { key, text: GALE_LOSS_SPEECH };
+  const voiceStep = voice.gale_step >= 1 ? voice.gale_step : 1;
+  if (cycle === "GALE_WIN") return { key, text: galeWinSpeech(voiceStep) };
+  if (cycle === "GALE_LOSS") return { key, text: galeLossSpeech(voiceStep) };
   if (cycle === "WIN") {
     return {
       key,
@@ -489,7 +549,11 @@ function speakDirection(direction?: string | null): string {
  * `speech_preview` era falado também depois do motivo — quando os dois eram a
  * mesma narrativa, a análise saía duas vezes seguidas.
  */
-function analysisSentence(signal: RobotSignal): string {
+function analysisSentence(
+  signal: Partial<
+    Pick<RobotSignal, "strategy_summary" | "speech_preview" | "ai_entry_reason" | "strategy_reason" | "reason">
+  >,
+): string {
   const sources = [
     signal.strategy_summary,
     signal.speech_preview,
