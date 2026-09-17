@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 
 from backend import signal_engine
 from backend.live_demo_mode import (
     LIVE_CONFIDENCE,
+    LIVE_MAX_EXPIRATION_MINUTES,
+    LIVE_MAX_SECONDS_BETWEEN_ENTRIES,
+    LIVE_MIN_SECONDS_BETWEEN_ENTRIES,
+    LIVE_NON_WAIVABLE,
     STRATEGY_LIVE_DEMO,
     apply_live_demo,
     is_live_demo,
     live_demo_allows,
+    live_cadencia_estourada,
+    live_espera_espacamento,
     live_demo_passa_portao,
+    live_expiration_minutes,
     live_min_confidence,
 )
 
@@ -225,6 +233,153 @@ class CadenciaTests(unittest.TestCase):
         self.assertIs(live["live_demo"], True)
 
 
+class LiveDemoExpiracaoTests(unittest.TestCase):
+    """Teto de duração da entrada de demonstração (pedido do dono, 15/09/2026).
+
+    A duração normal sai do timeframe da conta. Uma conta em M15 abriria
+    entrada de 15 minutos no meio da transmissão, que é o oposto do que o modo
+    existe para fazer.
+    """
+
+    def test_conta_longa_e_encurtada_para_o_teto(self) -> None:
+        for minutos in (15, 30):
+            with self.subTest(minutos=minutos):
+                sinal = {"live_demo": True}
+                self.assertEqual(
+                    live_expiration_minutes(minutos, sinal),
+                    LIVE_MAX_EXPIRATION_MINUTES,
+                )
+
+    def test_conta_curta_nao_muda(self) -> None:
+        """M1 e M5 já entram abaixo do teto — em 15/09 as 5 contas de
+        marketing estavam todas em M1, então na prática o teto é uma garantia
+        e não uma mudança de comportamento."""
+        for minutos in (1, 5):
+            with self.subTest(minutos=minutos):
+                self.assertEqual(
+                    live_expiration_minutes(minutos, {"live_demo": True}), minutos
+                )
+
+    def test_entrada_normal_nunca_e_encurtada(self) -> None:
+        for candidato in ({}, {"live_demo": False}, {"live_demo": None}, None):
+            with self.subTest(candidato=candidato):
+                self.assertEqual(live_expiration_minutes(15, candidato), 15)
+
+    def test_valor_invalido_cai_no_teto(self) -> None:
+        self.assertEqual(
+            live_expiration_minutes("nao-e-numero", {"live_demo": True}),
+            LIVE_MAX_EXPIRATION_MINUTES,
+        )
+
+    def test_valor_invalido_de_entrada_normal_passa_intacto(self) -> None:
+        """O teto do LIVE não pode virar validador da ordem normal: quem
+        valida duração é ``validate_buy_real_order_payload``. Converter antes
+        de checar o modo fazia uma operação normal com valor esquisito virar
+        5 minutos sem ninguém ver."""
+        self.assertEqual(live_expiration_minutes("nao-e-numero", {}), "nao-e-numero")
+
+
+class LiveDemoCadenciaTests(unittest.TestCase):
+    """Teto de tempo sem entrar (pedido do dono, 15/09/2026).
+
+    "Preciso que pegue no máximo a cada 5 minutos, pode ser antes."
+    """
+
+    def test_sem_entrada_nenhuma_conta_como_estourado(self) -> None:
+        """Robô que acabou de ligar não espera 5 min para começar a contar."""
+        self.assertTrue(live_cadencia_estourada(None, datetime(2026, 9, 15, 20, 0, 0)))
+
+    def test_dentro_do_teto_nao_estoura(self) -> None:
+        agora = datetime(2026, 9, 15, 20, 5, 0)
+        self.assertFalse(
+            live_cadencia_estourada(datetime(2026, 9, 15, 20, 1, 0), agora)
+        )
+
+    def test_no_teto_exato_estoura(self) -> None:
+        agora = datetime(2026, 9, 15, 20, 5, 0)
+        self.assertTrue(
+            live_cadencia_estourada(datetime(2026, 9, 15, 20, 0, 0), agora)
+        )
+        self.assertEqual(LIVE_MAX_SECONDS_BETWEEN_ENTRIES, 300)
+
+    def test_payout_abaixo_do_minimo_passa_quando_a_cadencia_estourou(self) -> None:
+        """A seca vale mais que 2 pontos de payout — mas só na seca."""
+        sinal = apply_live_demo(
+            barrado(blocked_filters=["MIN_CONFIDENCE"], payout=78.0),
+            "EURUSD-OTC",
+            live_enabled=True,
+        )
+        passa, motivo = live_demo_passa_portao(
+            sinal, min_payout=80, minimo_confianca=LIVE_CONFIDENCE
+        )
+        self.assertFalse(passa, "sem seca, o payout mínimo do painel vale")
+        self.assertIn("PAYOUT_ABAIXO_DO_MINIMO", str(motivo))
+
+        passa, motivo = live_demo_passa_portao(
+            sinal,
+            min_payout=80,
+            minimo_confianca=LIVE_CONFIDENCE,
+            cadencia_estourada=True,
+        )
+        self.assertTrue(passa, motivo)
+        self.assertIsNone(motivo)
+
+    def test_bloqueio_de_execucao_nao_cede_nem_na_seca(self) -> None:
+        """Forçar ordem em ativo fechado não gera entrada, gera recusa."""
+        for impeditivo in ("ACTIVE_CLOSED", "STOP_LOSS_HIT", "OPERATION_IN_PROGRESS"):
+            with self.subTest(impeditivo=impeditivo):
+                sinal = barrado(blocked_filters=[impeditivo], payout=87.0)
+                sinal["live_demo"] = True
+                passa, motivo = live_demo_passa_portao(
+                    sinal,
+                    min_payout=80,
+                    minimo_confianca=LIVE_CONFIDENCE,
+                    cadencia_estourada=True,
+                )
+                self.assertFalse(passa)
+                self.assertEqual(motivo, impeditivo)
+
+
+class LiveDemoEspacamentoTests(unittest.TestCase):
+    """Piso de tempo entre entradas (decisão do dono, 15/09/2026).
+
+    "Não é praticamente toda vela... no máximo a cada 5 minutos, não a cada 1."
+    Piso 3 min + teto 5 min = 12 a 20 entradas por hora.
+    """
+
+    def test_piso_e_teto_sao_coerentes(self) -> None:
+        self.assertEqual(LIVE_MIN_SECONDS_BETWEEN_ENTRIES, 180)
+        self.assertLess(
+            LIVE_MIN_SECONDS_BETWEEN_ENTRIES, LIVE_MAX_SECONDS_BETWEEN_ENTRIES
+        )
+
+    def test_dentro_do_piso_espera(self) -> None:
+        """Vela seguinte em M1: 1 min depois ainda não pode entrar."""
+        agora = datetime(2026, 9, 15, 20, 1, 0)
+        self.assertTrue(
+            live_espera_espacamento(datetime(2026, 9, 15, 20, 0, 0), agora)
+        )
+
+    def test_passado_o_piso_libera(self) -> None:
+        agora = datetime(2026, 9, 15, 20, 3, 0)
+        self.assertFalse(
+            live_espera_espacamento(datetime(2026, 9, 15, 20, 0, 0), agora)
+        )
+
+    def test_primeira_entrada_da_sessao_nao_espera(self) -> None:
+        """Sem entrada anterior não há o que espaçar — a transmissão começa."""
+        self.assertFalse(
+            live_espera_espacamento(None, datetime(2026, 9, 15, 20, 0, 0))
+        )
+
+    def test_janela_entre_piso_e_teto_nao_estoura(self) -> None:
+        """Entre 3 e 5 min: pode entrar, mas ainda não é seca."""
+        agora = datetime(2026, 9, 15, 20, 4, 0)
+        ultima = datetime(2026, 9, 15, 20, 0, 0)
+        self.assertFalse(live_espera_espacamento(ultima, agora))
+        self.assertFalse(live_cadencia_estourada(ultima, agora))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -294,18 +449,25 @@ class LiveDemoPortaoTests(unittest.TestCase):
         self.assertTrue(passa, motivo)
         self.assertIsNone(motivo)
 
-    def test_regiao_de_suporte_e_resistencia_nao_e_dispensada(self) -> None:
-        """A violação relatada pelo dono em 2026-09-09.
+    def test_nivel_e_pavio_sao_dispensados(self) -> None:
+        """Decisão do dono em 2026-09-15: o modo LIVE dispensa nível e pavio.
 
-        Log de produção, conta de marketing com o modo ligado:
-        ``LIVE_DEMO_RELEASE NZDUSD-OTC PUT
-        barrados=LEVEL_CONFLICT,LEVEL_REJECTION,SR_ZONE`` seguido de
-        ``ORDER_ACCEPTED order_id=14247169254`` 42 segundos depois — PUT colado
-        no suporte, ordem real. Foram 4 dessas em 6 liberações num intervalo de
-        48 h. Cadência de transmissão não justifica operar contra o nível.
+        Reverte a regra de 09/09 (``SR_ZONE``/``LEVEL_CONFLICT``/
+        ``LEVEL_REJECTION``) e a de 11/09 (``WICK_EXCESS``), que tinham entrado
+        depois de ``LIVE_DEMO_RELEASE NZDUSD-OTC PUT`` virar ordem real colada
+        no suporte. A justificativa nova é a duração: a entrada do modo LIVE é
+        curta (teto de ``LIVE_MAX_EXPIRATION_MINUTES``) e nessa escala nível e
+        pavio não mandam na vela.
+
+        O efeito colateral é conhecido e aceito: o robô VAI entrar contra
+        suporte e resistência durante a transmissão. Este teste existe para
+        que a reversão seja uma decisão explícita e não um acidente — se
+        alguém recolocar esses filtros em ``LIVE_NON_WAIVABLE``, é aqui que
+        aparece.
         """
-        for filtro in ("SR_ZONE", "LEVEL_CONFLICT", "LEVEL_REJECTION"):
+        for filtro in ("SR_ZONE", "LEVEL_CONFLICT", "LEVEL_REJECTION", "WICK_EXCESS"):
             with self.subTest(filtro=filtro):
+                self.assertNotIn(filtro, LIVE_NON_WAIVABLE)
                 sinal = apply_live_demo(
                     barrado(blocked_filters=[filtro], payout=87.0),
                     "NZDUSD-OTC",
@@ -314,8 +476,8 @@ class LiveDemoPortaoTests(unittest.TestCase):
                 passa, motivo = live_demo_passa_portao(
                     sinal, min_payout=80, minimo_confianca=LIVE_CONFIDENCE
                 )
-                self.assertFalse(passa)
-                self.assertEqual(motivo, filtro)
+                self.assertTrue(passa, motivo)
+                self.assertIsNone(motivo)
 
     def test_bloqueio_de_execucao_continua_barrando(self) -> None:
         for impeditivo in ("STOP_LOSS_HIT", "ACTIVE_CLOSED", "OPERATION_IN_PROGRESS"):

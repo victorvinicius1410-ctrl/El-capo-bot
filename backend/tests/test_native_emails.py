@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.admin_models import AdminActor, AdminPermission
 from backend.email_models import EmailTemplateUpdate
-from backend.email_repository import InMemoryEmailRepository
+from backend.email_repository import (
+    EMAIL_STORAGE_BUCKET,
+    InMemoryEmailRepository,
+    SupabaseEmailRepository,
+)
 from backend.email_router import create_email_router
 from backend.email_service import (
     DEFAULT_BODIES,
@@ -412,6 +418,76 @@ class EmailServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         deliveries = await emails.list_deliveries(owner())
         self.assertEqual(len(deliveries), 1)
+
+
+class StoragePruneTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão: o DELETE unitário era recusado com 400 e nada era apagado."""
+
+    async def test_prune_sends_batch_delete_with_prefixes(self) -> None:
+        """A remoção vai em lote, no bucket, com os obsoletos no corpo."""
+        prefix = "tenant-1/deliveries/"
+        listed = [{"name": f"2026090{index}_abc.json"} for index in range(1, 6)]
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.startswith("/storage/v1/object/list/"):
+                return httpx.Response(200, json=listed)
+            return httpx.Response(200, json=[])
+
+        repository = SupabaseEmailRepository(
+            "https://project.supabase.co",
+            "server-only-key",
+        )
+        # `backend.email_repository.httpx` é o módulo global: sem guardar a
+        # classe real antes, o lambda chamaria a si mesmo.
+        real_client = httpx.AsyncClient
+        transport = httpx.MockTransport(handler)
+        with patch(
+            "backend.email_repository.httpx.AsyncClient",
+            lambda **kwargs: real_client(transport=transport),
+        ):
+            await repository._storage_prune_prefix(prefix, keep=3)
+
+        removal = captured[-1]
+        self.assertEqual(removal.method, "DELETE")
+        self.assertEqual(
+            removal.url.path, f"/storage/v1/object/{EMAIL_STORAGE_BUCKET}"
+        )
+        body = json.loads(removal.content)
+        # Os 3 mais recentes ficam; os 2 mais antigos saem, com o prefixo junto.
+        self.assertEqual(
+            body["prefixes"],
+            [f"{prefix}20260902_abc.json", f"{prefix}20260901_abc.json"],
+        )
+
+    async def test_prune_logs_when_storage_rejects(self) -> None:
+        """Falha da remoção precisa aparecer no log, não sumir em silêncio."""
+        listed = [{"name": f"2026090{index}_abc.json"} for index in range(1, 6)]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/storage/v1/object/list/"):
+                return httpx.Response(200, json=listed)
+            return httpx.Response(400, json={"error": "invalid"})
+
+        repository = SupabaseEmailRepository(
+            "https://project.supabase.co",
+            "server-only-key",
+        )
+        # `backend.email_repository.httpx` é o módulo global: sem guardar a
+        # classe real antes, o lambda chamaria a si mesmo.
+        real_client = httpx.AsyncClient
+        transport = httpx.MockTransport(handler)
+        with patch(
+            "backend.email_repository.httpx.AsyncClient",
+            lambda **kwargs: real_client(transport=transport),
+        ):
+            with self.assertLogs("backend-email-repository", level="WARNING") as logs:
+                await repository._storage_prune_prefix("tenant-1/deliveries/", keep=3)
+
+        self.assertTrue(
+            any("email.storage_prune_failed" in line for line in logs.output)
+        )
 
 
 class EmailRouterTests(unittest.TestCase):

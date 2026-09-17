@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.account_link_service import SupabaseAccountLinkService
+from backend.account_link_service import AccountLinkError, SupabaseAccountLinkService
 from backend.admin_models import AdminActor, AdminPermission
 from backend.services.encryption_service import EncryptionService
 from backend.webhook_models import DomainEventType, WebhookEndpointCreate
@@ -285,6 +287,73 @@ class QueueDeliveriesResilienceTests(unittest.IsolatedAsyncioTestCase):
         emails.queue_for_event.assert_awaited_once_with(event)
 
 
+class PasswordRecoveryRouteTests(unittest.TestCase):
+    """A rota pública responde 202 sempre; o que importa é o efeito."""
+
+    def _client(self, handler) -> TestClient:
+        """Monta a rota com um Auth Admin falso e captura o evento emitido."""
+        key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+        self.service = WebhookService(InMemoryWebhookRepository(), EncryptionService(key))
+        self.service.enqueue_event = AsyncMock(return_value=AsyncMock(id="evt-recovery"))
+        self.service.queue_event_deliveries = AsyncMock()
+        links = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+
+        async def admin() -> dict[str, str]:
+            return {"user_id": "owner", "company_id": COMPANY_ID, "permissions": ""}
+
+        app = FastAPI()
+        app.include_router(create_webhook_router(self.service, admin, links))
+        return TestClient(app)
+
+    def test_recovery_enqueues_event_with_link(self) -> None:
+        """Conta existente gera o evento de recuperação com a URL do link."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "user-7",
+                    "app_metadata": {"company_id": COMPANY_ID},
+                    "action_link": "https://auth.example.com/verify?token=one-time",
+                },
+            )
+
+        response = self._client(handler).post(
+            "/auth/password-recovery", json={"email": "Client@Example.com"}
+        )
+
+        self.assertEqual(response.status_code, 202)
+        kwargs = self.service.enqueue_event.await_args.kwargs
+        self.assertEqual(
+            kwargs["event_type"], DomainEventType.PASSWORD_RECOVERY_REQUESTED
+        )
+        self.assertEqual(kwargs["company_id"], COMPANY_ID)
+        self.assertEqual(
+            kwargs["data"]["recovery_url"],
+            "https://auth.example.com/verify?token=one-time",
+        )
+        self.assertEqual(kwargs["customer"]["email"], "client@example.com")
+        self.service.queue_event_deliveries.assert_awaited_once()
+
+    def test_recovery_of_unknown_account_stays_silent(self) -> None:
+        """Conta inexistente responde igual, sem emitir evento."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"msg": "not found"})
+
+        response = self._client(handler).post(
+            "/auth/password-recovery", json={"email": "missing@example.com"}
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.service.enqueue_event.assert_not_awaited()
+
+
 class AccountLinkAndEncryptionTests(unittest.IsolatedAsyncioTestCase):
     """Valida links de uso único e criptografia autenticada."""
 
@@ -298,8 +367,8 @@ class AccountLinkAndEncryptionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             EncryptionService(base64.urlsafe_b64encode(b"short").decode())
 
-    async def test_recovery_uses_company_from_verified_auth_metadata(self) -> None:
-        """O tenant vem do usuário retornado pela Auth Admin."""
+    async def test_recovery_accepts_legacy_nested_payload(self) -> None:
+        """Respostas com o usuário aninhado em ``user`` continuam aceitas."""
         response = AsyncMock()
         response.status_code = 200
         response.json = lambda: {
@@ -328,6 +397,186 @@ class AccountLinkAndEncryptionTests(unittest.IsolatedAsyncioTestCase):
         sent_body = client.post.await_args.kwargs["json"]
         self.assertNotIn("company_id", sent_body)
         self.assertNotIn("password", sent_body)
+
+    async def test_recovery_reads_identity_from_root_payload(self) -> None:
+        """A Auth Admin devolve o usuário na raiz; o tenant precisa vir de lá."""
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "user-9",
+                    "email": "client@example.com",
+                    "app_metadata": {"provider": "email", "company_id": COMPANY_ID},
+                    "user_metadata": {"name": "Cliente"},
+                    "action_link": "https://auth.example.com/verify?token=one-time",
+                    "email_otp": "123456",
+                    "hashed_token": "hashed-one-time",
+                    "verification_type": "recovery",
+                    "redirect_to": "https://app.example.com/reset-password",
+                },
+            )
+
+        service = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+        link = await service.create_recovery_link("client@example.com")
+
+        self.assertIsNotNone(link)
+        self.assertEqual(link.company_id, COMPANY_ID)
+        self.assertEqual(link.user_id, "user-9")
+        self.assertEqual(
+            link.action_link, "https://auth.example.com/verify?token=one-time"
+        )
+        self.assertEqual(captured[0].url.path, "/auth/v1/admin/generate_link")
+        sent_body = json.loads(captured[0].content)
+        self.assertEqual(sent_body["type"], "recovery")
+        self.assertNotIn("company_id", sent_body)
+        self.assertNotIn("password", sent_body)
+        # Regressão: dentro de `options` a Auth Admin ignora o destino e o link
+        # leva ao Site URL do projeto (localhost).
+        self.assertEqual(
+            sent_body["redirect_to"], "https://app.example.com/reset-password"
+        )
+        self.assertNotIn("options", sent_body)
+
+    async def test_recovery_resolves_company_from_access_profile(self) -> None:
+        """Conta sem company_id no app_metadata cai no perfil de acesso."""
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/rest/v1/user_access_profiles":
+                return httpx.Response(200, json=[{"company_id": COMPANY_ID}])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "user-legacy",
+                    "email": "legacy@example.com",
+                    "app_metadata": {"provider": "email"},
+                    "action_link": "https://auth.example.com/verify?token=one-time",
+                },
+            )
+
+        service = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+        link = await service.create_recovery_link("legacy@example.com")
+
+        self.assertIsNotNone(link)
+        self.assertEqual(link.company_id, COMPANY_ID)
+        self.assertEqual(link.user_id, "user-legacy")
+        lookup = captured[1]
+        self.assertEqual(lookup.url.path, "/rest/v1/user_access_profiles")
+        self.assertEqual(lookup.url.params["user_id"], "eq.user-legacy")
+        # Conta removida do painel não pode render link nem ser adotada.
+        self.assertEqual(lookup.url.params["deleted_at"], "is.null")
+
+    async def test_recovery_without_any_tenant_is_neutral(self) -> None:
+        """Sem tenant em lugar nenhum a recuperação falha sem vazar o motivo."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/rest/v1/user_access_profiles":
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "user-orphan",
+                    "action_link": "https://auth.example.com/verify?token=one-time",
+                },
+            )
+
+        service = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+        self.assertIsNone(await service.create_recovery_link("orphan@example.com"))
+
+    async def test_purchase_account_creates_user_and_first_access_link(self) -> None:
+        """Comprador novo ganha conta e link de primeiro acesso do mesmo tenant."""
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/auth/v1/admin/users":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "user-9",
+                        "email": "novo@example.com",
+                        "app_metadata": {"company_id": COMPANY_ID},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "user-9",
+                    "email": "novo@example.com",
+                    "app_metadata": {"provider": "email", "company_id": COMPANY_ID},
+                    "action_link": "https://auth.example.com/verify?token=first-access",
+                },
+            )
+
+        service = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+        link = await service.create_purchase_account(
+            company_id=COMPANY_ID,
+            email="novo@example.com",
+            name="Comprador Novo",
+        )
+
+        self.assertEqual(link.user_id, "user-9")
+        self.assertEqual(link.company_id, COMPANY_ID)
+        self.assertEqual(
+            link.action_link, "https://auth.example.com/verify?token=first-access"
+        )
+        created_body = json.loads(captured[0].content)
+        self.assertTrue(created_body["email_confirm"])
+        self.assertEqual(created_body["app_metadata"]["company_id"], COMPANY_ID)
+        self.assertTrue(created_body["password"])
+        self.assertEqual(captured[1].url.path, "/auth/v1/admin/generate_link")
+
+    async def test_purchase_account_rejects_other_tenant(self) -> None:
+        """E-mail já existente sob outro tenant não é adotado pela compra."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/auth/v1/admin/users":
+                return httpx.Response(422, json={"msg": "already registered"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "user-outro",
+                    "app_metadata": {"company_id": OTHER_COMPANY_ID},
+                    "action_link": "https://auth.example.com/verify?token=one-time",
+                },
+            )
+
+        service = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+        with self.assertRaises(AccountLinkError):
+            await service.create_purchase_account(
+                company_id=COMPANY_ID,
+                email="outro@example.com",
+                name="Outro",
+            )
 
     async def test_recovery_does_not_reveal_missing_account(self) -> None:
         """Conta inexistente produz resultado neutro."""

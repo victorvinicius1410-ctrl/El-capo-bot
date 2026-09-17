@@ -178,13 +178,25 @@ class CamposDoVereditoTest(unittest.TestCase):
         self.assertIn("wick_entry_reason", robot_persistence.TRADE_ANALYSIS_FIELDS)
 
     def test_pavio_e_bloqueio_que_ninguem_dispensa(self) -> None:
-        from backend import live_demo_mode, reversion_strategy, signal_engine
+        """Vale para todo mundo MENOS o modo LIVE — ver o teste seguinte."""
+        from backend import reversion_strategy, signal_engine
 
         self.assertIn("WICK_EXCESS", main.CRITICAL_TRADE_BLOCKS)
         self.assertIn("WICK_EXCESS", main.RECOVERY_NON_RELAXABLE_TRADE_BLOCKS)
-        self.assertIn("WICK_EXCESS", live_demo_mode.LIVE_NON_WAIVABLE)
         self.assertIn("WICK_EXCESS", reversion_strategy.REVZ_NON_WAIVABLE)
         self.assertIn("WICK_EXCESS", signal_engine.NAMED_STRATEGY_NON_WAIVABLE)
+
+    def test_modo_live_e_a_unica_excecao_ao_pavio(self) -> None:
+        """Exceção aberta pelo dono em 15/09/2026, revertendo a regra de 11/09.
+
+        A entrada do modo LIVE é curta (teto de
+        ``LIVE_MAX_EXPIRATION_MINUTES``) e nessa escala o pavio não manda na
+        vela. A exceção é SÓ do modo LIVE: o motor clássico, a REV-Z, as
+        estratégias nomeadas e a recuperação continuam barrando.
+        """
+        from backend import live_demo_mode
+
+        self.assertNotIn("WICK_EXCESS", live_demo_mode.LIVE_NON_WAIVABLE)
 
 
 if __name__ == "__main__":

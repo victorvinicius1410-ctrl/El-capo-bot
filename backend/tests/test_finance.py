@@ -8,10 +8,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.account_link_service import AccountLink
+from backend.account_link_service import AccountLink, SupabaseAccountLinkService
 from backend.admin_models import AdminActor, AdminPermission, PaymentStatus
 from backend.cakto_service import CaktoConfig, CaktoOfferCreated, CaktoService
 from backend.finance_models import BillingPlanCreate, BillingPlanUpdate
@@ -274,6 +275,116 @@ class FinanceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             kwargs["data"]["first_access_url"],
             "https://app.example.com/reset-password?token=one-time",
+        )
+
+    async def test_new_buyer_provisioning_uses_real_auth_admin_payload(self) -> None:
+        """Compra de cliente novo funciona contra a resposta real da Auth Admin.
+
+        Regressão: o parser lia a identidade de ``body["user"]`` e a Auth Admin
+        devolve os campos na raiz, então todo comprador novo virava 422.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/auth/v1/admin/users":
+                return httpx.Response(
+                    200,
+                    json={"id": "buyer-real", "app_metadata": {"company_id": COMPANY_ID}},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "buyer-real",
+                    "email": "real@example.com",
+                    "app_metadata": {"provider": "email", "company_id": COMPANY_ID},
+                    "action_link": "https://app.example.com/reset-password?token=first",
+                    "hashed_token": "hashed-one-time",
+                    "verification_type": "recovery",
+                },
+            )
+
+        links = SupabaseAccountLinkService(
+            "https://project.supabase.co",
+            "server-only-key",
+            redirect_url="https://app.example.com/reset-password",
+            transport=httpx.MockTransport(handler),
+        )
+        webhooks = AsyncMock()
+        webhooks.enqueue_event = AsyncMock(return_value=AsyncMock(id="evt-real"))
+        webhooks.queue_event_deliveries = AsyncMock()
+        service = FinanceService(
+            self.repository,
+            webhooks=webhooks,
+            account_links=links,
+        )
+        payload = cakto_payload("purchase_approved")
+        payload["data"] = {
+            **payload["data"],  # type: ignore[arg-type]
+            "id": "payment-real-buyer",
+            "customer": {"email": "real@example.com", "name": "Comprador Real"},
+        }
+
+        result = await service.process_cakto_event(payload)
+
+        self.assertTrue(result.processed)
+        kwargs = webhooks.enqueue_event.await_args.kwargs
+        self.assertEqual(kwargs["event_type"], DomainEventType.PURCHASE_COMPLETED)
+        self.assertEqual(
+            kwargs["data"]["first_access_url"],
+            "https://app.example.com/reset-password?token=first",
+        )
+
+    async def test_checkout_abandonment_is_accepted_without_ledger_row(self) -> None:
+        """Abandono de carrinho não tem transação: aceita sem gravar evento."""
+        webhooks = AsyncMock()
+        webhooks.enqueue_event = AsyncMock(return_value=AsyncMock(id="evt-abandon"))
+        webhooks.queue_event_deliveries = AsyncMock()
+        service = FinanceService(self.repository, webhooks=webhooks)
+        sem_data = {
+            "id", "refId", "ref_id", "subscription", "occurred_at", "createdAt",
+            "updatedAt", "paidAt", "created_at", "updated_at", "canceledAt",
+            "refundedAt", "chargedbackAt",
+        }
+        payload = cakto_payload("checkout_abandonment")
+        payload["data"] = {
+            key: value
+            for key, value in payload["data"].items()  # type: ignore[union-attr]
+            if key not in sem_data
+        }
+        marco = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        await self.repository.touch_config_state(COMPANY_ID, last_event_at=marco)
+
+        before = len(await self.repository.list_events(COMPANY_ID, limit=100, offset=0))
+        result = await service.process_cakto_event(payload)
+        after = await self.repository.list_events(COMPANY_ID, limit=100, offset=0)
+
+        self.assertFalse(result.processed)
+        self.assertFalse(result.duplicate)
+        self.assertEqual(len(after), before)
+        webhooks.enqueue_event.assert_not_awaited()
+        # Sem data no payload, o "último evento" do painel não pode voltar a 1970.
+        state = await self.repository.get_config_state(COMPANY_ID)
+        self.assertEqual(state.last_event_at, marco)
+
+    async def test_checkout_abandonment_with_date_advances_last_event(self) -> None:
+        """Quando o abandono traz data, ela mantém o painel vivo."""
+        service = FinanceService(self.repository, webhooks=AsyncMock())
+        payload = cakto_payload("checkout_abandonment")
+        payload["data"] = {
+            **payload["data"],  # type: ignore[arg-type]
+            "createdAt": "2026-09-16T12:00:00Z",
+        }
+        for chave in ("id", "refId", "ref_id", "subscription"):
+            payload["data"].pop(chave, None)  # type: ignore[union-attr]
+        await self.repository.touch_config_state(
+            COMPANY_ID,
+            last_event_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        )
+
+        await service.process_cakto_event(payload)
+
+        state = await self.repository.get_config_state(COMPANY_ID)
+        self.assertEqual(
+            state.last_event_at, datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
         )
 
     async def test_subscription_renewed_emits_renewed_email_event(self) -> None:

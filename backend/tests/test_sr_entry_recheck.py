@@ -49,6 +49,45 @@ class RevalidacaoDeNivelNaEntradaTest(unittest.IsolatedAsyncioTestCase):
     async def test_libera_quando_continua_respeitando(self) -> None:
         self.assertIsNone(await self._rodar(True, "OK_FORA_DA_REGIAO"))
 
+    async def test_modo_live_dispensa_a_reconferencia(self) -> None:
+        """Decisão do dono em 15/09/2026: no LIVE não vale nível nem pavio.
+
+        A entrada do modo é curta (teto de ``LIVE_MAX_EXPIRATION_MINUTES``), e
+        nessa escala a regra de nível não manda na vela. Sem o desvio, esta
+        reconferência refaz do zero — com velas novas — o veto que
+        ``apply_live_demo`` acabou de dispensar: é a armadilha dos "dois
+        portões" que já pegou três vezes neste código. Medido em 15/09 na conta
+        11e0b3d5: das 3 liberações do modo, 1 morreu aqui com
+        ``PAVIO_NA_ENTRADA`` e virou "sem oportunidade" em silêncio.
+
+        O cenário abaixo é o que BARRA uma entrada normal (``respeita=False``,
+        nível virou contra): o candidato do LIVE tem que passar mesmo assim.
+        """
+        candidato = self._candidato()
+        candidato["live_demo"] = True
+        velas = _velas_planas(160, 1.3187)
+        with mock.patch.object(
+            main, "call_bullex_service",
+            new=mock.AsyncMock(return_value=(200, {"ok": True, "candles": velas})),
+        ), mock.patch.object(
+            main, "extract_candles", return_value=velas
+        ), mock.patch.object(
+            main, "build_zone", return_value={"support": 1.318665, "resistance": None}
+        ), mock.patch.object(
+            main, "evaluate_respect", return_value=(False, "CONTRA_O_NIVEL")
+        ):
+            motivo = await main.revalidate_level_before_entry(
+                "user-sr", candidato, "M1"
+            )
+        self.assertIsNone(motivo)
+        self.assertEqual(
+            candidato["sr_entry_recheck_reason"], "LIVE_DEMO_DISPENSA_NIVEL_E_PAVIO"
+        )
+
+    async def test_entrada_normal_continua_barrada_no_mesmo_cenario(self) -> None:
+        """Contraprova do teste acima: sem a marca ``live_demo``, barra."""
+        self.assertEqual(await self._rodar(False), "SR_ZONE_NA_ENTRADA")
+
     async def test_sem_direcao_nao_ha_nivel_a_respeitar(self) -> None:
         cand = {"symbol": "GBPUSD-OTC", "signal": "WAIT"}
         self.assertIsNone(

@@ -455,8 +455,30 @@ class ScoreCanStillRiseTests(ScoreAuthorityTestCase):
             patch.object(main, "robot_runtime_mode", return_value="embedded"),
         ):
             await main.robot_reset_score({"user_id": self.user_id})
-        self.assertIsNone(main.get_session_score_authority(self.user_id))
+        # Contrato novo (15/09/2026): o "Reiniciar placar" MARCA 0-0 em vez de
+        # só limpar a marca da exclusão anterior. É essa marca que autoriza o
+        # gateway a gravar o zero — `persist_robot` passou a recusar
+        # rebaixamento sem ela. Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F1.
+        self.assertEqual(main.get_session_score_authority(self.user_id), (0, 0, 0.0))
         self.assertEqual(self.score(), (0, 0, 0.0))
+
+    async def test_reset_score_authority_does_not_block_next_real_result(self) -> None:
+        """A marca do reset não pode travar o placar: o WIN seguinte sobe."""
+        self.set_score(5, 3, 25.0)
+        with (
+            patch.object(main, "persist_robot", return_value=None),
+            patch.object(main, "is_manual_disconnect", return_value=False),
+            patch.object(main, "get_cached_account_snapshot", return_value={}),
+            patch.object(main.robot_state_ws_hub, "has_connections", return_value=False),
+            patch.object(main, "robot_runtime_mode", return_value="embedded"),
+        ):
+            await main.robot_reset_score({"user_id": self.user_id})
+        self.assertEqual(self.score(), (0, 0, 0.0))
+        # `finish_monitored_trade` limpa a marca ao contabilizar resultado real.
+        main.clear_session_score_authority(self.user_id)
+        self.set_score(1, 0, 8.7)
+        main.reconcile_session_score_on_gateway(self.user_id)
+        self.assertEqual(self.score(), (1, 0, 8.7))
 
     async def test_reconcile_still_promotes_when_no_deletion_happened(self) -> None:
         """Sem baixa vigente o comportamento antigo continua: nunca rebaixa."""
@@ -526,7 +548,9 @@ class RuntimeCrossProcessTests(ScoreAuthorityTestCase):
                 main,
                 {"user_id": self.user_id, "action": "reset_score"},
             )
-        self.assertIsNone(main.get_session_score_authority(self.user_id))
+        # Contrato novo: o runtime também MARCA 0-0 — a marca substitui a da
+        # exclusão anterior e autoriza a gravação do zero nos dois processos.
+        self.assertEqual(main.get_session_score_authority(self.user_id), (0, 0, 0.0))
 
 
 class GatewayRuntimeSimulationTests(ScoreAuthorityTestCase):

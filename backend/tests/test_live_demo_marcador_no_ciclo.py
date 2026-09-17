@@ -20,6 +20,7 @@ o que a auditoria de 03/09 teve que desfazer.
 from __future__ import annotations
 
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 
 from backend import main
@@ -297,6 +298,85 @@ class ValidacaoPreCompraTests(unittest.TestCase):
             user_id=None,
         )
         self.assertEqual(motivo, "STOP_WIN_HIT")
+
+
+class EspacamentoNoPortaoDoCicloTest(unittest.TestCase):
+    """O piso de ritmo barra no portão do ciclo, para TODO tipo de candidato.
+
+    Decisão do dono em 15/09/2026, depois que a remoção dos freios de nível e
+    pavio deixou o modo entrar praticamente a cada vela em M1: "não é
+    praticamente toda vela... no máximo a cada 5 minutos, não a cada 1".
+
+    O escopo escolhido foi "todas as entradas com o LIVE ligado" — inclusive as
+    aprovadas pela estratégia normal, porque quem manda no ritmo da transmissão
+    é o relógio, não o setup.
+    """
+
+    def _state(self, *, live_demo: bool, ultima_entrada):
+        return SimpleNamespace(
+            min_confidence=80,
+            min_payout=80,
+            timeframe="M1",
+            strategy_mode="conservative",
+            live_demo=live_demo,
+            last_entry_at=ultima_entrada,
+        )
+
+    def _candidato_do_live(self) -> dict:
+        liberado = apply_live_demo(sinal_barrado(), "EURGBP-OTC", live_enabled=True)
+        return monta_candidato_do_ciclo(liberado, "EURGBP-OTC")
+
+    def test_dentro_do_piso_o_portao_barra(self) -> None:
+        agora = main.utc_now()
+        state = self._state(
+            live_demo=True, ultima_entrada=agora - timedelta(seconds=60)
+        )
+        self.assertFalse(
+            main.candidate_meets_cycle_threshold(
+                self._candidato_do_live(),
+                state,
+                minimum_confidence=LIVE_CONFIDENCE,
+                user_id=None,
+            )
+        )
+
+    def test_passado_o_piso_o_portao_libera(self) -> None:
+        agora = main.utc_now()
+        state = self._state(
+            live_demo=True, ultima_entrada=agora - timedelta(seconds=200)
+        )
+        self.assertTrue(
+            main.candidate_meets_cycle_threshold(
+                self._candidato_do_live(),
+                state,
+                minimum_confidence=LIVE_CONFIDENCE,
+                user_id=None,
+            )
+        )
+
+    def test_com_o_modo_desligado_o_piso_nao_existe(self) -> None:
+        """Cliente pagante não herda o ritmo da transmissão."""
+        agora = main.utc_now()
+        state = self._state(
+            live_demo=False, ultima_entrada=agora - timedelta(seconds=10)
+        )
+        candidato = self._candidato_do_live()
+        self.assertTrue(
+            main.candidate_meets_cycle_threshold(
+                candidato, state, minimum_confidence=LIVE_CONFIDENCE, user_id=None
+            )
+        )
+
+    def test_primeira_entrada_da_sessao_nao_espera(self) -> None:
+        state = self._state(live_demo=True, ultima_entrada=None)
+        self.assertTrue(
+            main.candidate_meets_cycle_threshold(
+                self._candidato_do_live(),
+                state,
+                minimum_confidence=LIVE_CONFIDENCE,
+                user_id=None,
+            )
+        )
 
 
 if __name__ == "__main__":

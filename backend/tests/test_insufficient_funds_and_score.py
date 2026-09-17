@@ -187,7 +187,14 @@ class PersistedScoreRehydrateTests(unittest.TestCase):
         self.assertEqual(state.losses, 1)
 
     def test_intentional_reset_score_skips_rehydrate(self) -> None:
-        """Após Reiniciar placar, não reidratar wins/losses antigos da DB."""
+        """Após Reiniciar placar, não reidratar wins/losses antigos da DB.
+
+        Quem segura é a MARCA de baixa intencional que o ``/robot/reset-score``
+        grava, não mais o ``stop_reset_at`` sozinho: esse par (reset + placar em
+        branco) congelava a memória do gateway para sempre e fazia toda
+        gravação dele apagar o placar real.
+        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F1.
+        """
         from backend.auto_trader import utc_now
 
         user_id = "user-score-after-reset"
@@ -196,6 +203,7 @@ class PersistedScoreRehydrateTests(unittest.TestCase):
         state.losses = 0
         state.profit = 0.0
         state.stop_reset_at = utc_now()
+        main.mark_session_score_authority(user_id, 0, 0, 0.0)
 
         class FakePersistence:
             def load_state(self, uid: str):
@@ -207,11 +215,39 @@ class PersistedScoreRehydrateTests(unittest.TestCase):
             changed = main.rehydrate_score_from_persistence_if_blank(user_id)
         finally:
             main.robot_persistence = old
+            main.clear_session_score_authority(user_id)
 
         self.assertFalse(changed)
         self.assertEqual(state.wins, 0)
         self.assertEqual(state.losses, 0)
         self.assertEqual(state.profit, 0.0)
+
+    def test_score_returns_after_reset_mark_expires(self) -> None:
+        """Com a marca vencida, o placar do dia volta a ser reidratado.
+
+        É o outro lado da moeda: sem isto, quem usou "Reiniciar placar" uma vez
+        ficava sem placar na tela pelo resto do dia.
+        """
+        user_id = "user-score-after-reset-expirada"
+        state = main.auto_trader.get(user_id)
+        state.wins = 0
+        state.losses = 0
+        state.profit = 0.0
+        state.stop_reset_at = None
+
+        class FakePersistence:
+            def load_state(self, uid: str):
+                return {"wins": 3, "losses": 1, "profit": 16.1}
+
+        old = main.robot_persistence
+        main.robot_persistence = FakePersistence()
+        try:
+            changed = main.rehydrate_score_from_persistence_if_blank(user_id)
+        finally:
+            main.robot_persistence = old
+
+        self.assertTrue(changed)
+        self.assertEqual((state.wins, state.losses, state.profit), (3, 1, 16.1))
 
 
 if __name__ == "__main__":
