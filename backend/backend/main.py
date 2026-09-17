@@ -34,7 +34,7 @@ from backend.auto_trader import (
     strip_ai_fields,
     utc_now,
 )
-from backend.brasilia_time import history_cutoff, is_brasilia_today
+from backend.brasilia_time import brasilia_today, history_cutoff, is_brasilia_today
 from backend.status import (
     STATUS_ACCOUNT_DISCONNECTED,
     STATUS_ACTIVE_COOLDOWN,
@@ -91,10 +91,16 @@ from backend.reversion_strategy import (
 )
 from backend.live_demo_mode import (
     LIVE_CONFIDENCE,
+    LIVE_MAX_EXPIRATION_MINUTES,
+    LIVE_MAX_SECONDS_BETWEEN_ENTRIES,
+    LIVE_MIN_SECONDS_BETWEEN_ENTRIES,
     LIVE_NON_WAIVABLE,
     is_live_demo,
+    live_cadencia_estourada,
+    live_espera_espacamento,
     live_demo_passa_portao,
     live_demo_restaura,
+    live_expiration_minutes,
     live_min_confidence,
 )
 from backend.support_resistance_strategy import SR_CONFIDENCE_MAX
@@ -2569,6 +2575,31 @@ def seconds_until_next_candle_after_trade(state: Any) -> float | None:
     if seconds_since_finish >= remaining + 0.5:
         return None
     return max(0.5, remaining)
+
+
+def post_trade_analysis_wait(state: Any) -> float | None:
+    """Quanto dormir depois de um resultado, antes de analisar de novo.
+
+    O sono existe para não repetir análise pesada no resto da vela em que a
+    operação fechou. Ele NÃO pode valer quando já existe sinal escolhido
+    esperando para ser enviado: o envio acontece na abertura da vela (janela
+    0-3s) e ``seconds_until_next_candle_after_trade`` volta a ~60s exatamente
+    na virada, fazendo o laço dormir 5s por cima da janela.
+
+    Era assim que todo gale morria: ``GALE_TRIGGERED`` → sono de 5s na virada
+    → acorda no segundo ~5 → ``ENTRY_WINDOW_MISSED`` → ``SIGNAL_EXPIRED``.
+    Em 7 dias de produção foram 38 gales disparados e nenhuma ordem enviada.
+
+    Args:
+        state: Estado do robô do cliente.
+
+    Returns:
+        Segundos até a próxima vela, ou None quando o ciclo tem que rodar
+        agora (sinal/gale pendente, ou nada a esperar).
+    """
+    if getattr(state, "gale_pending", False) or getattr(state, "pending_signal", None):
+        return None
+    return seconds_until_next_candle_after_trade(state)
 
 
 def normalize_allowed_assets_list(payload: Any) -> list[dict[str, Any]]:
@@ -6427,6 +6458,12 @@ def build_guarded_connection_payload(reason: str) -> dict[str, Any]:
 
 
 TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800}
+# Volta de minutos para o rótulo do timeframe. Derivado de `TIMEFRAME_SECONDS`
+# de propósito: uma segunda tabela escrita à mão é exatamente o tipo de lista
+# fixa que já descartou campo novo neste código.
+TIMEFRAME_BY_MINUTES = {
+    seconds // 60: name for name, seconds in TIMEFRAME_SECONDS.items()
+}
 # Janela de compra no início da vela. A auditoria de 2026-08-30 mediu que só
 # 33,6% das ordens caíam em 0–8s: metade saía entre 9 e 20s porque o relógio
 # do robô atrasava (ver `refresh_entry_window`) e porque nada revalidava o
@@ -7866,6 +7903,9 @@ def robot_stop_reason(state: Any) -> str | None:
 
 
 async def pause_robot_by_stop(user_id: str, reason: str) -> Any:
+    # O stop encerra o ciclo: um gale disparado aqui nunca mais entra, então a
+    # perna perdida tem de contar antes de pausar.
+    close_abandoned_gale_cycle(user_id)
     state = auto_trader.pause_by_stop(user_id, reason)
     if reason == STATUS_STOP_WIN_HIT:
         logger.warning("[STOP_WIN_HIT] user_id=%s profit=%s", user_id, state.profit)
@@ -8498,11 +8538,13 @@ def reconcile_session_score_on_gateway(user_id: str) -> bool:
             "profit": getattr(state, "profit", 0),
         }
     )
-    if getattr(state, "stop_reset_at", None) is not None and _session_score_total(
-        local[0], local[1]
-    ) == 0 and abs(local[2]) < 1e-9:
-        return False
-
+    # NÃO voltar a barrar por ``stop_reset_at`` + placar em branco: esse par
+    # congelava a memória do gateway PARA SEMPRE depois de um "Reiniciar
+    # placar" (o reconcile parava de promover e toda gravação dele apagava o
+    # placar real — 71% dos clientes já usaram o botão). A janela do reset é
+    # coberta pela marca de baixa intencional lida logo acima, que o próprio
+    # ``/robot/reset-score`` grava e o primeiro resultado real limpa.
+    # Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F1.
     candidates: list[tuple[int, int, float]] = [local]
     redis_score = _load_redis_session_score(normalized)
     if redis_score is not None:
@@ -9439,16 +9481,23 @@ def rehydrate_score_from_persistence_if_blank(user_id: str) -> bool:
     Returns:
         True se o placar em memória foi preenchido a partir da persistência.
     """
+    if robot_runtime_mode() == "worker":
+        # O `robot-runtime` é o DONO do placar: a memória viva dele já foi
+        # recalculada pelo histórico do dia no `restore`. Reidratar da DB aqui
+        # ressuscitava o placar de ONTEM logo depois da virada do dia, e era
+        # também o caminho pelo qual o placar de uma sessão nova nascia com o
+        # número da sessão anterior.
+        return False
     state = auto_trader.get(user_id)
     live_wins = int(getattr(state, "wins", 0) or 0)
     live_losses = int(getattr(state, "losses", 0) or 0)
     live_profit = float(getattr(state, "profit", 0) or 0)
     if live_wins or live_losses or abs(live_profit) > 1e-9:
         return False
-    # ``reset_score`` zera de propósito e marca ``stop_reset_at``. Não
-    # reidratar o placar antigo da DB (persistência ainda assíncrona).
-    if getattr(state, "stop_reset_at", None) is not None:
-        return False
+    # ``stop_reset_at`` sozinho NÃO barra mais a reidratação: com ele o placar
+    # do dia nunca voltava para quem já tinha usado "Reiniciar placar" uma vez,
+    # mesmo horas depois. Quem cobre a janela do reset é a marca abaixo, que o
+    # ``/robot/reset-score`` grava com TTL curto.
     # Excluir a última operação deixa 0-0 de propósito: sem este guard a DB
     # (gravada em background, ainda com a linha antiga) reidratava o placar.
     authority = get_session_score_authority(user_id)
@@ -9904,6 +9953,17 @@ async def revalidate_level_before_entry(
         ``"SR_ZONE_SEM_VERIFICACAO"`` quando não deu para verificar e
         ``SR_ENTRY_RECHECK_FAIL_CLOSED`` está ligado.
     """
+    if is_live_demo(candidate):
+        # Modo LIVE dispensa nível e pavio também NO DISPARO (15/09/2026, a
+        # pedido do dono). Sem este desvio a reconferência refaz, por conta
+        # própria e a partir de velas novas, exatamente o veto que
+        # `apply_live_demo` acabou de dispensar — é a mesma armadilha de "dois
+        # portões" que já pegou três vezes neste código (REV-Z, piso de
+        # confiança, portão do ciclo). Medido em 15/09 na conta 11e0b3d5: das
+        # 3 liberações do modo, 1 morreu aqui com `PAVIO_NA_ENTRADA` e virou
+        # "sem oportunidade" em silêncio.
+        candidate["sr_entry_recheck_reason"] = "LIVE_DEMO_DISPENSA_NIVEL_E_PAVIO"
+        return None
     if not SR_ENTRY_RECHECK or not SR_ZONE_HARD_BLOCK:
         return None
     direction = str(candidate.get("direction") or candidate.get("signal") or "").strip().upper()
@@ -10532,6 +10592,97 @@ def _get_robot_persist_lock(user_id: str) -> threading.Lock:
         return lock
 
 
+def _protect_session_score_on_persist(
+    user_id: str,
+    payload: dict[str, Any],
+    last_trade: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """
+    Impede o gateway de gravar um placar que não é o dele.
+
+    Em ``ROBOT_RUNTIME_MODE=external`` quem conta WIN/LOSS é o
+    ``robot-runtime``; o gateway só alcança o placar quando um caminho de
+    LEITURA roda o reconcile. Entre uma leitura e outra ele fica para trás — e
+    qualquer ``persist_robot`` dele (parar, salvar configuração, sincronizar
+    conexão e até o próprio ``GET /robot/state``) gravava esse atraso por cima
+    do placar real em ``robot_states``. O painel seguia certo até o snapshot
+    Redis expirar (600s); depois caía no banco zerado e o placar sumia — só
+    voltava no "Iniciar Operação" seguinte, que recalcula pelo histórico do dia.
+    Medido em 15/09/2026: 3 de 22 clientes ativos com o placar apagado.
+
+    Regra: o gateway nunca REBAIXA o placar persistido. A única baixa legítima
+    tem marca de baixa intencional (``score_authority``) — "Reiniciar placar",
+    "Reiniciar ciclo" e exclusão no Shift+O — e essa passa direto.
+
+    Só consulta Redis (rápido, rede local). **Não** ler Supabase aqui: este
+    caminho roda em ~50 lugares e um HTTPS síncrono trava o event loop (o mesmo
+    defeito que atrasava a entrada na vela em 10/09).
+
+    Args:
+        user_id: Dono da sessão.
+        payload: Estado serializado que iria para ``robot_states``.
+        last_trade: Última operação que iria para ``robot_trades``.
+
+    Returns:
+        ``(payload, last_trade)`` — iguais aos recebidos, ou com o placar e a
+        última operação preservados do snapshot vivo.
+    """
+    if robot_runtime_mode() != "external":
+        return payload, last_trade
+    if not isinstance(payload, dict):
+        return payload, last_trade
+    if get_session_score_authority(user_id) is not None:
+        # Baixa intencional vigente: o valor baixo é o certo.
+        return payload, last_trade
+    try:
+        remote = robot_bus.get_snapshot(user_id)
+    except Exception:
+        logger.warning(
+            "[SCORE_PERSIST_SNAPSHOT_READ_FAILED] user_id=%s",
+            user_id,
+            exc_info=True,
+        )
+        return payload, last_trade
+    if not isinstance(remote, dict) or not isinstance(remote.get("data"), dict):
+        return payload, last_trade
+    live_data = remote["data"]
+    local = _parse_session_score_from_mapping(payload)
+    live = _parse_session_score_from_mapping(live_data)
+    preferred = _pick_preferred_session_score(local, live)
+    patched_last_trade = last_trade
+    if not last_trade and isinstance(live_data.get("last_trade"), dict):
+        patched_last_trade = live_data["last_trade"]
+    if preferred == local and patched_last_trade is last_trade:
+        return payload, last_trade
+    patched = dict(payload)
+    if preferred != local:
+        patched["wins"], patched["losses"], patched["profit"] = preferred
+        # O placar de vitrine (Shift+O) anda junto: sem os offsets o stop
+        # passaria a contar linha sintética como dinheiro real.
+        for field in ("stop_offset_wins", "stop_offset_losses", "stop_offset_profit"):
+            if field in live_data:
+                patched[field] = live_data[field]
+        logger.warning(
+            "[SCORE_PERSIST_DOWNGRADE_BLOCKED] user_id=%s gateway=%sx%s/%s "
+            "vivo=%sx%s/%s",
+            user_id,
+            local[0],
+            local[1],
+            local[2],
+            preferred[0],
+            preferred[1],
+            preferred[2],
+        )
+    if patched_last_trade is not last_trade:
+        patched["last_trade"] = patched_last_trade
+        logger.warning(
+            "[LAST_TRADE_PERSIST_ERASE_BLOCKED] user_id=%s order_id=%s",
+            user_id,
+            (patched_last_trade or {}).get("order_id"),
+        )
+    return patched, patched_last_trade
+
+
 def persist_robot(user_id: str) -> Future | None:
     """
     Agenda a persistência do robô em background (ver nota acima).
@@ -10558,6 +10709,11 @@ def persist_robot(user_id: str) -> Future | None:
             }
         )
         last_trade = state.last_trade
+        # Em modo external o placar não é do gateway: nunca gravar o atraso
+        # dele por cima do placar vivo (ver docs/PLACAR_DIAGNOSTICO_2026-09-15).
+        state_payload, last_trade = _protect_session_score_on_persist(
+            user_id, state_payload, last_trade
+        )
         robot_state_hydrated_users.add(user_id)
         restorable_robot_states[user_id] = deepcopy(state_payload)
         if robot_state_ws_hub.has_connections(user_id):
@@ -11557,6 +11713,24 @@ def candidate_meets_cycle_threshold(
         return False
     if str(candidate.get("direction") or candidate.get("signal") or "").upper() not in {"CALL", "PUT"}:
         return False
+    # Ritmo da transmissão (15/09/2026). Com o modo LIVE ligado nenhuma entrada
+    # sai antes do piso — nem a aprovada pela estratégia normal. Fica ANTES de
+    # tudo de propósito: tirados os freios de nível e pavio, sobra candidato em
+    # 100% dos ciclos e sem este piso o robô entrava a cada vela em M1, que é
+    # o oposto do que o dono pediu ("no máximo a cada 5 min, não a cada 1").
+    # O gale não chega aqui: `resolve_entry_validation_reason` só roda com
+    # `not is_gale_order`.
+    if getattr(state, "live_demo", False) and live_espera_espacamento(
+        getattr(state, "last_entry_at", None), utc_now()
+    ):
+        logger.info(
+            "[LIVE_DEMO_ESPACAMENTO] user_id=%s symbol=%s ultima_entrada=%s piso_segundos=%s",
+            user_id,
+            candidate.get("symbol") or candidate.get("active"),
+            getattr(state, "last_entry_at", None),
+            LIVE_MIN_SECONDS_BETWEEN_ENTRIES,
+        )
+        return False
     if candidate_pre_order_block_reason(candidate) is not None:
         return False
     # Dados de candles/payout vindos de cache stale não podem abrir ordem —
@@ -11582,17 +11756,33 @@ def candidate_meets_cycle_threshold(
     # minutos para pegar operacao". Os portoes de execucao (ativo fechado,
     # stale, trade_allowed) ja rodaram acima e continuam valendo.
     if is_live_demo(candidate):
+        # Teto de tempo sem entrar (15/09/2026): estourado, o portão também
+        # dispensa o payout mínimo do painel. Ver `live_cadencia_estourada`.
+        estourou = live_cadencia_estourada(
+            getattr(state, "last_entry_at", None), utc_now()
+        )
+        if estourou:
+            logger.warning(
+                "[LIVE_DEMO_CADENCIA_ESTOURADA] user_id=%s symbol=%s "
+                "ultima_entrada=%s teto_segundos=%s",
+                user_id,
+                candidate.get("symbol") or candidate.get("active"),
+                getattr(state, "last_entry_at", None),
+                LIVE_MAX_SECONDS_BETWEEN_ENTRIES,
+            )
         liberado, motivo = live_demo_passa_portao(
             candidate,
             min_payout=float(getattr(state, "min_payout", 0) or 0),
             minimo_confianca=int(minimum_confidence),
+            cadencia_estourada=estourou,
         )
         if not liberado:
             logger.info(
-                "[LIVE_DEMO_GATE_BLOCK] user_id=%s symbol=%s motivo=%s",
+                "[LIVE_DEMO_GATE_BLOCK] user_id=%s symbol=%s motivo=%s cadencia_estourada=%s",
                 user_id,
                 candidate.get("symbol") or candidate.get("active"),
                 motivo,
+                estourou,
             )
         return liberado
     # Preço no nível: mesmo desenho do desvio acima, pelo mesmo motivo. Os
@@ -12340,8 +12530,112 @@ def _timeout_reconcile_clear(user_id: str, order_id: str) -> None:
     _timeout_reconcile_backoff.pop((user_id, order_id), None)
 
 
+# Último dia civil de Brasília em que cada usuário foi visto operando. Só
+# memória: no boot o `restore` já recalcula o placar pelo dia corrente.
+_ultimo_dia_do_placar: dict[str, Any] = {}
+
+
+def reset_session_score_on_new_day(user_id: str) -> bool:
+    """Acerta o placar da sessão quando o dia de Brasília vira.
+
+    Nada zerava o placar em memória à meia-noite, mas o recálculo do
+    ``restore`` só conta o dia corrente: com o robô rodando madrugada adentro o
+    placar somava dois dias e caía sozinho no primeiro restart. Roda no
+    ``robot-runtime``, que é o dono do placar.
+    Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F2.
+
+    Args:
+        user_id: Dono da sessão.
+
+    Returns:
+        True se o dia virou e o placar foi recalculado.
+    """
+    hoje = brasilia_today()
+    anterior = _ultimo_dia_do_placar.get(user_id)
+    _ultimo_dia_do_placar[user_id] = hoje
+    if anterior is None or anterior == hoje:
+        return False
+    state = auto_trader.get(user_id)
+    antes = (
+        int(state.wins or 0),
+        int(state.losses or 0),
+        round(float(state.profit or 0), 2),
+    )
+    depois = auto_trader.recompute_session_score_for_today(user_id)
+    # Virar o dia é baixa INTENCIONAL: sem a marca, qualquer reconcile
+    # promoveria de volta o placar de ontem que ainda está na DB/Redis.
+    mark_session_score_authority(user_id, depois[0], depois[1], depois[2])
+    logger.warning(
+        "[SCORE_NEW_DAY_RECOMPUTED] user_id=%s dia_anterior=%s dia=%s "
+        "antes=%sx%s/%s depois=%sx%s/%s",
+        user_id,
+        anterior,
+        hoje,
+        antes[0],
+        antes[1],
+        antes[2],
+        depois[0],
+        depois[1],
+        depois[2],
+    )
+    if antes != depois:
+        persist_robot(user_id)
+        try:
+            if robot_runtime_mode() == "worker":
+                robot_bus.publish_snapshot(
+                    user_id, build_robot_state_snapshot_payload(user_id)
+                )
+        except Exception:
+            logger.warning(
+                "[SCORE_NEW_DAY_PUBLISH_FAILED] user_id=%s", user_id, exc_info=True
+            )
+    return True
+
+
+def close_abandoned_gale_cycle(user_id: str) -> bool:
+    """Contabiliza o LOSS de um gale que foi disparado e nunca entrou.
+
+    Chamado ao reciclar o ciclo, ao pausar por stop e ao parar o robô — os três
+    caminhos em que a etapa seguinte deixa de existir. Sem isto o LOSS ficava
+    só no Histórico e o placar do cliente nunca o via
+    (docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F3).
+
+    Args:
+        user_id: Dono da sessão.
+
+    Returns:
+        True se havia gale abandonado e ele foi contabilizado.
+    """
+    trade = auto_trader.close_abandoned_gale(user_id)
+    if not trade:
+        return False
+    try:
+        robot_persistence.save_trade_history(user_id, trade)
+        invalidate_daily_history_cache(user_id)
+        robot_persistence.save_trade(user_id, trade)
+    except Exception:
+        logger.exception(
+            "[GALE_ABANDONED_HISTORY_ERROR] user_id=%s order_id=%s",
+            user_id,
+            trade.get("order_id"),
+        )
+    state = auto_trader.get(user_id)
+    logger.info(
+        "[SCORE_UPDATED] user_id=%s wins=%s losses=%s profit=%s cycle_result=LOSS",
+        user_id,
+        state.wins,
+        state.losses,
+        state.profit,
+    )
+    persist_robot(user_id)
+    return True
+
+
 def reset_cycle_after_finish(user_id: str) -> Any:
     logger.info("[CYCLE_RESET_STARTED] user_id=%s", user_id)
+    # Gale disparado cuja etapa nunca saiu: fecha o ciclo contando o LOSS antes
+    # de reciclar, senão a perna perdida some do placar para sempre.
+    close_abandoned_gale_cycle(user_id)
     state = auto_trader.reset_cycle_after_result(user_id)
     logger.info(
         "[CYCLE_RESET_DONE] user_id=%s cycle_id=%s next_cycle_at=%s",
@@ -12455,6 +12749,76 @@ async def reconcile_timeout_last_trade(user_id: str) -> bool:
     return True
 
 
+def salvar_resultado_atrasado(
+    user_id: str,
+    order_id: str,
+    result: str,
+    profit: float,
+) -> bool:
+    """Contabiliza e grava um resultado que chegou depois do ciclo virar.
+
+    O ciclo é reciclado por ``waiting_result_stale`` e uma ordem nova abre antes
+    de o resultado da anterior chegar; ``finish_trade`` recusava por ``order_id``
+    diferente e a operação sumia do placar e do Histórico sem log nenhum.
+    O espelho em ``robot_trades`` guarda a ordem como foi enviada, e é dele que
+    sai a operação para fechar. Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F5.
+
+    Args:
+        user_id: Dono da sessão.
+        order_id: Ordem cujo resultado chegou atrasado.
+        result: WIN, LOSS ou DRAW.
+        profit: Lucro informado pela corretora.
+
+    Returns:
+        True se a operação foi contabilizada e gravada.
+    """
+    normalizado = str(order_id or "").strip()
+    if not normalizado:
+        return False
+    try:
+        espelhos = robot_persistence.load_trades(user_id) or []
+    except Exception:
+        logger.warning(
+            "[LATE_RESULT_LOAD_FAILED] user_id=%s order_id=%s",
+            user_id,
+            normalizado,
+            exc_info=True,
+        )
+        return False
+    origem = next(
+        (
+            item
+            for item in espelhos
+            if str((item or {}).get("order_id") or "").strip() == normalizado
+        ),
+        None,
+    )
+    if not origem:
+        logger.warning(
+            "[LATE_RESULT_WITHOUT_MIRROR] user_id=%s order_id=%s",
+            user_id,
+            normalizado,
+        )
+        return False
+    if str(origem.get("result") or "").strip().upper() in {"WIN", "LOSS", "DRAW"}:
+        return False
+    fechado = auto_trader.count_late_result(user_id, origem, result, profit)
+    if not fechado:
+        return False
+    try:
+        robot_persistence.save_trade_history(user_id, fechado)
+        invalidate_daily_history_cache(user_id)
+        robot_persistence.save_trade(user_id, fechado)
+    except Exception:
+        logger.exception(
+            "[LATE_RESULT_HISTORY_ERROR] user_id=%s order_id=%s",
+            user_id,
+            normalizado,
+        )
+    persist_robot(user_id)
+    return True
+
+
 async def finish_monitored_trade(user_id: str, order_id: str, result: str, profit: float) -> None:
     should_pause_worker = False
     result, profit = await apply_marketing_result_override(user_id, result, profit)
@@ -12479,6 +12843,18 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
                 else:
                     state.unseen_result = False
                     state.result_client_seen_at = None
+        if not finalized and not state.gale_pending:
+            # Resultado de ordem que não é mais a do ciclo: contabiliza fora do
+            # ciclo em vez de descartar em silêncio.
+            try:
+                salvar_resultado_atrasado(user_id, order_id, result, profit)
+            except Exception:
+                logger.warning(
+                    "[LATE_RESULT_FAILED] user_id=%s order_id=%s",
+                    user_id,
+                    order_id,
+                    exc_info=True,
+                )
         if not finalized and state.gale_pending:
             logger.info(
                 "[TRADE_RESULT] user_id=%s order_id=%s result=LOSS profit=%s",
@@ -12541,8 +12917,9 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
         if finalized and state.last_trade:
             cycle_profit = float(state.last_trade.get("profit") or 0)
             if state.last_trade.get("is_gale"):
+                # Sequência inteira (entrada + todas as etapas), não só a anterior.
                 cycle_profit = round(
-                    float((state.gale_parent_trade or {}).get("profit") or 0) + cycle_profit,
+                    float(getattr(state, "gale_chain_profit", 0) or 0) + cycle_profit,
                     2,
                 )
             logger.info(
@@ -13709,11 +14086,32 @@ async def execute_robot_cycle(
                     order_amount,
                     payout,
                 )
+                # Duração da ordem. No modo LIVE vale o teto de
+                # `LIVE_MAX_EXPIRATION_MINUTES` (15/09/2026, a pedido do dono):
+                # a entrada da transmissão é curta. Só a ORDEM encurta — o
+                # timeframe da análise continua o da conta, porque velas,
+                # cache e janela de entrada derivam todos de `state.timeframe`.
+                entry_expiration_minutes = live_expiration_minutes(
+                    entry_window["expiration_minutes"], selected
+                )
+                entry_expiration_timeframe = TIMEFRAME_BY_MINUTES.get(
+                    entry_expiration_minutes, state.timeframe
+                )
+                if entry_expiration_minutes != entry_window["expiration_minutes"]:
+                    logger.info(
+                        "[LIVE_DEMO_EXPIRATION_CAP] user_id=%s symbol=%s "
+                        "timeframe=%s expiracao_minutos=%s teto=%s",
+                        user_id,
+                        symbol,
+                        state.timeframe,
+                        entry_expiration_minutes,
+                        LIVE_MAX_EXPIRATION_MINUTES,
+                    )
                 order_body = {
                     "active": symbol,
                     "action": direction.lower(),
                     "amount": order_amount,
-                    "expiration": entry_window["expiration_minutes"],
+                    "expiration": entry_expiration_minutes,
                 }
                 if state.account_mode == "REAL":
                     order_body["confirm_real"] = True
@@ -13740,7 +14138,7 @@ async def execute_robot_cycle(
                         symbol,
                         direction,
                         order_amount,
-                        entry_window["expiration_minutes"],
+                        entry_expiration_minutes,
                     )
 
                 logger.info(
@@ -13792,7 +14190,7 @@ async def execute_robot_cycle(
                     symbol,
                     direction,
                     order_amount,
-                    entry_window["expiration_minutes"],
+                    entry_expiration_minutes,
                     state.order_attempts,
                     is_gale_order,
                 )
@@ -13809,7 +14207,7 @@ async def execute_robot_cycle(
                         order_path,
                         order_body,
                         symbol=symbol,
-                        duration_minutes=entry_window["expiration_minutes"],
+                        duration_minutes=entry_expiration_minutes,
                     )
                 except Exception as exc:
                     reason = str(exc).strip() or type(exc).__name__
@@ -13986,7 +14384,7 @@ async def execute_robot_cycle(
                         str(exc).strip() or type(exc).__name__,
                     )
                 expected_expire_at, expiration_source = calculate_expected_expire_at(
-                    state.timeframe,
+                    entry_expiration_timeframe,
                     order_data,
                     expiration_window,
                     sent_at,
@@ -14007,7 +14405,7 @@ async def execute_robot_cycle(
                     "amount": order_amount,
                     "confidence": selected["confidence"],
                     "payout": payout,
-                    "expiration": state.timeframe,
+                    "expiration": entry_expiration_timeframe,
                     "timeframe": state.timeframe,
                     "result": STATUS_PENDING_RESULT,
                     "sent_at": sent_at.isoformat(),
@@ -14045,6 +14443,11 @@ async def execute_robot_cycle(
                     # `None` para operacao normal preserva as linhas de hoje:
                     # so a entrada de demonstracao ganha a marca.
                     "live_demo": True if selected.get("live_demo") is True else None,
+                    # Modo Estudo: só marca entrada do LIVE feita com a chave
+                    # ligada. `None` no resto preserva as linhas de hoje.
+                    "study_mode": True
+                    if (getattr(state, "study_mode", False) and selected.get("live_demo") is True)
+                    else None,
                     # z da indicação e do fechamento: é com isto que a REV-Z vai
                     # ser medida para a frente. `None` fora do mercado aberto.
                     "revz": dict(selected["revz"]) if isinstance(selected.get("revz"), dict) else None,
@@ -14269,6 +14672,24 @@ async def execute_robot_worker_cycle(user_id: str) -> None:
     Raises:
         asyncio.CancelledError: Propagado quando o worker é interrompido externamente.
     """
+    # Virada do dia de Brasília: o placar da sessão passa a contar só o dia novo.
+    try:
+        reset_session_score_on_new_day(user_id)
+    except Exception:
+        logger.warning("[SCORE_NEW_DAY_FAILED] user_id=%s", user_id, exc_info=True)
+    # TIMEOUT falso é reconciliado AQUI, no processo dono do placar. Em
+    # `ROBOT_RUNTIME_MODE=external` o gateway lê um `last_trade` que não é o
+    # vivo, então a reconciliação dele quase nunca tinha o que corrigir
+    # (docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F7). O backoff de
+    # `_timeout_reconcile_*` limita as tentativas por ordem.
+    try:
+        await reconcile_timeout_last_trade(user_id)
+    except Exception as exc:
+        logger.warning(
+            "[TIMEOUT_RECONCILE_SKIPPED] user_id=%s error=%s phase=worker",
+            user_id,
+            exc.__class__.__name__,
+        )
     try:
         await asyncio.wait_for(
             execute_robot_cycle(user_id),
@@ -14381,7 +14802,7 @@ async def robot_worker(user_id: str) -> None:
                 logger.info("[CPU_GUARD_SLEEP] user_id=%s seconds=0.50", user_id)
                 await asyncio.sleep(0.5)
                 continue
-            post_trade_wait = seconds_until_next_candle_after_trade(state)
+            post_trade_wait = post_trade_analysis_wait(state)
             if post_trade_wait is not None:
                 sleep_seconds = max(0.5, min(post_trade_wait, 5.0))
                 logger.info(
@@ -14928,9 +15349,11 @@ async def _robot_state_impl(auth: dict[str, str]) -> JSONResponse:
     # persistence latency. Startup restoration populates auto_trader; a missing
     # entry is represented by its in-memory default state.
     auto_trader.get(user_id)
-    # Corrige TIMEOUT falso da última ordem (Bullex já tem WIN/LOSS).
+    # Corrige TIMEOUT falso da última ordem (Bullex já tem WIN/LOSS). Em modo
+    # external quem faz isso é o `robot-runtime`, dono do `last_trade` vivo.
     try:
-        await reconcile_timeout_last_trade(user_id)
+        if robot_runtime_mode() != "external":
+            await reconcile_timeout_last_trade(user_id)
     except Exception as exc:
         logger.warning(
             "[TIMEOUT_RECONCILE_SKIPPED] user_id=%s error=%s",
@@ -15180,7 +15603,8 @@ async def robot_panel_maintenance(user_id: str) -> None:
     mark_panel_heartbeat(user_id)
     mark_user_active(user_id)
     try:
-        await reconcile_timeout_last_trade(user_id)
+        if robot_runtime_mode() != "external":
+            await reconcile_timeout_last_trade(user_id)
     except Exception as exc:
         logger.warning(
             "[TIMEOUT_RECONCILE_SKIPPED] user_id=%s error=%s",
@@ -15739,7 +16163,10 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
     clear_session_backoff(user_id)
     logger.info("[ROBOT_START_REQUEST] user_id=%s", user_id)
     try:
-        await reconcile_timeout_last_trade(user_id)
+        # Em external o dono do `last_trade` vivo é o runtime: ele reconcilia no
+        # primeiro ciclo depois do start.
+        if robot_runtime_mode() != "external":
+            await reconcile_timeout_last_trade(user_id)
     except Exception as exc:
         logger.warning(
             "[TIMEOUT_RECONCILE_SKIPPED] user_id=%s error=%s phase=start",
@@ -15765,7 +16192,9 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
     if stop_blocks and is_marketing_simulation_session(auth):
         previous_status = state.status
         state = auto_trader.reset_score(user_id)
-        clear_session_score_authority(user_id)
+        # Zerar aqui é intencional (destrava o start da conta marketing): sem a
+        # marca o `persist_robot` recusaria gravar o zero.
+        mark_session_score_authority(user_id, 0, 0, 0.0)
         persist_robot(user_id)
         logger.info(
             "[MARKETING_AUTO_RESET_SCORE_ON_START] user_id=%s previous_status=%s "
@@ -16096,6 +16525,41 @@ async def robot_live_mode(
     return json_response(200, build_success({"live_demo": ligado}))
 
 
+@app.post("/robot/study-mode")
+async def robot_study_mode(
+    payload: dict[str, Any] = Body(default_factory=dict),
+    auth: dict[str, str] = Depends(require_headers),
+) -> JSONResponse:
+    """Liga ou desliga o Modo Estudo — só marketing, só vale com o LIVE ligado.
+
+    Teste interno para procurar padrões de win: o painel esconde análise e
+    loss e narra o win com a estratégia. Não muda operação nem placar real:
+    todo loss é gravado e o painel mostra o selo "ESTUDO · losses ocultos".
+
+    Args:
+        payload: ``{"enabled": bool}``.
+        auth: Sessão autenticada.
+
+    Returns:
+        ``{"study_mode": bool}``.
+    """
+    user_id = auth["user_id"]
+    tipo = str(auth.get("account_type") or "").strip().lower()
+    if tipo != "marketing":
+        logger.warning("[STUDY_MODE_DENIED] user_id=%s account_type=%s", user_id, tipo or "?")
+        return json_response(403, build_error("STUDY_MODE_SOMENTE_MARKETING"))
+
+    ligado = bool(payload.get("enabled"))
+    state = auto_trader.get(user_id)
+    state.study_mode = ligado
+    persist_robot(user_id)
+    # Mesmo motivo do `live_mode`: em `external` a memória que vale é a do runtime.
+    if robot_runtime_mode() == "external":
+        robot_bus.publish_command(user_id, "study_mode", enabled=ligado)
+    logger.warning("[STUDY_MODE_SET] user_id=%s enabled=%s", user_id, ligado)
+    return json_response(200, build_success({"study_mode": ligado}))
+
+
 @app.post("/robot/start")
 async def robot_start(auth: dict[str, str] = Depends(require_headers)) -> JSONResponse:
     try:
@@ -16114,6 +16578,11 @@ async def _robot_stop_impl(auth: dict[str, str]) -> JSONResponse:
     user_id = auth["user_id"]
     mark_user_active(user_id)
     logger.info("[ROBOT_STOP_REQUEST] user_id=%s", user_id)
+    # Hidratar e adotar o placar vivo ANTES de parar: em modo external a
+    # memória do gateway pode estar atrasada, e o `persist_robot` logo abaixo
+    # gravava esse atraso — o cliente perdia o placar do dia ao parar.
+    get_user_robot_state(user_id)
+    adopt_live_session_score_if_blank(user_id)
     state = auto_trader.stop(user_id)
     persist_robot(user_id)
     # Sobrescreve Redis ANTES do cmd ao runtime: senão GET /robot/state e o WS
@@ -16148,7 +16617,9 @@ async def robot_reset_cycle(
     user_id = auth["user_id"]
     async with auto_trader.lock(user_id):
         state = auto_trader.reset_cycle(user_id, reset_score=True, reset_daily_profit=True)
-        clear_session_score_authority(user_id)
+        # Mesma regra do "Reiniciar placar": sem a marca o `persist_robot`
+        # recusaria gravar o zero e o placar voltaria pelo snapshot Redis.
+        mark_session_score_authority(user_id, 0, 0, 0.0)
         robot_persistence.clear_finished_trades(user_id)
         robot_persistence.clear_trade_history(user_id)
         persist_robot(user_id)
@@ -16207,7 +16678,11 @@ async def robot_reset_score(auth: dict[str, str] = Depends(require_headers)) -> 
     user_id = auth["user_id"]
     async with auto_trader.lock(user_id):
         state = auto_trader.reset_score(user_id)
-        clear_session_score_authority(user_id)
+        # Baixa intencional: marcar 0-0 (em vez de só limpar a marca anterior)
+        # é o que autoriza o gateway a gravar o zero — o `persist_robot` agora
+        # recusa rebaixar o placar sem essa marca. Ela também substitui a marca
+        # de uma exclusão anterior e cai sozinha no primeiro resultado real.
+        mark_session_score_authority(user_id, 0, 0, 0.0)
         future = persist_robot(user_id)
     if future is not None:
         try:

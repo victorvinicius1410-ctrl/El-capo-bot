@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 from backend.email_models import EmailDeliveryStatus
 from backend.email_repository import SupabaseEmailRepository
 from backend.email_service import EmailConfig, EmailService
+
+logger = logging.getLogger(__name__)
 
 
 def _service() -> EmailService:
@@ -24,7 +27,11 @@ def _service() -> EmailService:
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     if not supabase_url or not service_role_key:
         raise RuntimeError("Supabase não configurado para o worker de email")
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").strip()
+    frontend_url = os.getenv("FRONTEND_URL", "").strip()
+    if not frontend_url:
+        # Sem isso os CTAs dos e-mails do worker apontam para localhost.
+        frontend_url = "http://localhost:5173"
+        logger.warning("worker.frontend_url_default url=%s", frontend_url)
     return EmailService(
         SupabaseEmailRepository(supabase_url, service_role_key),
         EmailConfig.from_environment(frontend_url),

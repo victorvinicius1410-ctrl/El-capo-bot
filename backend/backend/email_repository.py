@@ -558,12 +558,23 @@ class SupabaseEmailRepository(EmailRepository):
         stale = names[keep:]
         if not stale:
             return
+        # DELETE unitário com Content-Type: application/json e corpo vazio é
+        # recusado com 400 pelo Storage. A remoção em lote manda os prefixos no
+        # corpo e ainda troca N requisições por uma.
+        paths = [f"{prefix}{name}" for name in stale]
         async with httpx.AsyncClient(timeout=30.0) as client:
-            for name in stale:
-                await client.delete(
-                    f"{self.base_url}/storage/v1/object/{EMAIL_STORAGE_BUCKET}/{prefix}{name}",
-                    headers=self.headers,
-                )
+            response = await client.request(
+                "DELETE",
+                f"{self.base_url}/storage/v1/object/{EMAIL_STORAGE_BUCKET}",
+                headers=self.headers,
+                json={"prefixes": paths},
+            )
+        if response.status_code >= 400:
+            logger.warning(
+                "email.storage_prune_failed status=%s count=%s",
+                response.status_code,
+                len(paths),
+            )
 
     async def _storage_get_json(self, object_path: str) -> Any | None:
         """GET de objeto JSON no Storage (None se inexistente)."""

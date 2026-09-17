@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from celery import Celery
@@ -16,8 +19,14 @@ from backend.webhook_models import DeliveryStatus, DomainEventType
 from backend.webhook_repository import SupabaseWebhookRepository
 from backend.webhook_service import WebhookService
 
+if TYPE_CHECKING:  # pragma: no cover - evita o ciclo email_tasks <-> webhook_tasks
+    from backend.email_service import EmailService
+
 
 from backend.env_prefix import env_prefixed
+
+
+logger = logging.getLogger(__name__)
 
 
 def _environment_value(name: str, default: str = "") -> str:
@@ -44,6 +53,33 @@ celery_app.conf.update(
 )
 
 
+@lru_cache(maxsize=1)
+def _emails() -> "EmailService | None":
+    """
+    EmailService do processo worker, ou ``None`` quando e-mail está desligado.
+
+    Sem isto o ``WebhookService`` do worker nasce sem e-mail e tasks como
+    ``trials.end`` rodam mudas. O import é tardio porque ``email_tasks`` importa
+    ``celery_app`` deste módulo — no topo, o ciclo pega o módulo pela metade.
+    O cache evita que cada task recrie o repositório e repita o probe de
+    ``_prefer_storage``.
+
+    Returns:
+        ``EmailService`` pronto, ou ``None`` se desligado/incompleto.
+    """
+    from backend.workers.email_tasks import _service as _email_service
+
+    try:
+        service = _email_service()
+    except (RuntimeError, ValueError):
+        # Config de e-mail incompleta não pode derrubar webhooks.deliver nem trials.end.
+        logger.warning("worker.emails_unavailable", exc_info=True)
+        return None
+    if not service.config.enabled:
+        return None
+    return service
+
+
 def _service() -> WebhookService:
     """Monta dependências server-only do processo worker."""
     supabase_url = os.getenv("SUPABASE_URL", "").strip()
@@ -54,6 +90,7 @@ def _service() -> WebhookService:
     return WebhookService(
         SupabaseWebhookRepository(supabase_url, service_role_key),
         EncryptionService(encryption_key),
+        emails=_emails(),
     )
 
 

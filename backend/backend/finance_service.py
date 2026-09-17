@@ -60,6 +60,8 @@ GENERATED_EVENTS = frozenset(
 INFORMATIVE_EVENTS = frozenset({"initiate_checkout", "checkout_abandonment"})
 ENABLED_EVENTS = tuple(sorted(ESSENTIAL_EVENTS | GENERATED_EVENTS | INFORMATIVE_EVENTS))
 APPROVED_EVENTS = frozenset({"purchase_approved", "subscription_renewed"})
+# Sentinela de "o payload não trouxe data": nunca pode virar last_event_at.
+UNKNOWN_EVENT_AT = datetime(1970, 1, 1, tzinfo=timezone.utc)
 OUTGOING_EVENT_MAP = {
     "purchase_approved": DomainEventType.PURCHASE_COMPLETED,
     "purchase_refused": DomainEventType.SUBSCRIPTION_PAYMENT_FAILED,
@@ -318,6 +320,28 @@ class FinanceService:
             raise FinanceValidationError("BILLING_PLAN_MAPPING_MISMATCH")
         if expected_company_id is not None and plan.company_id != expected_company_id:
             raise FinanceAuthorizationError("EVENT_OUTSIDE_TENANT")
+
+        if event_name in INFORMATIVE_EVENTS:
+            # Abandono/início de checkout não têm transação, logo não têm
+            # referência estável para o ledger: a Cakto reenvia o mesmo abandono
+            # com timestamp novo e cada retentativa viraria uma linha nova.
+            # Estes eventos também não estão em OUTGOING_EVENT_MAP, então a única
+            # coisa que perdemos ao não gravar é ruído no painel.
+            informative_at = _event_datetime(data, payload)
+            if informative_at != UNKNOWN_EVENT_AT:
+                # touch_config_state sobrescreve sem comparar: gravar a sentinela
+                # rebobinaria o "último evento" do painel para 1970 e faria a
+                # integração parecer morta.
+                await self.repository.touch_config_state(
+                    plan.company_id,
+                    last_event_at=informative_at,
+                )
+            return ProcessEventResult(
+                processed=False,
+                duplicate=False,
+                company_id=plan.company_id,
+                event_name=event_name,
+            )
 
         occurred_at = _event_datetime(data, payload)
         provider_reference = _provider_reference(data)
@@ -870,7 +894,7 @@ def _event_datetime(data: dict[str, Any], payload: dict[str, Any]) -> datetime:
         or payload.get("timestamp")
     )
     if not value:
-        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return UNKNOWN_EVENT_AT
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError as exc:

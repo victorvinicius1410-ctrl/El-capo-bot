@@ -250,6 +250,18 @@ async def _handle_command(gateway: object, payload: dict) -> None:
         # Não force-hydrate: o placar vivo do worker é a fonte de verdade.
         # `stop()` só desliga; wins/losses permanecem.
         _hydrate_user_from_persistence(gateway, user_id, force=False)
+        # Cliente parou com gale disparado: a etapa nunca mais entra, então o
+        # LOSS da perna perdida precisa entrar no placar agora.
+        fechar_gale = getattr(gateway, "close_abandoned_gale_cycle", None)
+        if callable(fechar_gale):
+            try:
+                fechar_gale(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_GALE_CLOSE_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
         stop_fn = getattr(gateway.auto_trader, "stop", None)  # type: ignore[attr-defined]
         if callable(stop_fn):
             stop_fn(user_id)
@@ -283,11 +295,12 @@ async def _handle_command(gateway: object, payload: dict) -> None:
         reset_fn = getattr(gateway.auto_trader, "reset_score", None)  # type: ignore[attr-defined]
         if callable(reset_fn):
             reset_fn(user_id)
-        # Marca de baixa intencional anterior (exclusão marketing) não pode
-        # sobreviver ao Reiniciar placar.
-        clear_authority = getattr(gateway, "clear_session_score_authority", None)
-        if callable(clear_authority):
-            clear_authority(user_id)
+        # Marca de baixa intencional: 0-0 marcado substitui a marca de uma
+        # exclusão anterior E autoriza a gravação do zero nos dois processos —
+        # o `persist_robot` passou a recusar rebaixamento sem marca.
+        mark_authority = getattr(gateway, "mark_session_score_authority", None)
+        if callable(mark_authority):
+            mark_authority(user_id, 0, 0, 0.0)
         publish = getattr(gateway, "publish_robot_control_snapshot", None)
         if callable(publish):
             try:
@@ -330,6 +343,36 @@ async def _handle_command(gateway: object, payload: dict) -> None:
             "[ROBOT_RUNTIME_CMD] action=live_mode user_id=%s enabled=%s",
             user_id,
             state.live_demo,
+        )
+    elif action == "study_mode":
+        # Modo Estudo: espelho do `live_mode` — sem aplicar aqui, o persist do
+        # runtime sobrescreveria o valor do gateway.
+        state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
+        state.study_mode = bool(payload.get("enabled"))
+        persist = getattr(gateway, "persist_robot", None)
+        if callable(persist):
+            try:
+                persist(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_STUDY_MODE_PERSIST_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        publish = getattr(gateway, "publish_robot_control_snapshot", None)
+        if callable(publish):
+            try:
+                publish(user_id)
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_STUDY_MODE_SNAPSHOT_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
+        logger.warning(
+            "[ROBOT_RUNTIME_CMD] action=study_mode user_id=%s enabled=%s",
+            user_id,
+            state.study_mode,
         )
     elif action == "apply_score":
         # Shift+O atualiza o placar no gateway; o publisher do runtime
@@ -466,6 +509,133 @@ async def _snapshot_publisher(gateway: object, stop: asyncio.Event) -> None:
             continue
 
 
+def _ainda_pode_fechar(trade: dict, margem_segundos: int = 180) -> bool:
+    """A vela desta ordem ainda não fechou (ou fechou agora há pouco)?
+
+    Importa porque a corretora só sabe o resultado enquanto a sessão viva tem a
+    ordem em memória (`socket_option_closed`/`order_binary` do bullex-service):
+    se a vela fecha sem ninguém ouvindo, o resultado é **irrecuperável** por
+    esse caminho. Medido em 15/09: ordem de 5 horas antes ainda respondia
+    `PENDING_RESULT`.
+
+    Args:
+        trade: Operação como foi enviada.
+        margem_segundos: Folga depois da expiração.
+
+    Returns:
+        True se vale religar o monitor em vez de desistir.
+    """
+    from datetime import datetime, timezone
+
+    bruto = trade.get("expires_at") or trade.get("expected_expire_at")
+    if not bruto:
+        return False
+    try:
+        expira = datetime.fromisoformat(str(bruto).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expira.tzinfo is None:
+        expira = expira.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - expira).total_seconds() < margem_segundos
+
+
+async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
+    """Busca o resultado das ordens que ficaram abertas quando o processo caiu.
+
+    O monitor de resultado (`TradeResultMonitor`) é um ``asyncio.Task``: deploy,
+    restart ou queda no meio da vela mata o monitor e ninguém mais busca o
+    resultado. A linha fica ``PENDING_RESULT`` para sempre — fora do placar e
+    fora do Histórico. Foram 35 órfãs entre 01 e 15/09, **15 num único dia de
+    deploy**. Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F6.
+
+    Faz UMA tentativa por ordem, não religa o monitor de 35 minutos: se o
+    cliente está desconectado da corretora não adianta insistir, e o próximo
+    boot (ou o painel) tenta de novo.
+
+    Args:
+        gateway: Módulo ``backend.main``.
+        horas: Janela para trás.
+    """
+    persistence = getattr(gateway, "robot_persistence", None)
+    carregar = getattr(persistence, "load_pending_trades", None)
+    if not callable(carregar):
+        return
+    try:
+        pendentes = carregar(horas)
+    except Exception:
+        logger.warning("[ORPHAN_TRADE_SCAN_FAILED]", exc_info=True)
+        return
+    if not pendentes:
+        logger.info("[ORPHAN_TRADE_SCAN] pendentes=0 janela_horas=%s", horas)
+        return
+    logger.warning(
+        "[ORPHAN_TRADE_SCAN] pendentes=%s janela_horas=%s", len(pendentes), horas
+    )
+    buscar = getattr(gateway, "fetch_trade_result", None)
+    normalizar = getattr(gateway, "normalize_trade_result", None)
+    finalizar = getattr(gateway, "finish_monitored_trade", None)
+    if not all(callable(x) for x in (buscar, normalizar, finalizar)):
+        return
+    for user_id, trade in pendentes:
+        order_id = str(trade.get("order_id") or "").strip()
+        if not order_id or not _is_valid_account_user_id(user_id):
+            continue
+        try:
+            _, payload = await asyncio.wait_for(buscar(user_id, order_id), timeout=20)
+            resultado = normalizar(payload)
+        except Exception as erro:  # noqa: BLE001
+            logger.warning(
+                "[ORPHAN_TRADE_FETCH_FAILED] user_id=%s order_id=%s erro=%s",
+                user_id,
+                order_id,
+                erro.__class__.__name__,
+            )
+            continue
+        if resultado is None or resultado[0] not in {"WIN", "LOSS", "DRAW"}:
+            # Ordem que ainda não fechou: desistir aqui é perder o resultado
+            # para sempre, porque a corretora só o entrega no momento do
+            # fechamento. Religa o monitor para estar ouvindo na hora.
+            if _ainda_pode_fechar(trade):
+                monitor = getattr(gateway, "trade_result_monitor", None)
+                iniciar = getattr(monitor, "start", None)
+                if callable(iniciar) and iniciar(
+                    user_id,
+                    order_id,
+                    trade.get("expires_at") or trade.get("expected_expire_at"),
+                ):
+                    logger.warning(
+                        "[ORPHAN_TRADE_MONITOR_RESTARTED] user_id=%s order_id=%s expira=%s",
+                        user_id,
+                        order_id,
+                        trade.get("expires_at") or trade.get("expected_expire_at"),
+                    )
+                    continue
+            logger.warning(
+                "[ORPHAN_TRADE_STILL_UNKNOWN] user_id=%s order_id=%s resultado=%s",
+                user_id,
+                order_id,
+                None if resultado is None else resultado[0],
+            )
+            continue
+        nome, lucro = resultado
+        try:
+            await finalizar(user_id, order_id, nome, lucro)
+            logger.warning(
+                "[ORPHAN_TRADE_RECOVERED] user_id=%s order_id=%s result=%s profit=%s",
+                user_id,
+                order_id,
+                nome,
+                lucro,
+            )
+        except Exception:
+            logger.warning(
+                "[ORPHAN_TRADE_RECOVER_FAILED] user_id=%s order_id=%s",
+                user_id,
+                order_id,
+                exc_info=True,
+            )
+
+
 async def amain() -> None:
     """Boot do robot-runtime."""
     os.environ.setdefault("ROBOT_RUNTIME_MODE", "worker")
@@ -476,6 +646,9 @@ async def amain() -> None:
     logger.info("[ROBOT_RUNTIME_START] mode=%s", os.getenv("ROBOT_RUNTIME_MODE"))
     # Reusa a restauração de estados do startup HTTP.
     await gateway.restore_robot_states()
+    # Ordens que ficaram abertas quando este processo caiu (deploy no meio da
+    # vela): busca o resultado uma vez, senão elas nunca entram no placar.
+    await _recuperar_ordens_orfas(gateway)
     stop = asyncio.Event()
 
     def _signal_handler(*_args: object) -> None:

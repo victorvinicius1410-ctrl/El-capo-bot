@@ -3,10 +3,11 @@ import logging
 import os
 import sqlite3
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -16,6 +17,11 @@ from backend.brasilia_time import history_cutoff_iso
 import httpx
 
 logger = logging.getLogger("backend-gateway")
+
+
+# Rótulo que `main.py` grava na ordem enviada e que só sai quando o resultado
+# chega. Ver `load_pending_trades`.
+PENDING_RESULT_LABEL = "PENDING_RESULT"
 
 
 def utc_iso() -> str:
@@ -44,6 +50,8 @@ ROBOT_SETTING_FIELDS = (
     # ajuste de demonstração, não uma preferência que precise viajar entre
     # ambientes. Ver `live_demo_mode.py`.
     "live_demo",
+    # Modo Estudo: mesma regra do `live_demo`, só no `state_json`.
+    "study_mode",
 )
 
 SUPABASE_ROBOT_SETTING_FIELDS = (
@@ -80,6 +88,7 @@ ROBOT_SETTING_DEFAULTS: dict[str, Any] = {
     "martingale_steps": 1,
     "martingale_multiplier": 2,
     "live_demo": False,
+    "study_mode": False,
 }
 TRADE_ANALYSIS_FIELDS = (
     "analyzed_direction",
@@ -94,6 +103,9 @@ TRADE_ANALYSIS_FIELDS = (
     # estrategia e e o que a auditoria consulta para excluir o modo das
     # medicoes — a contaminacao que a auditoria de 03/09 teve que desfazer.
     "live_demo",
+    # Operação feita com o Modo Estudo ligado (17/09/2026). É o filtro do
+    # relatório `scripts/relatorio_modo_estudo.py` e do histórico do painel.
+    "study_mode",
     # Veredito da REV-Z (mercado aberto, desde 10/09/2026): z da indicação e z
     # no fechamento que confirmou a entrada. É a medida para a frente da
     # estratégia; `None` nas operações do OTC.
@@ -278,6 +290,24 @@ class RobotPersistence(ABC):
     @abstractmethod
     def load_trades(self, user_id: str) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+    def load_pending_trades(self, hours: int = 6) -> list[tuple[str, dict[str, Any]]]:
+        """Ordens abertas sem resultado nas últimas ``hours`` horas.
+
+        O monitor de resultado é um ``asyncio.Task`` e morre com o processo: um
+        deploy no meio da vela deixa a linha em ``PENDING_RESULT`` para sempre,
+        fora do placar e fora do Histórico (35 órfãs entre 01 e 15/09, 15 delas
+        num único dia de deploy). O ``robot-runtime`` usa isto no boot para
+        buscar o resultado que ficou para trás.
+        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F6.
+
+        Args:
+            hours: Janela para trás, em horas.
+
+        Returns:
+            Pares ``(user_id, trade)`` das ordens ainda pendentes.
+        """
+        return []
 
     @abstractmethod
     def clear_finished_trades(self, user_id: str) -> None:
@@ -557,6 +587,28 @@ class SQLiteRobotPersistence(RobotPersistence):
                 (user_id,),
             ).fetchall()
         return list(reversed([json.loads(row["trade_json"]) for row in rows]))
+
+    def load_pending_trades(self, hours: int = 6) -> list[tuple[str, dict[str, Any]]]:
+        corte = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select user_id, trade_json from robot_trades
+                where created_at >= ?
+                order by created_at asc
+                limit 200
+                """,
+                (corte,),
+            ).fetchall()
+        pendentes: list[tuple[str, dict[str, Any]]] = []
+        for row in rows:
+            try:
+                trade = json.loads(row["trade_json"])
+            except (TypeError, ValueError):
+                continue
+            if str(trade.get("result") or "").strip().upper() == PENDING_RESULT_LABEL:
+                pendentes.append((str(row["user_id"]), trade))
+        return pendentes
 
     def clear_finished_trades(self, user_id: str) -> None:
         user_id = require_user_id(user_id)
@@ -1065,11 +1117,11 @@ class SupabaseRobotPersistence(RobotPersistence):
             "executed_at": trade.get("sent_at") or utc_iso(),
             "trade_json": trade,
         }
-        self._request(
-            "POST",
+        self._escrever_com_retry(
             "/robot_trades?on_conflict=user_id,order_id",
-            json=body,
-            extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            body,
+            {"Prefer": "resolution=merge-duplicates,return=minimal"},
+            f"user_id={user_id} order_id={order_id} tabela=robot_trades",
         )
 
     def load_trades(self, user_id: str) -> list[dict[str, Any]]:
@@ -1078,6 +1130,24 @@ class SupabaseRobotPersistence(RobotPersistence):
             f"/robot_trades?user_id=eq.{quote(user_id, safe='')}&select=trade_json&order=executed_at.desc&limit=100",
         )
         return list(reversed([row.get("trade_json") or {} for row in rows]))
+
+    def load_pending_trades(self, hours: int = 6) -> list[tuple[str, dict[str, Any]]]:
+        corte = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))).isoformat()
+        rows = self._request(
+            "GET",
+            "/robot_trades?select=user_id,trade_json"
+            f"&result=eq.{PENDING_RESULT_LABEL}"
+            # O `+` do fuso PRECISA virar %2B: sem isso o PostgREST lê um
+            # espaço e devolve 400 (pego no deploy do sistema 02).
+            f"&executed_at=gte.{quote(corte, safe=':-.')}"
+            "&order=executed_at.asc&limit=200",
+        )
+        pendentes: list[tuple[str, dict[str, Any]]] = []
+        for row in rows:
+            trade = row.get("trade_json") or {}
+            if isinstance(trade, dict) and trade.get("order_id"):
+                pendentes.append((str(row.get("user_id")), trade))
+        return pendentes
 
     def clear_finished_trades(self, user_id: str) -> None:
         user_id = require_user_id(user_id)
@@ -1116,11 +1186,11 @@ class SupabaseRobotPersistence(RobotPersistence):
         self._ensure_user(user_id)
         item = build_trade_history_item(user_id, trade)
         item.pop("id", None)
-        self._request(
-            "POST",
+        self._escrever_com_retry(
             "/robot_trade_history?on_conflict=user_id,order_id",
-            json=item,
-            extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            item,
+            {"Prefer": "resolution=merge-duplicates,return=minimal"},
+            f"user_id={user_id} order_id={item.get('order_id')} tabela=robot_trade_history",
         )
 
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
@@ -1237,6 +1307,69 @@ class SupabaseRobotPersistence(RobotPersistence):
             json={"id": user_id},
             extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
         )
+
+    def _escrever_com_retry(
+        self,
+        path: str,
+        body: Any,
+        extra_headers: dict[str, str],
+        rotulo: str,
+        tentativas: int = 3,
+    ) -> Any:
+        """POST com nova tentativa em falha transitória.
+
+        14 operações reais (0,35% de setembro) ficaram sem linha no Histórico
+        sem nada em comum entre elas — falha passageira no POST, sem retry e
+        sem rastro acionável. 4xx NÃO é repetido: `400` é regra do banco (foi
+        assim que todo empate sumiu) e repetir não muda nada.
+        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F8.
+
+        Args:
+            path: Caminho no PostgREST.
+            body: Corpo já montado.
+            extra_headers: Cabeçalhos do upsert.
+            rotulo: Identificação da linha para o log (``user_id`` + ordem).
+            tentativas: Máximo de tentativas.
+
+        Returns:
+            Resposta do PostgREST.
+
+        Raises:
+            Exception: A última falha, depois de esgotar as tentativas.
+        """
+        ultimo: Exception | None = None
+        for tentativa in range(1, max(1, tentativas) + 1):
+            try:
+                return self._request("POST", path, json=body, extra_headers=extra_headers)
+            except httpx.HTTPStatusError as erro:
+                status = erro.response.status_code
+                if status < 500:
+                    logger.warning(
+                        "[HISTORY_WRITE_FAILED] %s status=%s detalhe=%s",
+                        rotulo,
+                        status,
+                        erro.response.text[:200],
+                    )
+                    raise
+                ultimo = erro
+            except Exception as erro:  # noqa: BLE001
+                ultimo = erro
+            logger.warning(
+                "[HISTORY_WRITE_RETRY] %s tentativa=%s/%s erro=%s",
+                rotulo,
+                tentativa,
+                tentativas,
+                ultimo.__class__.__name__,
+            )
+            if tentativa < tentativas:
+                time.sleep(0.4 * tentativa)
+        logger.error(
+            "[HISTORY_WRITE_FAILED] %s tentativas=%s erro=%s",
+            rotulo,
+            tentativas,
+            ultimo.__class__.__name__ if ultimo else "desconhecido",
+        )
+        raise ultimo if ultimo is not None else RuntimeError("HISTORY_WRITE_FAILED")
 
     def _request(
         self,

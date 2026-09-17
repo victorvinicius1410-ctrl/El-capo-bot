@@ -315,6 +315,31 @@ def is_synthetic_trade(trade: dict[str, Any]) -> bool:
     return not str(trade.get("broker_order_id") or "").strip().isdigit()
 
 
+GALE_STEPS_MIN = 1
+GALE_STEPS_MAX = 10
+
+
+def gale_steps_allowed(state: Any) -> int:
+    """Quantas etapas de gale o ciclo pode abrir, conforme o painel.
+
+    É a "Quantidade de Gales" (`martingale_steps`): 1 dobra uma única vez, 2
+    dobra duas vezes, e assim por diante. O teto de 10 é o mesmo do campo na
+    tela e do `RobotConfigUpdate` — aqui ele também vale para estado antigo
+    que tenha sido restaurado com valor fora da faixa.
+
+    Args:
+        state: Estado do robô do cliente.
+
+    Returns:
+        Número de etapas entre 1 e 10.
+    """
+    try:
+        steps = int(getattr(state, "martingale_steps", GALE_STEPS_MIN) or GALE_STEPS_MIN)
+    except (TypeError, ValueError):
+        steps = GALE_STEPS_MIN
+    return max(GALE_STEPS_MIN, min(GALE_STEPS_MAX, steps))
+
+
 def set_display_score(state: Any, wins: int, losses: int, profit: float) -> None:
     """Troca o placar exibido por um valor vindo do Shift+O.
 
@@ -422,6 +447,12 @@ class RobotState:
     # marketing consegue ligar (o endpoint recusa as demais). Afrouxa o portão
     # em OTC — mais entradas, mesmo acerto de ~50%. Ver `live_demo_mode.py`.
     live_demo: bool = False
+    # Modo Estudo (17/09/2026): teste interno do dono com o expert. Só vale com
+    # `live_demo` ligado e só em conta marketing. É APRESENTAÇÃO: o painel
+    # esconde análise e loss e mostra o win com a estratégia. `wins`/`losses`
+    # reais seguem intactos (stop loss protege a banca), todo loss é gravado,
+    # e a tela sempre mostra o selo "ESTUDO · losses ocultos".
+    study_mode: bool = False
     allow_real: bool = True
     confirm_real: bool = True
     martingale_enabled: bool = False
@@ -489,6 +520,11 @@ class RobotState:
     gale_direction: str | None = None
     gale_original_order_id: str | None = None
     gale_parent_trade: dict[str, Any] | None = None
+    # Soma das perdas já acumuladas na sequência de gale do ciclo atual
+    # (entrada original + etapas anteriores). O resultado do ciclo é esta soma
+    # mais o resultado da etapa que fechar — com 2+ etapas não dá para usar só
+    # o `gale_parent_trade`, que guarda apenas a etapa imediatamente anterior.
+    gale_chain_profit: float = 0.0
     cycle_result: str | None = None
     order_attempts: int = 0
     fallback_candidate_used: bool = False
@@ -575,6 +611,7 @@ class RobotState:
                 self.gale_pending = False
                 self.gale_step = 0
                 self.gale_amount = 0.0
+                self.gale_chain_profit = 0.0
                 self.gale_active = False
                 self.gale_direction = None
                 self.gale_original_order_id = None
@@ -582,6 +619,7 @@ class RobotState:
                 data["gale_pending"] = False
                 data["gale_step"] = 0
                 data["gale_amount"] = 0.0
+                data["gale_chain_profit"] = 0.0
                 data["gale_active"] = False
                 data["gale_direction"] = None
                 data["gale_original_order_id"] = None
@@ -845,15 +883,17 @@ class RobotState:
         if data["status"] in {STATUS_WIN, STATUS_LOSS, STATUS_DRAW} and self.last_trade is not None:
             final_result = str(self.last_trade.get("final_result") or self.last_trade.get("result") or "").upper()
             gale_step = int(self.last_trade.get("gale_step") or 0)
+            # Diz a etapa que fechou o ciclo ("no Gale 2"), não um "Gale 1" fixo.
+            gale_label = f" no Gale {gale_step}" if gale_step >= 1 else ""
             if final_result == "WIN":
                 data["operation_message"] = "WIN"
-                data["voice_message"] = "WIN no Gale 1" if gale_step == 1 else "WIN"
+                data["voice_message"] = f"WIN{gale_label}"
             elif final_result == "DRAW":
                 data["operation_message"] = "EMPATE"
                 data["voice_message"] = "Empate. Stake devolvida."
             elif final_result == "LOSS":
-                data["operation_message"] = "LOSS no Gale 1" if gale_step == 1 else "LOSS"
-                data["voice_message"] = "LOSS no Gale 1" if gale_step == 1 else "LOSS"
+                data["operation_message"] = f"LOSS{gale_label}"
+                data["voice_message"] = f"LOSS{gale_label}"
         if (
             self.status == STATUS_WAITING_NEXT_CYCLE
             and not self.operation_in_progress
@@ -1125,8 +1165,32 @@ class AutoTrader:
         synthetic_wins = 0
         synthetic_losses = 0
         synthetic_profit = 0.0
+        # Uma perna de gale SUPERADA é a ordem que perdeu e passou o ciclo para
+        # a etapa seguinte: ela aparece como `parent_order_id` da etapa que
+        # veio depois. Contá-la dava DOIS pontos no mesmo ciclo, e o placar de
+        # quem usa gale inflava a cada reidratação — medido em 15/09: cliente
+        # com 6x3 no banco e 6x1 de ciclos fechados no Histórico.
+        # O vínculo é usado em vez de "está sem cycle_result" porque linha
+        # antiga e linha do Shift+O também vêm sem esse campo e PRECISAM contar.
+        # `management_totals` não aplica esta regra de propósito: lá se soma
+        # dinheiro, e a perna perdida é dinheiro real que saiu da conta.
+        pernas_superadas = {
+            str(item.get("parent_order_id") or "").strip()
+            for item in trades
+            if str(item.get("parent_order_id") or "").strip()
+        }
         for trade in trades:
-            result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
+            if (
+                str(trade.get("order_id") or "").strip() in pernas_superadas
+                and not trade.get("cycle_result")
+            ):
+                continue
+            result = str(
+                trade.get("cycle_result")
+                or trade.get("result")
+                or trade.get("final_result")
+                or ""
+            ).strip().upper()
             if result not in {"WIN", "LOSS"}:
                 continue
             finished_at = trade.get("finished_at")
@@ -1159,6 +1223,27 @@ class AutoTrader:
         state.stop_offset_wins = synthetic_wins
         state.stop_offset_losses = synthetic_losses
         state.stop_offset_profit = round(synthetic_profit, 2)
+
+    def recompute_session_score_for_today(self, user_id: str) -> tuple[int, int, float]:
+        """Recalcula o placar da sessão pelo histórico do dia civil de Brasília.
+
+        Usado na virada do dia: nada zerava o placar em memória à meia-noite,
+        mas o ``restore`` só conta o dia corrente — então o placar acumulava
+        dois dias e despencava sozinho no primeiro restart depois da virada
+        (medido em 15/09: cliente com 9x5 e só 8 operações no dia).
+        Recalcular em vez de zerar cego preserva o resultado que chega logo
+        DEPOIS da meia-noite, de uma ordem aberta antes dela.
+        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F2.
+
+        Args:
+            user_id: Dono da sessão.
+
+        Returns:
+            ``(wins, losses, profit)`` já aplicados no estado.
+        """
+        state = self.get(user_id)
+        self._recompute_score_from_history(state, self._histories.setdefault(user_id, []))
+        return (int(state.wins or 0), int(state.losses or 0), round(float(state.profit or 0), 2))
 
     def recover_sync_timeout(self, user_id: str) -> tuple[bool, RobotState]:
         state = self.get(user_id)
@@ -1415,6 +1500,7 @@ class AutoTrader:
             state.gale_active = False
             state.gale_step = 0
             state.gale_amount = 0.0
+            state.gale_chain_profit = 0.0
             state.gale_direction = None
             state.gale_original_order_id = None
             state.gale_parent_trade = None
@@ -2610,7 +2696,13 @@ class AutoTrader:
             state.rejection_reason = None
         return state
 
-    def _build_gale_signal(self, state: RobotState, trade: dict[str, Any], gale_amount: float) -> dict[str, Any]:
+    def _build_gale_signal(
+        self,
+        state: RobotState,
+        trade: dict[str, Any],
+        gale_amount: float,
+        step: int = 1,
+    ) -> dict[str, Any]:
         direction = str(trade.get("direction") or trade.get("signal") or "").upper()
         return {
             "symbol": str(trade.get("active") or ""),
@@ -2620,13 +2712,13 @@ class AutoTrader:
             "payout": float(trade.get("payout") or 0),
             "strategy_score": int(trade.get("strategy_score") or trade.get("score") or 0),
             "score": int(trade.get("strategy_score") or trade.get("score") or 0),
-            "reason": trade.get("entry_reason") or trade.get("reason") or "GALE_1",
-            "entry_reason": trade.get("entry_reason") or trade.get("reason") or "GALE_1",
+            "reason": trade.get("entry_reason") or trade.get("reason") or f"GALE_{step}",
+            "entry_reason": trade.get("entry_reason") or trade.get("reason") or f"GALE_{step}",
             "candle_reading": trade.get("candle_reading"),
             "block_reasons": list(trade.get("block_reasons") or []),
             "metrics": dict(trade.get("metrics") or {}),
-            "strategy_name": trade.get("strategy_name") or "Martingale G1",
-            "strategy_reason": trade.get("strategy_reason") or trade.get("entry_reason") or "Martingale G1",
+            "strategy_name": trade.get("strategy_name") or f"Martingale G{step}",
+            "strategy_reason": trade.get("strategy_reason") or trade.get("entry_reason") or f"Martingale G{step}",
             "used_strategies": list(trade.get("used_strategies") or []),
             "timeframe": str(trade.get("timeframe") or trade.get("expiration") or state.timeframe),
             "quality_score": int(trade.get("quality_score") or trade.get("strategy_score") or trade.get("score") or 0),
@@ -2638,8 +2730,11 @@ class AutoTrader:
             "target_entry_second": state.buy_target_second,
             "entry_window_start_second": state.entry_window_start_second,
             "entry_window_end_second": state.entry_window_end_second,
+            # O gale herda a marca do LIVE: sem ela a perna do gale era gravada
+            # sem `live_demo`/`study_mode` e sumia da auditoria e do relatório.
+            "live_demo": trade.get("live_demo") is True,
             "is_gale": True,
-            "gale_step": 1,
+            "gale_step": step,
             "gale_amount": gale_amount,
             "parent_order_id": str(trade.get("order_id") or "").strip(),
             "original_amount": float(trade.get("amount") or 0),
@@ -2659,6 +2754,11 @@ class AutoTrader:
             return False, state
 
         parent_trade = dict(state.last_trade)
+        # Etapa da ordem que acabou de perder: 0 = entrada original, 1 = G1...
+        parent_step = int(parent_trade.get("gale_step") or 0)
+        next_step = parent_step + 1
+        if next_step > gale_steps_allowed(state):
+            return False, state
         amount = float(parent_trade.get("amount") or 0)
         loss_profit = float(profit)
         if loss_profit >= 0:
@@ -2673,11 +2773,15 @@ class AutoTrader:
                 "cycle_result": None,
             }
         )
+        # Cada etapa dobra o valor da etapa anterior (`amount` é o valor da
+        # ordem que perdeu), então G1=entrada*m, G2=entrada*m², e assim por diante.
         gale_amount = round(amount * float(state.martingale_multiplier or 2), 2)
+        # A entrada original reinicia a soma; uma etapa de gale soma à anterior.
+        chain_before = float(state.gale_chain_profit or 0) if parent_step > 0 else 0.0
         completed.add(normalized_order_id)
         state.last_trade = parent_trade
         state.operation_in_progress = False
-        state.pending_signal = self._build_gale_signal(state, parent_trade, gale_amount)
+        state.pending_signal = self._build_gale_signal(state, parent_trade, gale_amount, next_step)
         state.last_signal = dict(state.pending_signal)
         state.status = STATUS_WAITING_GALE_ENTRY
         state.rejection_reason = None
@@ -2687,12 +2791,22 @@ class AutoTrader:
         state.entry_window_open = False
         state.seconds_until_entry_window = 0
         state.next_cycle_at = None
+        # Cada etapa do gale é uma ordem nova e tem o orçamento de tentativas
+        # inteiro. `prepare_cycle` sai antes de zerar isso quando existe sinal
+        # pendente, então as tentativas da entrada original ficavam somadas e o
+        # teto de `MAX_ORDER_ATTEMPTS_PER_CYCLE` barrava o envio do gale.
+        state.order_attempts = 0
+        state.fallback_candidate_used = False
         state.gale_pending = True
         state.gale_active = True
-        state.gale_step = 1
+        state.gale_step = next_step
         state.gale_amount = gale_amount
+        state.gale_chain_profit = round(chain_before + loss_profit, 2)
         state.gale_direction = str(parent_trade.get("direction") or "").upper() or None
-        state.gale_original_order_id = normalized_order_id
+        # Guarda a PRIMEIRA ordem da sequência: o pai imediato de cada etapa
+        # vai no `parent_order_id` do próprio sinal.
+        if parent_step <= 0 or not state.gale_original_order_id:
+            state.gale_original_order_id = normalized_order_id
         state.gale_parent_trade = dict(parent_trade)
         state.cycle_result = None
         history = self._histories.setdefault(user_id, [])
@@ -2700,12 +2814,142 @@ class AutoTrader:
         del history[:-100]
         return True, state
 
+    def count_late_result(
+        self,
+        user_id: str,
+        trade: dict[str, Any],
+        result: str,
+        profit: float,
+    ) -> dict[str, Any] | None:
+        """Contabiliza o resultado de uma ordem que não é mais a do ciclo.
+
+        Acontece quando o ciclo foi reciclado por ``waiting_result_stale`` e uma
+        ordem nova abriu antes de o resultado da anterior chegar: ``finish_trade``
+        recusava por ``order_id`` diferente e a operação sumia do placar E do
+        Histórico, em silêncio. O dinheiro foi real, então o placar do dia tem
+        de contar. NÃO encosta em ``last_trade``, ``status`` nem ``cycle_result``:
+        o ciclo corrente é de outra ordem.
+        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F5.
+
+        Args:
+            user_id: Dono da sessão.
+            trade: Operação como foi enviada (espelho de ``robot_trades``).
+            result: WIN, LOSS ou DRAW.
+            profit: Lucro informado pela corretora.
+
+        Returns:
+            A operação fechada, para gravar no Histórico, ou ``None``.
+        """
+        state = self.get(user_id)
+        normalizado = str(result or "").strip().upper()
+        order_id = str(trade.get("order_id") or "").strip()
+        completed = self._completed_order_ids.setdefault(user_id, set())
+        if not order_id or order_id in completed:
+            return None
+        if normalizado not in {"WIN", "LOSS", "DRAW"}:
+            return None
+        amount = float(trade.get("amount") or 0)
+        lucro = float(profit or 0)
+        if normalizado == "WIN":
+            lucro = lucro if lucro > 0 else amount
+            state.wins += 1
+        elif normalizado == "LOSS":
+            lucro = lucro if lucro < 0 else -amount
+            state.losses += 1
+        else:
+            lucro = 0.0
+        state.profit = round(float(state.profit or 0) + lucro, 2)
+        completed.add(order_id)
+        fechado = dict(trade)
+        fechado.update(
+            {
+                "result": normalizado,
+                "profit": round(lucro, 2),
+                "finished_at": utc_now().isoformat(),
+                "final_result": normalizado,
+                "cycle_result": normalizado,
+            }
+        )
+        historico = self._histories.setdefault(user_id, [])
+        historico.append(dict(fechado))
+        del historico[:-100]
+        logger.warning(
+            "[LATE_RESULT_COUNTED] user_id=%s order_id=%s result=%s profit=%s "
+            "wins=%s losses=%s",
+            user_id,
+            order_id,
+            normalizado,
+            round(lucro, 2),
+            state.wins,
+            state.losses,
+        )
+        return fechado
+
+    def close_abandoned_gale(self, user_id: str) -> dict[str, Any] | None:
+        """Fecha o ciclo quando o gale foi disparado e a etapa nunca entrou.
+
+        ``trigger_gale`` deixa o ciclo ABERTO de propósito: a perna que perdeu
+        vai para o Histórico com ``cycle_result=None`` e o placar não conta
+        nada, à espera da etapa seguinte. Quando ela nunca sai — janela da vela
+        perdida, ativo recusado, stop win/loss, cliente parando o robô — esse
+        LOSS não era contabilizado NUNCA: ficava só no Histórico. Medido em
+        15/09/2026: cliente com placar 5x0 e Histórico 4x1.
+        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F3.
+
+        Args:
+            user_id: Dono da sessão.
+
+        Returns:
+            A operação fechada, para regravar no Histórico com o resultado
+            final, ou ``None`` se não havia gale pendente.
+        """
+        state = self.get(user_id)
+        if not state.gale_pending:
+            return None
+        trade = dict(state.gale_parent_trade or state.last_trade or {})
+        if str(trade.get("result") or "").strip().upper() != "LOSS":
+            # Sem perna perdida não há o que contabilizar; só limpa o contexto.
+            self._clear_gale_state(state)
+            return None
+        # `gale_chain_profit` acumula a sequência inteira (entrada original +
+        # etapas anteriores). A árvore do sistema 02 ainda não tem esse campo,
+        # então cai no prejuízo da própria perna — que é o valor certo quando
+        # só houve uma etapa.
+        cycle_profit = round(float(getattr(state, "gale_chain_profit", 0) or 0), 2)
+        if not cycle_profit:
+            cycle_profit = round(float(trade.get("profit") or 0), 2)
+        state.losses += 1
+        state.profit = round(float(state.profit or 0) + cycle_profit, 2)
+        state.cycle_result = "LOSS"
+        trade.update({"cycle_result": "LOSS", "final_result": "LOSS"})
+        state.last_trade = trade
+        state.operation_in_progress = False
+        order_id = str(trade.get("order_id") or "").strip()
+        historico = self._histories.setdefault(user_id, [])
+        for indice, item in enumerate(historico):
+            if str(item.get("order_id") or "").strip() == order_id:
+                historico[indice] = dict(trade)
+                break
+        self._clear_gale_state(state)
+        logger.warning(
+            "[GALE_ABANDONED_LOSS_COUNTED] user_id=%s order_id=%s step=%s "
+            "cycle_profit=%s wins=%s losses=%s",
+            user_id,
+            order_id,
+            trade.get("gale_step"),
+            cycle_profit,
+            state.wins,
+            state.losses,
+        )
+        return trade
+
     def _clear_gale_state(self, state: RobotState, *, preserve_context: bool = False) -> None:
         state.gale_pending = False
         state.gale_active = False
         if not preserve_context:
             state.gale_step = 0
             state.gale_amount = 0.0
+            state.gale_chain_profit = 0.0
             state.gale_direction = None
             state.gale_original_order_id = None
             state.gale_parent_trade = None
@@ -2714,16 +2958,33 @@ class AutoTrader:
         state = self.get(user_id)
         normalized_order_id = str(order_id or "").strip()
         completed = self._completed_order_ids.setdefault(user_id, set())
+        # Todo descarte daqui para baixo é MUDO por natureza: o monitor loga
+        # `ORDER_RESULT_MONITOR_FINISHED result=WIN` mesmo assim, então o log
+        # dizia que terminou e o placar não mexia — foi o que escondeu o
+        # defeito do placar por semanas. Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.
+        def _descartado(motivo: str) -> tuple[bool, RobotState]:
+            logger.warning(
+                "[TRADE_RESULT_DISCARDED] user_id=%s order_id=%s result=%s "
+                "profit=%s reason=%s last_trade_order_id=%s",
+                user_id,
+                normalized_order_id,
+                str(result or "").strip().upper(),
+                profit,
+                motivo,
+                str((state.last_trade or {}).get("order_id") or "") or None,
+            )
+            return False, state
+
         if not normalized_order_id:
-            return False, state
+            return _descartado("sem_order_id")
         if not state.last_trade:
-            return False, state
+            return _descartado("sem_last_trade")
         if str(state.last_trade.get("order_id") or "").strip() != normalized_order_id:
-            return False, state
+            return _descartado("order_id_diferente")
         trade_result = str((state.last_trade or {}).get("result") or "").strip().upper()
         normalized_result = str(result or "").strip().upper()
         if normalized_result not in {"WIN", "LOSS", "DRAW"}:
-            return False, state
+            return _descartado("resultado_nao_final")
 
         # Recupera TIMEOUT falso: Bullex fechou WIN/LOSS/DRAW depois do monitor desistir.
         recovering_timeout = trade_result == "TIMEOUT" and normalized_result in {"WIN", "LOSS", "DRAW"}
@@ -2743,9 +3004,9 @@ class AutoTrader:
                 profit,
             )
         elif normalized_order_id in completed:
-            return False, state
+            return _descartado("ordem_ja_contabilizada")
         elif not state.operation_in_progress and trade_result in {"WIN", "LOSS", "DRAW"}:
-            return False, state
+            return _descartado("ciclo_ja_fechado")
 
         trade = dict(state.last_trade)
         is_gale_trade = bool(trade.get("is_gale"))
@@ -2760,7 +3021,7 @@ class AutoTrader:
         projected_cycle_profit = projected_trade_profit
         if is_gale_trade:
             projected_cycle_profit = round(
-                float((state.gale_parent_trade or {}).get("profit") or 0) + projected_trade_profit,
+                float(state.gale_chain_profit or 0) + projected_trade_profit,
                 2,
             )
         projected_trade = dict(trade)
@@ -2782,15 +3043,30 @@ class AutoTrader:
             )
             == STATUS_STOP_LOSS_HIT
         )
+        # Etapa da ordem que está fechando; a próxima só abre se couber na
+        # "Quantidade de Gales" configurada (1 gale = dobra uma vez só).
+        current_gale_step = int(trade.get("gale_step") or 0)
+        steps_allowed = gale_steps_allowed(state)
+        gale_steps_left = current_gale_step < steps_allowed
         should_trigger_gale = (
             normalized_result == "LOSS"
             and state.enabled
-            and not is_gale_trade
             and state.martingale_enabled
-            and int(state.martingale_steps or 1) >= 1
-            and not state.gale_active
+            and gale_steps_left
             and not stop_loss_blocks_gale
         )
+        if (
+            normalized_result == "LOSS"
+            and state.enabled
+            and state.martingale_enabled
+            and not gale_steps_left
+        ):
+            logger.info(
+                "[GALE_STEPS_EXHAUSTED] user_id=%s order_id=%s steps=%s",
+                user_id,
+                normalized_order_id,
+                steps_allowed,
+            )
         if should_trigger_gale:
             triggered, triggered_state = self.trigger_gale(user_id, normalized_order_id, profit)
             if triggered:
@@ -2819,7 +3095,9 @@ class AutoTrader:
 
         cycle_profit = trade_profit
         if is_gale_trade:
-            cycle_profit = round(float((state.gale_parent_trade or {}).get("profit") or 0) + trade_profit, 2)
+            # Soma a sequência inteira (entrada original + todas as etapas
+            # anteriores), não só a etapa imediatamente anterior.
+            cycle_profit = round(float(state.gale_chain_profit or 0) + trade_profit, 2)
         state.profit += cycle_profit
 
         finished_at = utc_now()

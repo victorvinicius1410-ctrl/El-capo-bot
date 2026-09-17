@@ -97,9 +97,21 @@ def create_webhook_router(
     ) -> Response:
         """Gera link de uso único sem confirmar se a conta existe."""
         request_id = _request_id(request)
-        if account_links is not None:
+        if account_links is None:
+            logger.warning(
+                "password_recovery.links_disabled request_id=%s",
+                request_id,
+            )
+        else:
             link = await account_links.create_recovery_link(payload.email.strip().casefold())
-            if link is not None:
+            if link is None:
+                # A resposta é 202 de qualquer jeito (anti-enumeração); sem este
+                # log, e-mail inexistente e falha de integração ficam iguais.
+                logger.info(
+                    "password_recovery.link_unavailable request_id=%s",
+                    request_id,
+                )
+            else:
                 event = await service.enqueue_event(
                     company_id=link.company_id,
                     event_type=DomainEventType.PASSWORD_RECOVERY_REQUESTED,

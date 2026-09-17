@@ -88,21 +88,46 @@ LIVE_NON_WAIVABLE = frozenset(
         "OPERATION_IN_PROGRESS",
         "CANDLES_UNAVAILABLE",
         "MIN_PAYOUT",
-        # A região de suporte e resistência NÃO é filtro de qualidade e o modo
-        # LIVE não a dispensa. Foi a violação relatada pelo dono em 09/09/2026:
-        # `20:52:24 LIVE_DEMO_RELEASE NZDUSD-OTC PUT
-        #  barrados=LEVEL_CONFLICT,LEVEL_REJECTION,SR_ZONE` seguido de
-        # `20:53:06 ORDER_ACCEPTED order_id=14247169254` — PUT colado no
-        # suporte, ordem real 42 s depois. Em 48 h foram 4 dessas em 6
-        # liberações. Cadência de transmissão não justifica operar contra o
-        # nível; o modo continua afrouxando tudo o que é qualidade de setup.
-        "SR_ZONE",
-        "LEVEL_CONFLICT",
-        "LEVEL_REJECTION",
-        # Pavio excessivo (11/09): regra do dono, também não é cadência.
-        "WICK_EXCESS",
     }
 )
+# HISTÓRICO, para ninguém "reconsertar" isto achando que é regressão:
+# `SR_ZONE`, `LEVEL_CONFLICT`, `LEVEL_REJECTION` entraram nesta lista em
+# 09/09/2026, depois que o dono flagrou `LIVE_DEMO_RELEASE NZDUSD-OTC PUT`
+# seguido de `ORDER_ACCEPTED` 42 s depois — PUT colado no suporte, 4 casos em
+# 6 liberações. `WICK_EXCESS` entrou em 11/09 pelo mesmo motivo.
+#
+# **Em 15/09/2026 o dono reverteu os dois**, com a justificativa de que a
+# entrada do modo LIVE é curta (teto de `LIVE_MAX_EXPIRATION_MINUTES`) e
+# nessa escala nível e pavio não mandam na vela. Então o modo voltou a
+# dispensar TUDO que é qualidade de setup — nível e pavio incluídos — e aqui
+# ficam só os bloqueios de execução: os que fariam a corretora recusar a ordem
+# ou que protegem a banca. O efeito colateral aceito é o da medição de 09/09:
+# o robô VAI entrar contra suporte e resistência durante a transmissão.
+
+# Teto de duração da entrada de demonstração (15/09/2026). O modo existe para
+# dar ritmo à live: entrada que dura 15 ou 30 minutos deixa a transmissão
+# parada e não é o que o dono pediu. Não afeta conta em M1 ou M5 — ambas já
+# entram abaixo do teto.
+LIVE_MAX_EXPIRATION_MINUTES = 5
+
+# Teto de tempo SEM entrar, com o modo ligado (15/09/2026). O dono: "preciso
+# que pegue no máximo a cada 5 minutos, pode ser antes". Estourado o teto, o
+# portão do modo passa a dispensar também o payout mínimo do painel — que é
+# preferência do usuário, não impedimento da corretora. O resto de
+# `LIVE_NON_WAIVABLE` continua valendo: forçar ordem em ativo fechado, conta
+# desconectada ou stop batido não gera entrada, gera recusa.
+LIVE_MAX_SECONDS_BETWEEN_ENTRIES = 300
+
+# Piso de tempo ENTRE entradas, com o modo ligado (15/09/2026). Sem ele o modo
+# virou enxurrada: tirados os freios de nível e pavio, sobra candidato com
+# direção em 100% dos ciclos e o robô entrava praticamente a cada vela (M1).
+# O dono: "não a cada 1 minuto". Piso 3 min + teto 5 min = 12 a 20 entradas por
+# hora. Vale para TODA entrada enquanto o LIVE estiver ligado, inclusive as
+# aprovadas pela estratégia normal — é o ritmo da transmissão que manda.
+# O gale NÃO passa por aqui (`resolve_entry_validation_reason` só roda com
+# `not is_gale_order`): ele é continuação de uma entrada que já saiu e precisa
+# da vela seguinte.
+LIVE_MIN_SECONDS_BETWEEN_ENTRIES = 180
 
 # Confiança exibida. Curta e honesta: não há convicção nenhuma por trás de uma
 # entrada de demonstração em série aleatória.
@@ -130,6 +155,93 @@ def live_min_confidence(minimo_usuario: int, candidato: dict[str, Any] | None) -
     if isinstance(candidato, dict) and candidato.get("live_demo") is True:
         return min(int(minimo_usuario), LIVE_CONFIDENCE)
     return int(minimo_usuario)
+
+
+def live_expiration_minutes(
+    expiracao_minutos: int, candidato: dict[str, Any] | None
+) -> int:
+    """Aplica o teto de duração da entrada de demonstração.
+
+    Pedido do dono em 15/09/2026: no modo LIVE a operação é curta, no máximo
+    ``LIVE_MAX_EXPIRATION_MINUTES``. A duração normal sai do timeframe da conta
+    (``TIMEFRAME_SECONDS``), então uma conta em M15 abriria entrada de 15
+    minutos no meio da transmissão. Conta em M1 ou M5 não muda nada: já entra
+    abaixo do teto — em 15/09 as 5 contas de marketing estavam todas em M1.
+
+    O teto vale só para a duração da ordem. O timeframe da ANÁLISE continua o
+    da conta: trocá-lo aqui mudaria as velas lidas, o cache e a janela de
+    entrada, que derivam todos de ``state.timeframe``.
+
+    Args:
+        expiracao_minutos: Duração que o timeframe da conta pediria.
+        candidato: Sinal avaliado. Só entradas marcadas ``live_demo`` mudam.
+
+    Returns:
+        A duração em minutos a enviar para a corretora.
+    """
+    # A entrada normal sai daqui intacta, inclusive quando o valor é
+    # esquisito: quem valida a duração da ordem é `validate_buy_real_order_payload`.
+    # Converter antes de checar o modo fazia uma operação NORMAL com valor
+    # inválido virar 5 minutos silenciosamente.
+    if not is_live_demo(candidato):
+        return expiracao_minutos
+    try:
+        minutos = int(expiracao_minutos)
+    except (TypeError, ValueError):
+        return LIVE_MAX_EXPIRATION_MINUTES
+    return min(minutos, LIVE_MAX_EXPIRATION_MINUTES)
+
+
+def live_cadencia_estourada(
+    ultima_entrada: Any, agora: Any, *, teto_segundos: int = LIVE_MAX_SECONDS_BETWEEN_ENTRIES
+) -> bool:
+    """Diz se o modo LIVE passou do teto de tempo sem entrar.
+
+    ``ultima_entrada`` nula conta como estourado: ou o robô acabou de ligar, ou
+    a sessão nunca entrou. Nos dois casos o que o dono quer numa transmissão é
+    a primeira entrada logo, não esperar 5 minutos para começar a contar.
+
+    Args:
+        ultima_entrada: ``state.last_entry_at`` (datetime) ou ``None``.
+        agora: Instante de referência (datetime).
+        teto_segundos: Teto configurável, para teste.
+
+    Returns:
+        ``True`` quando já passou do teto sem nenhuma entrada.
+    """
+    if ultima_entrada is None:
+        return True
+    try:
+        decorrido = (agora - ultima_entrada).total_seconds()
+    except (TypeError, AttributeError):
+        return True
+    return decorrido >= float(teto_segundos)
+
+
+def live_espera_espacamento(
+    ultima_entrada: Any, agora: Any, *, piso_segundos: int = LIVE_MIN_SECONDS_BETWEEN_ENTRIES
+) -> bool:
+    """Diz se ainda falta tempo para a próxima entrada do modo LIVE.
+
+    Ao contrário de ``live_cadencia_estourada``, aqui ``ultima_entrada`` nula
+    significa que NÃO há o que esperar: a sessão não entrou ainda e a primeira
+    entrada da transmissão tem de sair logo.
+
+    Args:
+        ultima_entrada: ``state.last_entry_at`` (datetime) ou ``None``.
+        agora: Instante de referência (datetime).
+        piso_segundos: Piso configurável, para teste.
+
+    Returns:
+        ``True`` quando ainda está dentro do piso e a entrada deve esperar.
+    """
+    if ultima_entrada is None:
+        return False
+    try:
+        decorrido = (agora - ultima_entrada).total_seconds()
+    except (TypeError, AttributeError):
+        return False
+    return decorrido < float(piso_segundos)
 
 
 def is_otc_symbol(symbol: str) -> bool:
@@ -283,6 +395,7 @@ def live_demo_passa_portao(
     *,
     min_payout: float,
     minimo_confianca: int,
+    cadencia_estourada: bool = False,
 ) -> tuple[bool, str | None]:
     """Portão da entrada de demonstração: só o que impede a ordem de existir.
 
@@ -313,6 +426,12 @@ def live_demo_passa_portao(
     """
     bloqueados = {str(item) for item in (candidato.get("blocked_filters") or [])}
     impeditivos = sorted(bloqueados & LIVE_NON_WAIVABLE)
+    # Estourado o teto de tempo sem entrar, o payout mínimo do painel deixa de
+    # barrar: ele é preferência do usuário, e ficar de fora da vela por 2 pontos
+    # de payout é exatamente a "seca" que o modo existe para não ter. Os outros
+    # impeditivos são de execução e continuam valendo.
+    if cadencia_estourada:
+        impeditivos = [nome for nome in impeditivos if nome != "MIN_PAYOUT"]
     if impeditivos:
         return False, ",".join(impeditivos)
 
@@ -320,7 +439,7 @@ def live_demo_passa_portao(
         payout = float(candidato.get("payout") or 0)
     except (TypeError, ValueError):
         return False, "PAYOUT_INVALIDO"
-    if payout < float(min_payout):
+    if payout < float(min_payout) and not cadencia_estourada:
         return False, f"PAYOUT_ABAIXO_DO_MINIMO({payout:g}<{float(min_payout):g})"
 
     bruto = (
