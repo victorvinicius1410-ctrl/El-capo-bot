@@ -3,13 +3,12 @@
 set -euo pipefail
 
 # Fonte de verdade: /opt/elcapo/frontend (symlink /root/elcapo).
-# Fallback legado: /root/Frontend (espelho de upload).
+# O espelho legado /root/Frontend foi arquivado em 17/09/2026; sem build aqui,
+# o script para em vez de publicar um site velho.
 if [[ -d /opt/elcapo/frontend/.vercel/output/static/assets ]]; then
   SRC_ROOT=/opt/elcapo/frontend
-elif [[ -d /root/elcapo/frontend/.vercel/output/static/assets ]]; then
-  SRC_ROOT=/root/elcapo/frontend
 else
-  SRC_ROOT=/root/Frontend
+  SRC_ROOT=/root/elcapo/frontend
 fi
 
 SRC_STATIC="$SRC_ROOT/.vercel/output/static"
