@@ -36,7 +36,7 @@ if [[ -d "$SRC_DIST" ]]; then
   [[ -f "$SRC_DIST/favicon.svg" ]] && cp -a "$SRC_DIST/favicon.svg" "$DEST/"
   cp -a "$SRC_DIST"/*.mp3 "$DEST/" 2>/dev/null || true
   cp -a "$SRC_DIST"/*.webm "$DEST/" 2>/dev/null || true
-  for d in login register reset-password dashboard settings branding chart configuracoes feedbacks history payments welcome-trial; do
+  for d in login register reset-password forgot-password dashboard settings branding chart configuracoes feedbacks history payments welcome-trial; do
     if [[ -f "$SRC_DIST/$d/index.html" ]]; then
       mkdir -p "$DEST/$d"
       cp -a "$SRC_DIST/$d/index.html" "$DEST/$d/"

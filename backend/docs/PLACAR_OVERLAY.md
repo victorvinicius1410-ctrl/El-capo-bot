@@ -1,5 +1,14 @@
 # Placar do overlay (WIN / LOSS / resultado)
 
+> **Regra de 15/09/2026 — quem pode escrever o placar.** Em
+> `ROBOT_RUNTIME_MODE=external` o dono do placar é o `robot-runtime`. O gateway
+> **nunca rebaixa** o placar persistido: `_protect_session_score_on_persist`
+> barra a gravação e loga `[SCORE_PERSIST_DOWNGRADE_BLOCKED]`. A única baixa
+> legítima carrega marca de baixa intencional (`score_authority`) — "Reiniciar
+> placar", "Reiniciar ciclo", exclusão no Shift+O e a virada do dia. O runtime,
+> por sua vez, **nunca reidrata** o placar do banco: a memória viva dele já foi
+> recalculada pelo histórico do dia. Ver `PLACAR_DIAGNOSTICO_2026-09-15.md`.
+
 Como o frontend mostra o placar da sessão no robô flutuante, e por que ele
 às vezes **piscava zerado**, **não zerava no Reiniciar placar**, **caía
 um ponto ao parar** (ex.: 10x12 → 9x12), **regredia no start/stop**
