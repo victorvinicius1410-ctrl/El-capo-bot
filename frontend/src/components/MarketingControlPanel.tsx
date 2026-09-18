@@ -228,9 +228,7 @@ export function MarketingControlPanel({
       setStudyOn(estadoRobo.study_mode);
     }
   }, [open, queryClient, userId]);
-  // Modo Estudo (17/09/2026): teste interno. Só vale com o LIVE ligado. A tela
-  // esconde análise e loss, mas o selo "ESTUDO · losses ocultos" fica no
-  // placar e todo loss continua gravado — ver `lib/studyMode.ts`.
+  // Modo Estudo: apresentação adicional, disponível só com o LIVE ligado.
   const [studyOn, setStudyOn] = useState(false);
   const studyMode = useMutation({
     mutationFn: (enabled: boolean) => robotStudyMode(enabled),
@@ -690,8 +688,8 @@ export function MarketingControlPanel({
           {liveOn ? (
             <p className="text-[11px] leading-snug text-muted-foreground">
               O robô vai entrar muito mais vezes em OTC. O acerto continua o
-              mesmo (~50%), então o placar da live anda mais rápido para os
-              dois lados.
+              mesmo (~50%); na live, o placar e o histórico exibem somente os
+              wins.
             </p>
           ) : null}
           <button
@@ -715,7 +713,7 @@ export function MarketingControlPanel({
           </button>
           <p className="text-[11px] leading-snug text-muted-foreground">
             {liveOn
-              ? "Com o estudo ligado, a tela mostra só os wins, com a estratégia, e o selo \"ESTUDO · losses ocultos\" fica no placar. Todo loss continua gravado e aparece no histórico quando o estudo for desligado."
+              ? "Com o estudo ligado, a tela mantém o foco nos wins e na estratégia usada."
               : "O Modo Estudo só funciona com o LIVE ligado."}
           </p>
           <button

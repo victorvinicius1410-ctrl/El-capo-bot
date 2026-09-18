@@ -315,6 +315,20 @@ def is_synthetic_trade(trade: dict[str, Any]) -> bool:
     return not str(trade.get("broker_order_id") or "").strip().isdigit()
 
 
+def should_hide_live_loss(trade: dict[str, Any], state: Any | None = None) -> bool:
+    """True quando um LOSS do Modo LIVE não deve ir ao placar ou histórico.
+
+    A marca é congelada na abertura da ordem (`live_mode_active`), para que
+    desligar o LIVE enquanto a vela ainda está aberta não faça uma perda daquela
+    operação reaparecer. Ordens antigas sem a marca preservam o comportamento
+    original, para um novo clique no LIVE não esconder o histórico anterior.
+    """
+    result = str(trade.get("final_result") or trade.get("result") or "").strip().upper()
+    if result != "LOSS":
+        return False
+    return trade.get("live_mode_active") is True
+
+
 GALE_STEPS_MIN = 1
 GALE_STEPS_MAX = 10
 
@@ -447,11 +461,9 @@ class RobotState:
     # marketing consegue ligar (o endpoint recusa as demais). Afrouxa o portão
     # em OTC — mais entradas, mesmo acerto de ~50%. Ver `live_demo_mode.py`.
     live_demo: bool = False
-    # Modo Estudo (17/09/2026): teste interno do dono com o expert. Só vale com
-    # `live_demo` ligado e só em conta marketing. É APRESENTAÇÃO: o painel
-    # esconde análise e loss e mostra o win com a estratégia. `wins`/`losses`
-    # reais seguem intactos (stop loss protege a banca), todo loss é gravado,
-    # e a tela sempre mostra o selo "ESTUDO · losses ocultos".
+    # Modo Estudo (17/09/2026): apresentação adicional da conta marketing.
+    # O Modo LIVE já não põe LOSS no placar nem no histórico do painel; este
+    # flag só controla os demais elementos de apresentação da tela.
     study_mode: bool = False
     allow_real: bool = True
     confirm_real: bool = True
@@ -1120,7 +1132,10 @@ class AutoTrader:
 
         restored_trades = [strip_ai_fields(dict(trade)) for trade in (trades or [])]
         self._histories[user_id] = [
-            trade for trade in restored_trades if trade.get("result") in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
+            trade
+            for trade in restored_trades
+            if trade.get("result") in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
+            and not should_hide_live_loss(trade, state)
         ][-100:]
         self._completed_order_ids[user_id] = {
             str(trade.get("order_id"))
@@ -1180,6 +1195,8 @@ class AutoTrader:
             if str(item.get("parent_order_id") or "").strip()
         }
         for trade in trades:
+            if should_hide_live_loss(trade, state):
+                continue
             if (
                 str(trade.get("order_id") or "").strip() in pernas_superadas
                 and not trade.get("cycle_result")
@@ -2589,6 +2606,9 @@ class AutoTrader:
             (sent_at + timedelta(seconds=TIMEFRAME_SECONDS[state.timeframe])).isoformat(),
         )
         trade.setdefault("expires_at", trade["expected_expire_at"])
+        # O resultado chega depois da abertura. Congelar este estado impede que
+        # desligar o LIVE durante a vela faça um LOSS daquela ordem reaparecer.
+        trade.setdefault("live_mode_active", bool(state.live_demo))
         state.last_trade = trade
         state.last_entry_at = sent_at
         state.consecutive_no_opportunity_cycles = 0
@@ -2733,6 +2753,7 @@ class AutoTrader:
             # O gale herda a marca do LIVE: sem ela a perna do gale era gravada
             # sem `live_demo`/`study_mode` e sumia da auditoria e do relatório.
             "live_demo": trade.get("live_demo") is True,
+            "live_mode_active": trade.get("live_mode_active") is True,
             "is_gale": True,
             "gale_step": step,
             "gale_amount": gale_amount,
@@ -2809,9 +2830,10 @@ class AutoTrader:
             state.gale_original_order_id = normalized_order_id
         state.gale_parent_trade = dict(parent_trade)
         state.cycle_result = None
-        history = self._histories.setdefault(user_id, [])
-        history.append(dict(parent_trade))
-        del history[:-100]
+        if not should_hide_live_loss(parent_trade, state):
+            history = self._histories.setdefault(user_id, [])
+            history.append(dict(parent_trade))
+            del history[:-100]
         return True, state
 
     def count_late_result(
@@ -2855,7 +2877,8 @@ class AutoTrader:
             state.wins += 1
         elif normalizado == "LOSS":
             lucro = lucro if lucro < 0 else -amount
-            state.losses += 1
+            if not should_hide_live_loss({**trade, "result": normalizado}, state):
+                state.losses += 1
         else:
             lucro = 0.0
         state.profit = round(float(state.profit or 0) + lucro, 2)
@@ -2870,9 +2893,10 @@ class AutoTrader:
                 "cycle_result": normalizado,
             }
         )
-        historico = self._histories.setdefault(user_id, [])
-        historico.append(dict(fechado))
-        del historico[:-100]
+        if not should_hide_live_loss(fechado, state):
+            historico = self._histories.setdefault(user_id, [])
+            historico.append(dict(fechado))
+            del historico[:-100]
         logger.warning(
             "[LATE_RESULT_COUNTED] user_id=%s order_id=%s result=%s profit=%s "
             "wins=%s losses=%s",
@@ -2918,18 +2942,21 @@ class AutoTrader:
         cycle_profit = round(float(getattr(state, "gale_chain_profit", 0) or 0), 2)
         if not cycle_profit:
             cycle_profit = round(float(trade.get("profit") or 0), 2)
-        state.losses += 1
+        ocultar_loss = should_hide_live_loss(trade, state)
+        if not ocultar_loss:
+            state.losses += 1
         state.profit = round(float(state.profit or 0) + cycle_profit, 2)
         state.cycle_result = "LOSS"
         trade.update({"cycle_result": "LOSS", "final_result": "LOSS"})
         state.last_trade = trade
         state.operation_in_progress = False
         order_id = str(trade.get("order_id") or "").strip()
-        historico = self._histories.setdefault(user_id, [])
-        for indice, item in enumerate(historico):
-            if str(item.get("order_id") or "").strip() == order_id:
-                historico[indice] = dict(trade)
-                break
+        if not ocultar_loss:
+            historico = self._histories.setdefault(user_id, [])
+            for indice, item in enumerate(historico):
+                if str(item.get("order_id") or "").strip() == order_id:
+                    historico[indice] = dict(trade)
+                    break
         self._clear_gale_state(state)
         logger.warning(
             "[GALE_ABANDONED_LOSS_COUNTED] user_id=%s order_id=%s step=%s "
@@ -3089,7 +3116,8 @@ class AutoTrader:
                 amount,
             )
         else:
-            state.losses += 1
+            if not should_hide_live_loss({**trade, "result": normalized_result}, state):
+                state.losses += 1
             trade_profit = trade_profit if trade_profit < 0 else -amount
             state.cycle_result = "LOSS"
 
@@ -3149,9 +3177,10 @@ class AutoTrader:
             "at": finished_at.isoformat(),
         }
         self._clear_gale_state(state, preserve_context=True)
-        history = self._histories.setdefault(user_id, [])
-        history.append(dict(trade))
-        del history[:-100]
+        if not should_hide_live_loss(trade, state):
+            history = self._histories.setdefault(user_id, [])
+            history.append(dict(trade))
+            del history[:-100]
         if state.enabled and normalized_result in {"WIN", "LOSS"}:
             management_totals = self.management_totals(user_id)
             stop_reason = resolve_robot_stop_reason(

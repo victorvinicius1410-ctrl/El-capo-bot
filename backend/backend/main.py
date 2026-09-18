@@ -31,6 +31,7 @@ from backend.auto_trader import (
     is_synthetic_trade,
     resolve_robot_stop_reason,
     set_display_score,
+    should_hide_live_loss,
     strip_ai_fields,
     utc_now,
 )
@@ -12610,8 +12611,7 @@ def close_abandoned_gale_cycle(user_id: str) -> bool:
     if not trade:
         return False
     try:
-        robot_persistence.save_trade_history(user_id, trade)
-        invalidate_daily_history_cache(user_id)
+        save_visible_trade_history(user_id, trade)
         robot_persistence.save_trade(user_id, trade)
     except Exception:
         logger.exception(
@@ -12628,6 +12628,25 @@ def close_abandoned_gale_cycle(user_id: str) -> bool:
         state.profit,
     )
     persist_robot(user_id)
+    return True
+
+
+def save_visible_trade_history(user_id: str, trade: dict[str, Any]) -> bool:
+    """Grava no histórico do painel, exceto LOSS de ordem aberta no LIVE.
+
+    O espelho técnico em ``robot_trades`` continua sendo tratado pelos
+    chamadores: ele é necessário para a reconciliação de ordens, mas não é a
+    fonte do histórico que o painel apresenta.
+    """
+    if should_hide_live_loss(trade, auto_trader.get(user_id)):
+        logger.info(
+            "[LIVE_LOSS_HIDDEN_FROM_HISTORY] user_id=%s order_id=%s",
+            user_id,
+            trade.get("order_id"),
+        )
+        return False
+    robot_persistence.save_trade_history(user_id, trade)
+    invalidate_daily_history_cache(user_id)
     return True
 
 
@@ -12806,8 +12825,7 @@ def salvar_resultado_atrasado(
     if not fechado:
         return False
     try:
-        robot_persistence.save_trade_history(user_id, fechado)
-        invalidate_daily_history_cache(user_id)
+        save_visible_trade_history(user_id, fechado)
         robot_persistence.save_trade(user_id, fechado)
     except Exception:
         logger.exception(
@@ -12885,8 +12903,7 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
             )
             if state.last_trade:
                 try:
-                    robot_persistence.save_trade_history(user_id, state.last_trade)
-                    invalidate_daily_history_cache(user_id)
+                    save_visible_trade_history(user_id, state.last_trade)
                     # Espelha também em robot_trades para restore do placar/memória.
                     robot_persistence.save_trade(user_id, state.last_trade)
                     try:
@@ -12981,8 +12998,7 @@ async def finish_monitored_trade(user_id: str, order_id: str, result: str, profi
                     state.profit,
                 )
             try:
-                robot_persistence.save_trade_history(user_id, state.last_trade)
-                invalidate_daily_history_cache(user_id)
+                save_visible_trade_history(user_id, state.last_trade)
                 robot_persistence.save_trade(user_id, state.last_trade)
                 try:
                     trade_for_memory = dict(state.last_trade)
