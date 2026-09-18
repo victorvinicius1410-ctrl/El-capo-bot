@@ -3,7 +3,6 @@ import { RotateCcw, Settings, Volume2, VolumeX, X } from "lucide-react";
 import { toast } from "sonner";
 import { MoneyInput } from "./MoneyInput";
 import { RobotAvatarVideo } from "./RobotAvatarVideo";
-import { StudyModeSeal } from "./StudyModeSeal";
 import type { BullExAccount } from "@/lib/api";
 import { formatBullExBalance, formatProfitAmount, profitTone } from "@/lib/bullexConnection";
 import {
@@ -126,7 +125,8 @@ export function RobotOverlay({
   const scoreProfit = robotState ? robotState.profit : lastKnownScoreRef.current.profit;
   const now = useNowTicker();
   const presentation = getRobotStatusPresentation(robotState, now);
-  // Modo Estudo: sem balão, sem LOSS e sem lucro; o selo ocupa o lugar do LOSS.
+  // LIVE: sem balão de entrada e sem resultado LOSS; o contador prévio de
+  // losses permanece visível e congelado.
   const study = isStudyActive(robotState);
   const display = buildOverlayDisplay(robotState, presentation, now, study);
   const locked = isRobotLocked(robotState);
@@ -513,7 +513,7 @@ export function RobotOverlay({
             ) : null}
             <RobotAvatarVideo className="h-auto w-[110px] object-contain sm:w-[170px]" />
           </div>
-          {study ? <StudyModeSeal /> : <ScoreBadge label="LOSS" value={scoreLosses} tone="loss" />}
+          <ScoreBadge label="LOSS" value={scoreLosses} tone="loss" />
         </div>
         {speechDetailOpen && speechView ? (
           <div
@@ -752,8 +752,8 @@ function buildOverlayDisplay(
           : "";
   const countdown = countdownText(state, now);
   const detailParts = collectDetailParts(presentation);
-  // Estudo: sem contagem (ela entregaria a operação aberta); o rodapé é o
-  // texto neutro ou a estratégia do win.
+  // LIVE: sem contagem (ela entregaria a operação aberta); o rodapé é o
+  // texto neutro ou a estratégia do WIN.
   const footer = study
     ? presentation.detail
     : presentation.footer ??

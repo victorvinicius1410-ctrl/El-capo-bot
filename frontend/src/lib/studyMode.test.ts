@@ -16,7 +16,6 @@ import {
 } from "./robotState.ts";
 import {
   STUDY_IDLE_TITLE,
-  STUDY_SEAL_TEXT,
   filterStudyHistory,
   isStudyActive,
   studyHiddenNotice,
@@ -74,10 +73,10 @@ beforeEach(() => {
 });
 
 describe("isStudyActive", () => {
-  it("só vale com LIVE e estudo ligados", () => {
+  it("vale para todo LIVE, sem depender do antigo Modo Estudo", () => {
     assert.equal(isStudyActive({ live_demo: true, study_mode: true }), true);
     assert.equal(isStudyActive({ live_demo: false, study_mode: true }), false);
-    assert.equal(isStudyActive({ live_demo: true, study_mode: false }), false);
+    assert.equal(isStudyActive({ live_demo: true, study_mode: false }), true);
     assert.equal(isStudyActive(null), false);
   });
 
@@ -103,7 +102,7 @@ describe("isStudyActive", () => {
   });
 });
 
-describe("apresentação no Modo Estudo", () => {
+describe("apresentação no Modo LIVE", () => {
   it("análise e entrada viram o texto neutro, sem ativo", () => {
     for (const status of ["ANALYZING", "SIGNAL_FOUND", "BUYING", "WAITING_GALE_ENTRY"]) {
       const view = getRobotStatusPresentation(state({ status }), NOW);
@@ -158,7 +157,7 @@ describe("apresentação no Modo Estudo", () => {
   });
 });
 
-describe("narração do Modo Estudo", () => {
+describe("narração do Modo LIVE", () => {
   const voice = (result: string) => ({
     order_id: "ord-1",
     result,
@@ -186,6 +185,13 @@ describe("narração do Modo Estudo", () => {
     assert.equal(win?.trade?.strategy_name, "Rejeição no suporte");
   });
 
+  it("no win monta placar completo com estratégia e explicação técnica", () => {
+    const source = readFileSync(join(here, "robotNarration.ts"), "utf8");
+    assert.match(source, /Estratégia: \$\{reasonForSpeech\(trade\.strategy_name\)\}/);
+    assert.match(source, /const analise = analysisSentence/);
+    assert.match(source, /Placar: \$\{wins\} e \$\{losses\}/);
+  });
+
   it("não mistura a análise de outra ordem", () => {
     const win = studyWinSpeech(
       state({ result_voice: voice("WIN"), last_trade: trade("WIN", { order_id: "ord-2" }) }),
@@ -203,7 +209,7 @@ describe("narração do Modo Estudo", () => {
   });
 });
 
-describe("histórico e selo", () => {
+describe("histórico e placar do LIVE", () => {
   const items = [
     { id: "1", result: "WIN", studyMode: true },
     { id: "2", result: "LOSS", studyMode: true },
@@ -218,22 +224,18 @@ describe("histórico e selo", () => {
       ["1", "4"],
     );
     assert.equal(filtered.hidden, 2);
-    assert.equal(studyHiddenNotice(filtered.hidden), "2 losses ocultos pelo modo estudo");
+    assert.equal(studyHiddenNotice(filtered.hidden), "2 losses antigos ocultos no modo LIVE");
   });
 
-  it("estudo desligado devolve tudo", () => {
+  it("LIVE desligado devolve tudo", () => {
     const filtered = filterStudyHistory(items, false);
     assert.equal(filtered.items.length, 4);
     assert.equal(studyHiddenNotice(filtered.hidden), null);
   });
 
-  it("o selo substitui o LOSS no placar e não tem como fechar", () => {
+  it("mantém o contador de LOSS já existente no placar", () => {
     const overlay = readFileSync(join(here, "../components/RobotOverlay.tsx"), "utf8");
-    assert.match(overlay, /study \? <StudyModeSeal \/> : <ScoreBadge label="LOSS"/);
-    const seal = readFileSync(join(here, "../components/StudyModeSeal.tsx"), "utf8");
-    assert.match(seal, /STUDY_SEAL_TEXT/);
-    assert.doesNotMatch(seal, /onClick|button/);
-    assert.equal(STUDY_SEAL_TEXT, "ESTUDO · losses ocultos");
+    assert.match(overlay, /<ScoreBadge label="LOSS" value=\{scoreLosses\} tone="loss" \/>/);
   });
 
   it("o histórico mostra o aviso quando esconde algo", () => {

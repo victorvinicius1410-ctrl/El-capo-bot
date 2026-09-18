@@ -154,8 +154,7 @@ function HistoryPage() {
           className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm font-semibold text-amber-300"
           role="status"
         >
-          {studyNotice}. Os números abaixo não incluem essas operações; todas continuam gravadas e voltam
-          quando o estudo for desligado.
+          {studyNotice}.
         </div>
       ) : null}
 

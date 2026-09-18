@@ -70,6 +70,17 @@ class GatewayLiveModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bus.commands, [])
         self.assertTrue(main.auto_trader.get(USER_ID).live_demo)
 
+    async def test_gateway_preserves_existing_score_when_turning_live_on(self) -> None:
+        state = main.auto_trader.get(USER_ID)
+        state.wins, state.losses, state.profit = 6, 1, 42.0
+
+        with patch.object(main, "robot_runtime_mode", return_value="worker"):
+            response = await self.call(True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(state.live_demo)
+        self.assertEqual((state.wins, state.losses, state.profit), (6, 1, 42.0))
+
     async def test_non_marketing_is_denied_and_nothing_is_sent(self) -> None:
         with patch.object(main, "robot_runtime_mode", return_value="external"):
             response = await self.call(True, account_type="client")

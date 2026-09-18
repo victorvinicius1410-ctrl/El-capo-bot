@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, FlaskConical, Loader2, Pencil, Plus, Radio, Sparkles, Trash2, X } from "lucide-react";
+import { ChevronDown, Loader2, Pencil, Plus, Radio, Sparkles, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import {
   ApiError,
@@ -11,7 +11,6 @@ import {
   marketingSimulationHistory,
   marketingUpdateTrade,
   robotLiveMode,
-  robotStudyMode,
   type MarketingSimulationTrade,
   type MarketingSimulationTradeUpdate,
 } from "@/lib/api";
@@ -217,34 +216,14 @@ export function MarketingControlPanel({
   // cliques, dois `enabled=True` no log. O estado do robô é a fonte da verdade.
   useEffect(() => {
     if (!open) return;
-    const estadoRobo = queryClient.getQueryData<{ live_demo?: boolean; study_mode?: boolean }>([
+    const estadoRobo = queryClient.getQueryData<{ live_demo?: boolean }>([
       ...ROBOT_STATE_QUERY_KEY,
       userId,
     ]);
     if (typeof estadoRobo?.live_demo === "boolean") {
       setLiveOn(estadoRobo.live_demo);
     }
-    if (typeof estadoRobo?.study_mode === "boolean") {
-      setStudyOn(estadoRobo.study_mode);
-    }
   }, [open, queryClient, userId]);
-  // Modo Estudo: apresentação adicional, disponível só com o LIVE ligado.
-  const [studyOn, setStudyOn] = useState(false);
-  const studyMode = useMutation({
-    mutationFn: (enabled: boolean) => robotStudyMode(enabled),
-    onSuccess: (_data, enabled) => {
-      setStudyOn(enabled);
-      toast.success(enabled ? "Modo Estudo ligado" : "Modo Estudo desligado");
-    },
-    onError: (error: unknown) => {
-      const detalhe = error instanceof ApiError ? error.message : String(error);
-      toast.error(
-        detalhe.includes("SOMENTE_MARKETING")
-          ? "Modo Estudo é exclusivo de conta de marketing"
-          : `Não deu para mudar o Modo Estudo: ${detalhe}`,
-      );
-    },
-  });
   const liveMode = useMutation({
     mutationFn: (enabled: boolean) => robotLiveMode(enabled),
     onSuccess: (_data, enabled) => {
@@ -692,30 +671,6 @@ export function MarketingControlPanel({
               wins.
             </p>
           ) : null}
-          <button
-            type="button"
-            disabled={studyMode.isPending || (!liveOn && !studyOn)}
-            onClick={() => studyMode.mutate(!studyOn)}
-            aria-pressed={studyOn}
-            className={
-              "inline-flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold disabled:opacity-50 " +
-              (studyOn
-                ? "bg-amber-500 text-black hover:bg-amber-400"
-                : "border border-border text-muted-foreground hover:bg-accent hover:text-foreground")
-            }
-          >
-            {studyMode.isPending ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <FlaskConical className="h-4 w-4" />
-            )}
-            {studyOn ? "Modo Estudo ligado — desligar" : "Modo Estudo"}
-          </button>
-          <p className="text-[11px] leading-snug text-muted-foreground">
-            {liveOn
-              ? "Com o estudo ligado, a tela mantém o foco nos wins e na estratégia usada."
-              : "O Modo Estudo só funciona com o LIVE ligado."}
-          </p>
           <button
             type="button"
             onClick={() => setActiveTab("history")}

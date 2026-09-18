@@ -25,12 +25,13 @@ class LiveModeLossVisibilityTests(unittest.TestCase):
         trader = AutoTrader()
         state = trader.start("u-live")
         state.live_demo = True
+        state.wins, state.losses = 6, 1
         trader.record_trade("u-live", pending_trade("live-loss"))
 
         finalized, state = trader.finish_trade("u-live", "live-loss", "LOSS", -10.0)
 
         self.assertTrue(finalized)
-        self.assertEqual((state.wins, state.losses), (0, 0))
+        self.assertEqual((state.wins, state.losses), (6, 1))
         self.assertEqual(trader.history("u-live")["trades"], [])
         self.assertEqual(state.last_trade["result"], "LOSS")
 

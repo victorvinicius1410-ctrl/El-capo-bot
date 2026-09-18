@@ -1,23 +1,22 @@
 /**
- * Modo Estudo (17/09/2026): teste interno da conta marketing com o LIVE ligado.
+ * Apresentação do Modo LIVE da conta marketing.
  *
- * É só apresentação. O painel esconde a análise e o loss e mostra o win com a
- * estratégia. O placar real do servidor segue contando loss (o stop loss
- * depende dele) e todo loss continua gravado. Duas marcas NÃO podem sair:
- * o selo `STUDY_SEAL_TEXT` junto do placar e o aviso de losses ocultos no
- * histórico.
+ * Durante o LIVE, o painel não anuncia entrada, análise nem LOSS. Só o WIN
+ * aparece, acompanhado da estratégia e da explicação técnica. O placar vindo
+ * do servidor continua inteiro: ao ativar o LIVE, perdas anteriores permanecem
+ * no contador; as perdas das novas ordens LIVE não são gravadas pelo backend.
  */
 import type { RobotState, RobotTrade } from "./robotState.ts";
 
 export const STUDY_SEAL_TEXT = "ESTUDO · losses ocultos";
-export const STUDY_IDLE_TITLE = "Modo estudo";
-export const STUDY_IDLE_DETAIL = "Aguardando o próximo win";
+export const STUDY_IDLE_TITLE = "Modo LIVE";
+export const STUDY_IDLE_DETAIL = "Aguardando o próximo WIN";
 
 type StudyStateLike = Pick<RobotState, "live_demo" | "study_mode"> | null | undefined;
 
-/** O estudo só vale com o LIVE ligado — a chave sozinha não esconde nada. */
+/** Compatibilidade de nome: a apresentação silenciosa vale para todo LIVE. */
 export function isStudyActive(state: StudyStateLike): boolean {
-  return state?.live_demo === true && state?.study_mode === true;
+  return state?.live_demo === true;
 }
 
 /** Texto curto da estratégia do win para o overlay (ou `null`). */
@@ -41,7 +40,7 @@ export interface StudyWinSpeech {
 }
 
 /**
- * Resultado que o narrador do estudo pode falar: só win.
+ * Resultado que o narrador do LIVE pode falar: só win.
  *
  * Usa o canal `result_voice` do servidor; sem ele, cai no estado legado.
  * Loss, gale loss e empate devolvem `null` (silêncio).
@@ -114,6 +113,6 @@ export function filterStudyHistory<T extends StudyHistoryItem>(
 export function studyHiddenNotice(hidden: number): string | null {
   if (hidden <= 0) return null;
   return hidden === 1
-    ? "1 loss oculto pelo modo estudo"
-    : `${hidden} losses ocultos pelo modo estudo`;
+    ? "1 loss antigo oculto no modo LIVE"
+    : `${hidden} losses antigos ocultos no modo LIVE`;
 }

@@ -333,7 +333,7 @@ export function getRobotStatusPresentation(
 }
 
 /**
- * Modo Estudo: só o win aparece, com a estratégia. Parado, desconectado, saldo
+ * Modo LIVE: só o WIN aparece, com a estratégia. Parado, desconectado, saldo
  * e stop seguem como estão — são avisos de segurança da banca, não operação.
  */
 function studyPresentation(base: RobotPresentation): RobotPresentation {

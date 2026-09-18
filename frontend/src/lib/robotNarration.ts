@@ -141,8 +141,9 @@ export function buildRobotNarrationEvents(
     return events;
   }
 
-  // Modo Estudo: silêncio em análise, entrada, gale, rejeição e loss. Só o
-  // win é falado, com a estratégia. Stop e boas-vindas (acima) continuam.
+  // Modo LIVE: silêncio em análise, entrada, gale, rejeição e LOSS. Só o WIN
+  // é falado, com a estratégia e a explicação técnica. Stop e boas-vindas
+  // (acima) continuam.
   if (isStudyActive(state)) return studyNarrationEvents(state);
 
   if (includeOpeningVoiceover && startSequence > 0) {
@@ -289,7 +290,7 @@ export function buildRobotNarrationEvents(
   return dedupeEvents([...resultEvents, ...events]);
 }
 
-/** Fala do win no Modo Estudo: ativo, direção, estratégia e análise. */
+/** Fala do WIN no Modo LIVE: ativo, direção, estratégia e análise. */
 function studyNarrationEvents(state: RobotState): RobotNarrationEvent[] {
   const win = studyWinSpeech(state);
   if (!win) return [];
@@ -310,7 +311,9 @@ function studyNarrationEvents(state: RobotState): RobotNarrationEvent[] {
     });
     if (analise) parts.push(analise.trim());
   }
-  parts.push(`Placar: ${win.wins === 1 ? "1 win" : `${win.wins} wins`}.`);
+  const wins = win.wins === 1 ? "1 win" : `${win.wins} wins`;
+  const losses = win.losses === 1 ? "1 loss" : `${win.losses} losses`;
+  parts.push(`Placar: ${wins} e ${losses}.`);
   return [
     {
       key: resultEventKey(win.cycle, win.orderId, win.wins, win.losses),
