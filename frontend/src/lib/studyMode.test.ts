@@ -224,7 +224,7 @@ describe("histórico e placar do LIVE", () => {
       ["1", "4"],
     );
     assert.equal(filtered.hidden, 2);
-    assert.equal(studyHiddenNotice(filtered.hidden), "2 losses antigos ocultos no modo LIVE");
+    assert.equal(studyHiddenNotice(filtered.hidden), "2 losses antigos ocultos");
   });
 
   it("LIVE desligado devolve tudo", () => {

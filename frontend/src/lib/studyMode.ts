@@ -9,8 +9,10 @@
 import type { RobotState, RobotTrade } from "./robotState.ts";
 
 export const STUDY_SEAL_TEXT = "ESTUDO · losses ocultos";
-export const STUDY_IDLE_TITLE = "Modo LIVE";
-export const STUDY_IDLE_DETAIL = "Aguardando o próximo WIN";
+// Fora de um WIN, o LIVE preserva a comunicação visual normal do robô em vez
+// de revelar que está em modo de demonstração.
+export const STUDY_IDLE_TITLE = "El Capo está analisando o mercado";
+export const STUDY_IDLE_DETAIL = "Identificando uma oportunidade de operação lucrativa";
 
 type StudyStateLike = Pick<RobotState, "live_demo" | "study_mode"> | null | undefined;
 
@@ -113,6 +115,6 @@ export function filterStudyHistory<T extends StudyHistoryItem>(
 export function studyHiddenNotice(hidden: number): string | null {
   if (hidden <= 0) return null;
   return hidden === 1
-    ? "1 loss antigo oculto no modo LIVE"
-    : `${hidden} losses antigos ocultos no modo LIVE`;
+    ? "1 loss antigo oculto"
+    : `${hidden} losses antigos ocultos`;
 }
