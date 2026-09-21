@@ -39,10 +39,18 @@ import {
   type BillingPlanPayload,
 } from "@/lib/api";
 import {
+  BILLING_CYCLE_OPTIONS,
   CAKTO_ESSENTIAL_EVENTS,
+  CURRENCY_OPTIONS,
+  billingCycleLabel,
+  currencySymbol,
+  formatPriceInput,
   normalizeFinanceCollections,
   normalizeListPayload,
+  parsePriceInput,
+  slugifyPlanName,
   summarizeCaktoProduct,
+  uniquePlanSlug,
   validatePlanDraft,
   type PlanDraft,
 } from "@/lib/financePresentation";
@@ -358,7 +366,10 @@ function FinancePlans({ canManage }: { canManage: boolean }) {
               <strong className="text-lg">{formatMoney(plan.price, plan.currency)}</strong>
             </div>
             <p className="mt-3 text-xs text-muted-foreground">
-              {plan.billing_interval_months} mês(es) · ordem {plan.display_order} · {plan.slug}
+              {billingCycleLabel(plan.billing_interval_months) ||
+                `A cada ${plan.billing_interval_months} meses`}
+              {" · "}
+              {plan.cakto_offer_id ? `oferta ${plan.cakto_offer_id}` : "sem oferta na Cakto"}
             </p>
             <ul className="mt-4 space-y-2 text-sm">
               {plan.features.map((feature) => (
@@ -400,6 +411,9 @@ function FinancePlans({ canManage }: { canManage: boolean }) {
         <PlanDialog
           plan={editing === "create" ? null : editing}
           sharedProductId={productSummary.productId}
+          takenSlugs={(plans.data ?? [])
+            .filter((item) => editing === "create" || item.id !== editing.id)
+            .map((item) => item.slug)}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -414,11 +428,13 @@ function FinancePlans({ canManage }: { canManage: boolean }) {
 function PlanDialog({
   plan,
   sharedProductId,
+  takenSlugs,
   onClose,
   onSaved,
 }: {
   plan: BillingPlan | null;
   sharedProductId: string;
+  takenSlugs: string[];
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -473,6 +489,10 @@ function PlanDialog({
       }
       const normalizedDraft = {
         ...draft,
+        // Slug é opcional na tela: em branco, deriva do nome sem colidir.
+        slug:
+          draft.slug.trim() ||
+          uniquePlanSlug(slugifyPlanName(draft.name), takenSlugs),
         cakto_product_id: (draft.cakto_product_id || defaultProductId).trim(),
         features: featuresText
           .split("\n")
@@ -524,55 +544,44 @@ function PlanDialog({
           icon={BadgeDollarSign}
           step={1}
           title="Cobrança"
-          description="Defina como a oferta será identificada, cobrada e ordenada."
+          description="Nome que o cliente vê, quanto custa e de quanto em quanto tempo cobra."
         >
           <div className="grid gap-4 sm:grid-cols-2">
-            <PlanInput
-              label="Nome"
-              field="name"
-              draft={draft}
-              setDraft={setDraft}
-              error={errors.name}
-            />
-            <PlanInput
-              label="Slug"
-              field="slug"
-              draft={draft}
-              setDraft={setDraft}
-              error={errors.slug}
-            />
-            <PlanInput
-              label="Preço"
-              field="price"
-              type="number"
-              step="0.01"
-              draft={draft}
-              setDraft={setDraft}
+            <div className="sm:col-span-2">
+              <PlanInput
+                label="Nome do plano"
+                field="name"
+                placeholder="Plano Mensal"
+                draft={draft}
+                setDraft={setDraft}
+                error={errors.name}
+              />
+            </div>
+            <PriceField
+              value={draft.price}
+              currency={draft.currency}
+              onChange={(price) => setDraft((current) => ({ ...current, price }))}
               error={errors.price}
             />
-            <PlanInput
+            <SelectField
               label="Moeda"
-              field="currency"
-              draft={draft}
-              setDraft={setDraft}
+              value={draft.currency}
+              onChange={(currency) => setDraft((current) => ({ ...current, currency }))}
+              options={CURRENCY_OPTIONS.map((option) => ({
+                value: option.code,
+                label: option.label,
+              }))}
               error={errors.currency}
             />
-            <PlanInput
-              label="Ciclo em meses"
-              field="billing_interval_months"
-              type="number"
-              draft={draft}
-              setDraft={setDraft}
-              error={errors.billing_interval_months}
-            />
-            <PlanInput
-              label="Ordem de exibição"
-              field="display_order"
-              type="number"
-              draft={draft}
-              setDraft={setDraft}
-              error={errors.display_order}
-            />
+            <div className="sm:col-span-2">
+              <CycleField
+                months={draft.billing_interval_months}
+                onChange={(billing_interval_months) =>
+                  setDraft((current) => ({ ...current, billing_interval_months }))
+                }
+                error={errors.billing_interval_months}
+              />
+            </div>
           </div>
         </AdminFormSection>
 
@@ -680,6 +689,35 @@ function PlanDialog({
             </div>
           )}
         </AdminFormSection>
+
+        <details className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 sm:p-5">
+          <summary className="cursor-pointer select-none text-sm font-semibold text-slate-200">
+            Opções avançadas
+            <span className="ml-2 text-xs font-normal text-slate-400">
+              identificador e posição na lista — preenchidos sozinhos
+            </span>
+          </summary>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            <PlanInput
+              label="Identificador (slug)"
+              field="slug"
+              placeholder={slugifyPlanName(draft.name) || "gerado a partir do nome"}
+              hint="Deixe em branco para gerar a partir do nome."
+              draft={draft}
+              setDraft={setDraft}
+              error={errors.slug}
+            />
+            <PlanInput
+              label="Ordem de exibição"
+              field="display_order"
+              type="number"
+              hint="Menor número aparece primeiro na página de planos."
+              draft={draft}
+              setDraft={setDraft}
+              error={errors.display_order}
+            />
+          </div>
+        </details>
 
         {mutation.error ? <ErrorNotice error={mutation.error} /> : null}
         <AdminFormActions>
@@ -857,6 +895,8 @@ function PlanInput({
   type = "text",
   step,
   readOnly = false,
+  placeholder,
+  hint,
 }: {
   label: string;
   field: keyof PlanDraft;
@@ -866,6 +906,8 @@ function PlanInput({
   type?: string;
   step?: string;
   readOnly?: boolean;
+  placeholder?: string;
+  hint?: string;
 }) {
   const numeric = type === "number";
   return (
@@ -877,6 +919,7 @@ function PlanInput({
         type={type}
         step={step}
         readOnly={readOnly}
+        placeholder={placeholder}
         value={String(draft[field])}
         onChange={(event) =>
           setDraft((current) => ({
@@ -887,8 +930,181 @@ function PlanInput({
         aria-invalid={Boolean(error)}
         className={ADMIN_FIELD_CLASS}
       />
+      {error ? (
+        <span className="text-xs text-destructive">{error}</span>
+      ) : hint ? (
+        <span className="text-xs text-slate-400">{hint}</span>
+      ) : null}
+    </label>
+  );
+}
+
+/** Campo de preço com o símbolo da moeda e máscara local. */
+function PriceField({
+  value,
+  currency,
+  onChange,
+  error,
+}: {
+  value: number;
+  currency: string;
+  onChange: (value: number) => void;
+  error?: string;
+}) {
+  // Texto próprio para o usuário digitar "1.147,90" sem o campo reformatar a cada tecla.
+  const [text, setText] = useState(() => formatPriceInput(value, currency));
+  const [editing, setEditing] = useState(false);
+
+  useEffect(() => {
+    if (!editing) setText(formatPriceInput(value, currency));
+  }, [value, currency, editing]);
+
+  return (
+    <label className="grid gap-1.5 text-sm">
+      <span className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-300">
+        Preço
+      </span>
+      <div className="relative">
+        <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm font-semibold text-slate-400">
+          {currencySymbol(currency)}
+        </span>
+        <input
+          type="text"
+          inputMode="decimal"
+          value={text}
+          placeholder="0,00"
+          onFocus={() => setEditing(true)}
+          onChange={(event) => {
+            setText(event.target.value);
+            const parsed = parsePriceInput(event.target.value);
+            onChange(Number.isFinite(parsed) ? parsed : 0);
+          }}
+          onBlur={() => {
+            setEditing(false);
+            setText(formatPriceInput(value, currency));
+          }}
+          aria-invalid={Boolean(error)}
+          className={`${ADMIN_FIELD_CLASS} pl-11`}
+        />
+      </div>
       {error ? <span className="text-xs text-destructive">{error}</span> : null}
     </label>
+  );
+}
+
+/** Seletor simples reaproveitável no formulário de oferta. */
+function SelectField({
+  label,
+  value,
+  options,
+  onChange,
+  error,
+  hint,
+}: {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+  error?: string;
+  hint?: string;
+}) {
+  return (
+    <label className="grid gap-1.5 text-sm">
+      <span className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-300">
+        {label}
+      </span>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        aria-invalid={Boolean(error)}
+        className={ADMIN_FIELD_CLASS}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      {error ? (
+        <span className="text-xs text-destructive">{error}</span>
+      ) : hint ? (
+        <span className="text-xs text-slate-400">{hint}</span>
+      ) : null}
+    </label>
+  );
+}
+
+/** Ciclo de cobrança por atalho, com escape para um número de meses livre. */
+function CycleField({
+  months,
+  onChange,
+  error,
+}: {
+  months: number;
+  onChange: (months: number) => void;
+  error?: string;
+}) {
+  const preset = billingCycleLabel(months);
+  const [custom, setCustom] = useState(!preset);
+
+  return (
+    <div className="grid gap-1.5 text-sm">
+      <span className="text-xs font-semibold uppercase tracking-[0.08em] text-slate-300">
+        Cobrança a cada
+      </span>
+      <div className="flex flex-wrap gap-2">
+        {BILLING_CYCLE_OPTIONS.map((option) => {
+          const selected = !custom && months === option.months;
+          return (
+            <button
+              key={option.months}
+              type="button"
+              aria-pressed={selected}
+              onClick={() => {
+                setCustom(false);
+                onChange(option.months);
+              }}
+              className={`rounded-xl border px-4 py-2 text-sm font-medium transition ${
+                selected
+                  ? "border-cyan-300/60 bg-cyan-400/15 text-cyan-100"
+                  : "border-slate-600/70 bg-slate-800/70 text-slate-300 hover:border-slate-500 hover:text-white"
+              }`}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          aria-pressed={custom}
+          onClick={() => setCustom(true)}
+          className={`rounded-xl border px-4 py-2 text-sm font-medium transition ${
+            custom
+              ? "border-cyan-300/60 bg-cyan-400/15 text-cyan-100"
+              : "border-slate-600/70 bg-slate-800/70 text-slate-300 hover:border-slate-500 hover:text-white"
+          }`}
+        >
+          Outro
+        </button>
+      </div>
+      {custom ? (
+        <div className="mt-1 flex items-center gap-2">
+          <input
+            type="number"
+            min={1}
+            value={months}
+            onChange={(event) => onChange(Number(event.target.value))}
+            aria-label="Meses entre as cobranças"
+            aria-invalid={Boolean(error)}
+            className={`${ADMIN_FIELD_CLASS} w-28`}
+          />
+          <span className="text-sm text-slate-400">
+            {months === 1 ? "mês" : "meses"} entre as cobranças
+          </span>
+        </div>
+      ) : null}
+      {error ? <span className="text-xs text-destructive">{error}</span> : null}
+    </div>
   );
 }
 

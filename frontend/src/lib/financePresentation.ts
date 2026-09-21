@@ -13,6 +13,81 @@ export const CAKTO_ESSENTIAL_EVENTS = [
 
 export interface PlanDraft extends Omit<BillingPlan, "id"> {}
 
+/** Moedas aceitas pelo backend (hoje só BRL: ONLY_BRL_SUPPORTED). */
+export const CURRENCY_OPTIONS = [
+  { code: "BRL", label: "Real brasileiro (R$)", symbol: "R$", locale: "pt-BR" },
+] as const;
+
+/** Ciclos de cobrança oferecidos como atalho no formulário. */
+export const BILLING_CYCLE_OPTIONS = [
+  { months: 1, label: "Mensal" },
+  { months: 3, label: "Trimestral" },
+  { months: 6, label: "Semestral" },
+  { months: 12, label: "Anual" },
+] as const;
+
+/** Símbolo da moeda escolhida, com fallback para o código. */
+export function currencySymbol(code: string): string {
+  return CURRENCY_OPTIONS.find((option) => option.code === code)?.symbol ?? code;
+}
+
+/** Nome do ciclo quando ele é um dos atalhos; vazio quando é personalizado. */
+export function billingCycleLabel(months: number): string {
+  return BILLING_CYCLE_OPTIONS.find((option) => option.months === months)?.label ?? "";
+}
+
+/**
+ * Deriva um slug válido a partir do nome do plano.
+ *
+ * Remove acentos, troca o que não for letra ou número por hífen e corta as
+ * pontas. Devolve string vazia quando o nome não tem nenhum caractere útil.
+ */
+export function slugifyPlanName(name: string): string {
+  return name
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Garante um slug livre, acrescentando sufixo numérico quando já existe.
+ *
+ * O backend recusa slug repetido (PLAN_SLUG_ALREADY_EXISTS); como o campo
+ * passou a ser opcional na tela, a desambiguação acontece aqui.
+ */
+export function uniquePlanSlug(base: string, taken: Iterable<string>): string {
+  const used = new Set([...taken].map((value) => value.trim().toLowerCase()));
+  const seed = base || "plano";
+  if (!used.has(seed)) return seed;
+  let suffix = 2;
+  while (used.has(`${seed}-${suffix}`)) suffix += 1;
+  return `${seed}-${suffix}`;
+}
+
+/**
+ * Lê um preço digitado com máscara brasileira.
+ *
+ * Aceita "1.147,90", "1147,90" e "1147.90". Devolve NaN quando não há dígito,
+ * para o campo poder ficar vazio enquanto o usuário digita.
+ */
+export function parsePriceInput(value: string): number {
+  const cleaned = value.replace(/[^\d,.-]/g, "");
+  if (!/\d/.test(cleaned)) return Number.NaN;
+  const normalized = cleaned.includes(",")
+    ? cleaned.replace(/\./g, "").replace(",", ".")
+    : cleaned;
+  return Number(normalized);
+}
+
+/** Formata o preço para o campo, no padrão da moeda escolhida. */
+export function formatPriceInput(value: number, currency = "BRL"): string {
+  if (!Number.isFinite(value)) return "";
+  const locale = CURRENCY_OPTIONS.find((option) => option.code === currency)?.locale ?? "pt-BR";
+  return value.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 /** Calcula o desconto de uma oferta contra o preço mensal de referência. */
 export function planDiscountPercent(price: number, months: number, monthlyReference: number): number {
   if (months <= 1 || price < 0 || monthlyReference <= 0) return 0;
@@ -45,7 +120,13 @@ export function validatePlanDraft(
   if (!draft.name.trim()) errors.name = "Informe o nome do plano.";
   if (!draft.description.trim()) errors.description = "Informe a descrição do plano.";
   if (!draft.features.some((feature) => feature.trim())) errors.features = "Informe pelo menos um benefício.";
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(draft.slug)) errors.slug = "Use letras minúsculas, números e hífens.";
+  // Slug é opcional na tela: quando fica em branco o formulário deriva do nome.
+  if (draft.slug.trim() && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(draft.slug.trim())) {
+    errors.slug = "Use letras minúsculas, números e hífens.";
+  }
+  if (!draft.slug.trim() && !slugifyPlanName(draft.name)) {
+    errors.name = "Informe um nome com letras ou números.";
+  }
   if (!Number.isFinite(draft.price) || draft.price < 0) errors.price = "Informe um preço válido.";
   if (draft.price > 0 && draft.price < 5) errors.price = "O preço mínimo na Cakto é R$ 5,00.";
   if (!Number.isInteger(draft.billing_interval_months) || draft.billing_interval_months < 1) {
