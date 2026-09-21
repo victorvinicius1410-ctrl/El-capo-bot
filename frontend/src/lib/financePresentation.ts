@@ -26,6 +26,73 @@ export const BILLING_CYCLE_OPTIONS = [
   { months: 12, label: "Anual" },
 ] as const;
 
+/** Texto sugerido para um plano, conforme o tempo que ele cobre. */
+export interface PlanCopy {
+  description: string;
+  features: string[];
+}
+
+const BASE_FEATURES = [
+  "Robô liberado sem limite de operações",
+  "Análise e execução automáticas",
+  "Stop win e stop loss configuráveis",
+  "Painel no computador e no celular",
+  "Suporte no WhatsApp",
+];
+
+const COPY_BY_CYCLE: Record<number, PlanCopy> = {
+  1: {
+    description:
+      "Acesso completo ao robô, renovando mês a mês. Para quem quer começar sem compromisso longo.",
+    features: BASE_FEATURES,
+  },
+  3: {
+    description:
+      "Três meses corridos com o preço travado — tempo de sobra para o robô rodar em mercados diferentes.",
+    features: [
+      "Tudo do plano mensal",
+      "3 meses corridos sem renovar todo mês",
+      "Histórico completo do trimestre no painel",
+      "Prioridade no suporte",
+    ],
+  },
+  6: {
+    description:
+      "Meio ano de acesso com preço garantido e economia real sobre o mensal.",
+    features: [
+      "Tudo do plano trimestral",
+      "6 meses de preço garantido",
+      "Economia real sobre o mensal",
+      "Prioridade no suporte",
+    ],
+  },
+  12: {
+    description: "Um ano inteiro de robô pelo melhor preço por mês da tabela.",
+    features: [
+      "Tudo do plano trimestral",
+      "Melhor preço por mês da tabela",
+      "Um ano inteiro sem se preocupar com renovação",
+      "Todas as atualizações do robô incluídas",
+    ],
+  },
+};
+
+/**
+ * Sugere descrição e benefícios a partir do ciclo de cobrança.
+ *
+ * Os ciclos conhecidos têm texto próprio; qualquer outro número de meses cai
+ * num texto montado na hora, para o campo nunca nascer vazio.
+ */
+export function planCopyForCycle(months: number): PlanCopy {
+  const known = COPY_BY_CYCLE[months];
+  if (known) return { description: known.description, features: [...known.features] };
+  const safeMonths = Math.max(1, Math.round(months) || 1);
+  return {
+    description: `Acesso completo ao robô por ${safeMonths} meses, sem renovar no meio do caminho.`,
+    features: [...BASE_FEATURES, `${safeMonths} meses corridos sem renovar`],
+  };
+}
+
 /** Símbolo da moeda escolhida, com fallback para o código. */
 export function currencySymbol(code: string): string {
   return CURRENCY_OPTIONS.find((option) => option.code === code)?.symbol ?? code;

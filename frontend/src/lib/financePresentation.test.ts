@@ -6,6 +6,7 @@ import {
   currencySymbol,
   formatPriceInput,
   parsePriceInput,
+  planCopyForCycle,
   slugifyPlanName,
   uniquePlanSlug,
   validatePlanDraft,
@@ -63,6 +64,32 @@ test("preço volta formatado com duas casas", () => {
   assert.equal(formatPriceInput(1147.9), "1.147,90");
   assert.equal(formatPriceInput(97), "97,00");
   assert.equal(formatPriceInput(Number.NaN), "");
+});
+
+test("cada ciclo sugere um texto diferente", () => {
+  const mensal = planCopyForCycle(1);
+  const trimestral = planCopyForCycle(3);
+  const anual = planCopyForCycle(12);
+  const descricoes = new Set([mensal, trimestral, planCopyForCycle(6), anual].map((c) => c.description));
+  assert.equal(descricoes.size, 4, "descrições não podem se repetir entre ciclos");
+  for (const copy of [mensal, trimestral, anual]) {
+    assert.ok(copy.description.length > 20);
+    assert.ok(copy.features.length >= 4);
+  }
+  assert.notDeepEqual(mensal.features, anual.features);
+});
+
+test("ciclo fora do padrão ainda recebe texto", () => {
+  const copy = planCopyForCycle(7);
+  assert.match(copy.description, /7 meses/);
+  assert.ok(copy.features.some((feature) => feature.includes("7 meses")));
+  assert.match(planCopyForCycle(0).description, /1 meses|1 mês/);
+});
+
+test("a sugestão é uma cópia, não a lista interna", () => {
+  const primeira = planCopyForCycle(1);
+  primeira.features.push("editado à mão");
+  assert.equal(planCopyForCycle(1).features.includes("editado à mão"), false);
 });
 
 test("moeda e ciclo têm rótulo legível", () => {

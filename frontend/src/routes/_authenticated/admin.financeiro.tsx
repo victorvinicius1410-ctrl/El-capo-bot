@@ -11,6 +11,7 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Wallet,
 } from "lucide-react";
@@ -48,6 +49,7 @@ import {
   normalizeFinanceCollections,
   normalizeListPayload,
   parsePriceInput,
+  planCopyForCycle,
   slugifyPlanName,
   summarizeCaktoProduct,
   uniquePlanSlug,
@@ -453,11 +455,12 @@ function PlanDialog({
   const [draft, setDraft] = useState<PlanDraft>({
     name: plan?.name ?? "",
     slug: plan?.slug ?? "",
-    description: plan?.description ?? "",
+    // Oferta nova nasce com o texto sugerido do ciclo padrão, nunca em branco.
+    description: plan?.description ?? planCopyForCycle(1).description,
     price: plan?.price ?? 0,
     currency: plan?.currency ?? "BRL",
     billing_interval_months: plan?.billing_interval_months ?? 1,
-    features: plan?.features ?? [],
+    features: plan?.features ?? planCopyForCycle(1).features,
     cakto_product_id: plan?.cakto_product_id ?? defaultProductId,
     cakto_offer_id: plan?.cakto_offer_id ?? "",
     checkout_url: plan?.checkout_url ?? "",
@@ -467,6 +470,16 @@ function PlanDialog({
   });
   const [featuresText, setFeaturesText] = useState(draft.features.join("\n"));
   const [errors, setErrors] = useState<Partial<Record<keyof PlanDraft, string>>>({});
+  // Enquanto o texto não for tocado à mão, ele acompanha o ciclo escolhido.
+  // Plano já existente nasce "tocado": o que o dono escreveu não se mexe sozinho.
+  const [copyTouched, setCopyTouched] = useState(Boolean(plan));
+
+  /** Escreve a sugestão do ciclo na descrição e nos benefícios. */
+  function applyCycleCopy(months: number) {
+    const copy = planCopyForCycle(months);
+    setDraft((current) => ({ ...current, description: copy.description }));
+    setFeaturesText(copy.features.join("\n"));
+  }
 
   useEffect(() => {
     if (plan || !defaultProductId) return;
@@ -576,9 +589,10 @@ function PlanDialog({
             <div className="sm:col-span-2">
               <CycleField
                 months={draft.billing_interval_months}
-                onChange={(billing_interval_months) =>
-                  setDraft((current) => ({ ...current, billing_interval_months }))
-                }
+                onChange={(billing_interval_months) => {
+                  setDraft((current) => ({ ...current, billing_interval_months }));
+                  if (!copyTouched) applyCycleCopy(billing_interval_months);
+                }}
                 error={errors.billing_interval_months}
               />
             </div>
@@ -589,19 +603,46 @@ function PlanDialog({
           icon={ListChecks}
           step={2}
           title="Apresentação"
-          description="Escreva uma proposta clara e os benefícios que o cliente verá."
+          description="Sugerimos um texto conforme o tempo do plano. Edite à vontade — o que você escrever fica."
         >
+          <div className="mb-4 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => {
+                applyCycleCopy(draft.billing_interval_months);
+                setCopyTouched(false);
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-cyan-300/40 bg-cyan-400/10 px-3 py-2 text-xs font-semibold text-cyan-100 transition hover:bg-cyan-400/20"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              Usar o texto sugerido
+              {billingCycleLabel(draft.billing_interval_months)
+                ? ` (${billingCycleLabel(draft.billing_interval_months).toLowerCase()})`
+                : ""}
+            </button>
+            <span className="text-xs text-slate-400">
+              {copyTouched
+                ? "Texto editado por você — não muda mais sozinho."
+                : "Acompanhando o tempo do plano."}
+            </span>
+          </div>
           <div className="grid gap-4">
             <PlanTextArea
               label="Descrição"
               value={draft.description}
-              onChange={(description) => setDraft((current) => ({ ...current, description }))}
+              onChange={(description) => {
+                setCopyTouched(true);
+                setDraft((current) => ({ ...current, description }));
+              }}
               error={errors.description}
             />
             <PlanTextArea
               label="Benefícios (um por linha)"
               value={featuresText}
-              onChange={setFeaturesText}
+              onChange={(value) => {
+                setCopyTouched(true);
+                setFeaturesText(value);
+              }}
               error={errors.features}
             />
           </div>
