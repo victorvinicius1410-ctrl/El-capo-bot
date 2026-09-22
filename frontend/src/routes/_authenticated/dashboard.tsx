@@ -31,6 +31,7 @@ import {
   isBullExDisconnected,
 } from "@/lib/bullexConnection";
 import { useBullExLoginState } from "@/lib/bullexLoginState";
+import { maskMoney, usePrivacyMode } from "@/lib/privacyMode";
 import { aggregateDashboardDailyRows, filterHistoryByRange } from "@/lib/dashboardDailyStats";
 import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
 import { useAuth } from "@/lib/useAuth";
@@ -49,6 +50,7 @@ function Dashboard() {
   const { account, accountStatus, robotState } = useLiveTradingData();
   const history = useRobotHistory(days);
   const loginFlow = useBullExLoginState(user?.id);
+  const privacyOn = usePrivacyMode();
   const acc = account.data;
   const syncing = account.isLoading || accountStatus.isLoading || robotState.isLoading;
   const cachedGrace = robotState.data?.connection_status_source === "cached_grace";
@@ -179,15 +181,15 @@ function Dashboard() {
       <section className="dash-summary">
         <SummaryTile
           label="Saldo"
-          value={isLoading ? "-" : formatBullExBalance(realBalance, currency)}
+          value={isLoading ? "-" : maskMoney(formatBullExBalance(realBalance, currency), privacyOn)}
           Icon={Wallet}
           accent
         />
         <SummaryTile label="Moeda" value={currency} Icon={Coins} accent />
         <SummaryTile
           label="Resultado do período"
-          value={formatMoney(periodResult)}
-          tone={periodResult < 0 ? "negative" : "positive"}
+          value={maskMoney(formatMoney(periodResult), privacyOn)}
+          tone={privacyOn ? undefined : periodResult < 0 ? "negative" : "positive"}
         />
         <SummaryTile label="Wins" value={String(periodWins)} tone="positive" />
         <SummaryTile label="Loss" value={String(periodLosses)} tone="negative" />
@@ -249,10 +251,14 @@ function Dashboard() {
                       <div className="font-medium">{row.dateLabel}</div>
                       <div
                         className={`text-sm font-semibold ${
-                          row.result < 0 ? "text-destructive" : "text-primary"
+                          privacyOn
+                            ? "text-muted-foreground"
+                            : row.result < 0
+                              ? "text-destructive"
+                              : "text-primary"
                         }`}
                       >
-                        {formatMoney(row.result)}
+                        {maskMoney(formatMoney(row.result), privacyOn)}
                       </div>
                     </TableCell>
                     <TableCell className="font-semibold text-primary">{row.wins}</TableCell>

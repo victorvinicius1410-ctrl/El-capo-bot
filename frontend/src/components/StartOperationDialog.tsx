@@ -13,6 +13,7 @@ import {
 import { ApiError, apiConfig, robotConfig, robotStart } from "@/lib/api";
 import { ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
 import { entryValueBalanceError, formatBullExBalance } from "@/lib/bullexConnection";
+import { maskMoney, usePrivacyMode } from "@/lib/privacyMode";
 import {
   DEFAULT_ROBOT_SETTINGS,
   ENTRY_VALUE_STEP,
@@ -148,6 +149,7 @@ export function StartOperationDialog({
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const ignoreOutsideUntilRef = useRef(0);
+  const privacyOn = usePrivacyMode();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const hasSavedConfig = useMemo(() => Boolean(userId && hasLastOperationConfig(userId)), [userId, open]);
   const balanceError = useMemo(
@@ -329,7 +331,8 @@ export function StartOperationDialog({
             Escolha o timeframe e o tipo de mercado. A IA monitora o mercado o tempo todo e só
             entra quando identifica um padrão das estratégias (Price Action, Psicologia de velas e
             Padrões de vela), respeitando a janela de compra do timeframe (M1/M5/M15). Valores
-            seguem a moeda da conta conectada ({formatBullExBalance(accountBalance, accountCurrency)}).
+            seguem a moeda da conta conectada (
+            {maskMoney(formatBullExBalance(accountBalance, accountCurrency), privacyOn)}).
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">

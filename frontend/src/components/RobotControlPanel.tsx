@@ -11,6 +11,7 @@ import { useLiveTradingData, applyRobotMutationToCache } from "@/hooks/useLiveTr
 import { useRobotSettings } from "@/hooks/useRobotSettings";
 import { robotStart, robotStop } from "@/lib/api";
 import { entryValueBalanceError, formatBullExBalance, isBullExConnected } from "@/lib/bullexConnection";
+import { maskMoney, usePrivacyMode } from "@/lib/privacyMode";
 import { isRobotOperationRunning } from "@/lib/robotState";
 import { useAuth } from "@/lib/useAuth";
 import { useQueryClient } from "@tanstack/react-query";
@@ -56,6 +57,7 @@ export function RobotControlPanel() {
   const connected = isBullExConnected({ account: account.data, accountStatus: accountStatus.data });
   const currency = account.data?.currency ?? null;
   const balance = account.data?.balance ?? null;
+  const privacyOn = usePrivacyMode();
   const entryLimits = entryLimitsForCurrency(currency);
   const balanceError = useMemo(
     () => entryValueBalanceError(balance, settings.entryValue),
@@ -186,7 +188,7 @@ export function RobotControlPanel() {
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Defina aqui o que o robô usa na corretora: timeframe, mercado, valores e gale.
-            Saldo conectado: {formatBullExBalance(balance, currency)}.
+            Saldo conectado: {maskMoney(formatBullExBalance(balance, currency), privacyOn)}.
           </p>
         </div>
         <span>{running ? "Em operação" : "Parado"}</span>

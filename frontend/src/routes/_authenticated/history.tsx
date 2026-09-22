@@ -50,6 +50,7 @@ import { useAuth } from "@/lib/useAuth";
 import { computeRobotStatsFromItems, filterHistoryByRange } from "@/lib/dashboardDailyStats";
 import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
+import { maskMoney, usePrivacyMode } from "@/lib/privacyMode";
 import { filterStudyHistory, isStudyActive, studyHiddenNotice } from "@/lib/studyMode";
 
 export const Route = createFileRoute("/_authenticated/history")({
@@ -65,6 +66,9 @@ function HistoryPage() {
   const [analysisItem, setAnalysisItem] = useState<RobotHistoryItem | null>(null);
   const history = useRobotHistory(days);
   const { robotState } = useLiveTradingData();
+  // Modo privacidade (olho do robô): esconde só os valores; o resultado
+  // WIN/LOSS da operação continua na tabela.
+  const privacyOn = usePrivacyMode();
   // Modo Estudo: esconde os losses do estudo enquanto ele estiver ligado, e o
   // aviso abaixo diz quantos. Desligou, a lista volta inteira.
   const study = filterStudyHistory(
@@ -165,9 +169,9 @@ function HistoryPage() {
         <StatCard label="Total Trades" value={String(stats.totalTrades)} Icon={ListChecks} />
         <StatCard
           label="Lucro Total"
-          value={formatMoney(stats.profit)}
+          value={maskMoney(formatMoney(stats.profit), privacyOn)}
           Icon={CircleDollarSign}
-          tone={stats.profit < 0 ? "negative" : "positive"}
+          tone={privacyOn ? undefined : stats.profit < 0 ? "negative" : "positive"}
         />
         <StatCard
           label="Profit Factor"
@@ -218,6 +222,7 @@ function HistoryPage() {
                 <HistoryRow
                   key={item.id}
                   item={item}
+                  hideMoney={privacyOn}
                   canDelete={canDeleteMarketing}
                   deleting={deleteTrade.isPending}
                   onOpenAnalysis={() => setAnalysisItem(item)}
@@ -283,12 +288,15 @@ function StatCard({
 
 function HistoryRow({
   item,
+  hideMoney,
   canDelete,
   deleting,
   onDelete,
   onOpenAnalysis,
 }: {
   item: RobotHistoryItem;
+  /** Modo privacidade: valor e lucro viram máscara. */
+  hideMoney: boolean;
   canDelete: boolean;
   deleting: boolean;
   onDelete: () => void;
@@ -350,14 +358,16 @@ function HistoryRow({
           <span className="text-xs text-muted-foreground">-</span>
         )}
       </TableCell>
-      <TableCell>{formatMoney(item.amount)}</TableCell>
+      <TableCell>{maskMoney(formatMoney(item.amount), hideMoney)}</TableCell>
       <TableCell>
         <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ${resultClass}`}>
           {isDraw ? "EMPATE" : item.result}
         </span>
       </TableCell>
-      <TableCell className={`font-semibold ${isWin ? "text-primary" : "text-muted-foreground"}`}>
-        {formatMoney(item.profit)}
+      <TableCell
+        className={`font-semibold ${hideMoney ? "text-muted-foreground" : isWin ? "text-primary" : "text-muted-foreground"}`}
+      >
+        {maskMoney(formatMoney(item.profit), hideMoney)}
       </TableCell>
       <TableCell>
         <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ${galeClass}`}>

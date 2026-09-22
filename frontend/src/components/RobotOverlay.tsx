@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type TouchEvent as ReactTouchEvent, type TouchList } from "react";
-import { RotateCcw, Settings, Volume2, VolumeX, X } from "lucide-react";
+import { Eye, EyeOff, RotateCcw, Settings, Volume2, VolumeX, X } from "lucide-react";
 import { toast } from "sonner";
 import { MoneyInput } from "./MoneyInput";
 import { RobotAvatarVideo } from "./RobotAvatarVideo";
@@ -18,6 +18,7 @@ import {
   getRobotStatusPresentation,
   type RobotPresentation,
 } from "@/lib/robotPresentation";
+import { PRIVACY_MASK, privacyToggleLabel, togglePrivacyMode, usePrivacyMode } from "@/lib/privacyMode";
 import { isStudyActive } from "@/lib/studyMode";
 import {
   DEFAULT_ROBOT_SETTINGS,
@@ -128,6 +129,9 @@ export function RobotOverlay({
   // LIVE: sem balão de entrada e sem resultado LOSS; o contador prévio de
   // losses permanece visível e congelado.
   const study = isStudyActive(robotState);
+  // Modo privacidade: o olho esconde dinheiro (saldo e resultado) em todo o
+  // painel; placar, WIN e LOSS continuam à mostra.
+  const privacyOn = usePrivacyMode();
   const display = buildOverlayDisplay(robotState, presentation, now, study);
   const locked = isRobotLocked(robotState);
   // Só pending_signal = entrada travada. best_candidate/last_signal na análise
@@ -395,6 +399,23 @@ export function RobotOverlay({
             type="button"
             onClick={(event) => {
               event.stopPropagation();
+              togglePrivacyMode();
+            }}
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-full border border-border bg-card text-foreground transition hover:bg-accent"
+            title={
+              privacyOn
+                ? "Valores escondidos — clique para mostrar saldo e resultado"
+                : "Clique para esconder saldo e resultado"
+            }
+            aria-label={privacyToggleLabel(privacyOn)}
+            aria-pressed={privacyOn}
+          >
+            {privacyOn ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </button>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
               onSilenceNarrator?.();
             }}
             disabled={!narratorEnabled || !onSilenceNarrator}
@@ -561,7 +582,9 @@ export function RobotOverlay({
             </div>
           </div>
         ) : null}
-        {study ? null : <ProfitBadge profit={scoreProfit} currency={account?.currency} />}
+        {study ? null : (
+          <ProfitBadge profit={scoreProfit} currency={account?.currency} hidden={privacyOn} />
+        )}
         {!adminModelControls && (onStartOperation || onStopOperation || onResetScore) ? (
           <div
             className="z-10 mt-1 flex flex-col items-center gap-1.5"
@@ -615,7 +638,11 @@ export function RobotOverlay({
           {account?.connected ? (
             <p className="mb-1 text-[11px] font-semibold sm:text-xs">
               {account.mode ?? "-"}
-              {account.balance != null ? ` | ${formatBullExBalance(account.balance, account.currency)}` : ""}
+              {privacyOn
+                ? ` | ${PRIVACY_MASK}`
+                : account.balance != null
+                  ? ` | ${formatBullExBalance(account.balance, account.currency)}`
+                  : ""}
             </p>
           ) : null}
           <p className={`whitespace-normal break-words text-[13px] font-bold leading-snug sm:text-base ${display.tone}`}>
@@ -1005,19 +1032,28 @@ function ScoreBadge({ label, value, tone }: { label: string; value: number; tone
   );
 }
 
-function ProfitBadge({ profit, currency }: { profit?: number | null; currency?: string | null }) {
-  const tone = profitTone(profit);
+function ProfitBadge({
+  profit,
+  currency,
+  hidden = false,
+}: {
+  profit?: number | null;
+  currency?: string | null;
+  /** Modo privacidade: mostra a máscara e não deixa o tom entregar o sinal. */
+  hidden?: boolean;
+}) {
+  const tone = hidden ? "neutral" : profitTone(profit);
   const toneClass =
     tone === "positive"
       ? "text-emerald-400 [text-shadow:0_0_10px_rgba(52,211,153,0.55),0_2px_4px_#03070a]"
       : tone === "negative"
         ? "text-rose-400 [text-shadow:0_0_10px_rgba(251,113,133,0.45),0_2px_4px_#03070a]"
         : "text-foreground/90 [text-shadow:0_2px_4px_#03070a]";
-  const formatted = formatProfitAmount(profit, currency);
+  const formatted = hidden ? PRIVACY_MASK : formatProfitAmount(profit, currency);
   return (
     <div
       className="mt-0.5 flex flex-col items-center rounded-xl border border-border/60 bg-[#0a1216]/85 px-3 py-1.5 shadow-[0_4px_14px_rgba(0,0,0,0.3)]"
-      aria-label={`Resultado financeiro: ${formatted}`}
+      aria-label={hidden ? "Resultado financeiro escondido" : `Resultado financeiro: ${formatted}`}
     >
       <span className="text-[9px] font-semibold uppercase tracking-[0.28em] text-muted-foreground/90 sm:text-[10px]">
         Resultado
