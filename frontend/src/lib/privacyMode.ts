@@ -1,16 +1,16 @@
 /**
- * Modo privacidade: esconde dinheiro da tela sem mexer na operação.
+ * Modo privacidade: esconde o saldo da conta sem mexer na operação.
  *
- * Ligado pelo ícone de olho do robô flutuante, vale para o painel inteiro
- * (saldo, resultado financeiro, valor de entrada e lucro do histórico). O que
- * some é só o número — WIN, LOSS, placar, estratégia e horários continuam
- * visíveis. A escolha fica no navegador; nada vai para o servidor.
+ * Ligado pelo ícone de olho do robô flutuante, vale só para o saldo mostrado
+ * na linha de baixo do robô. Resultado financeiro, placar, WIN, LOSS e o resto
+ * do painel continuam visíveis. A escolha fica no navegador; nada vai para o
+ * servidor.
  */
 import { useSyncExternalStore } from "react";
 
 const STORAGE_KEY = "elcapo.privacyMode";
 
-/** Texto que substitui qualquer valor escondido. */
+/** Texto que substitui o valor escondido. */
 export const PRIVACY_MASK = "••••";
 
 const listeners = new Set<() => void>();
@@ -68,7 +68,7 @@ export function usePrivacyMode(): boolean {
 /**
  * Troca um valor já formatado pela máscara quando o modo está ligado.
  *
- * Recebe texto pronto (e não o número) para que cada tela continue dona da
+ * Recebe texto pronto (e não o número) para que quem exibe continue dono da
  * própria formatação de moeda.
  */
 export function maskMoney(formatted: string, privacyOn: boolean): string {
@@ -77,5 +77,5 @@ export function maskMoney(formatted: string, privacyOn: boolean): string {
 
 /** Rótulo do botão de olho, igual no título e no leitor de tela. */
 export function privacyToggleLabel(privacyOn: boolean): string {
-  return privacyOn ? "Mostrar valores" : "Esconder valores";
+  return privacyOn ? "Mostrar saldo" : "Esconder saldo";
 }

@@ -50,7 +50,7 @@ describe("maskMoney", () => {
 
 describe("privacyToggleLabel", () => {
   it("diz a ação que o clique faz", () => {
-    assert.equal(privacyToggleLabel(false), "Esconder valores");
-    assert.equal(privacyToggleLabel(true), "Mostrar valores");
+    assert.equal(privacyToggleLabel(false), "Esconder saldo");
+    assert.equal(privacyToggleLabel(true), "Mostrar saldo");
   });
 });

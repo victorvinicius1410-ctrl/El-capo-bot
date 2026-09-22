@@ -20,7 +20,6 @@ import {
   isBullExConnected,
   isBullExStatusBackoff,
 } from "@/lib/bullexConnection";
-import { maskMoney, usePrivacyMode } from "@/lib/privacyMode";
 
 /**
  * Painel de conexão Bullex nas Configurações.
@@ -35,7 +34,6 @@ export function BullexConnectionPanel() {
   const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const privacyOn = usePrivacyMode();
   const cachedGrace = robotState.data?.connection_status_source === "cached_grace";
   const statusBackoff = isBullExStatusBackoff(accountStatus.data);
   // Conta "fantasma": pill Conectado sem email/saldo (cache/grace pós-deploy).
@@ -54,10 +52,7 @@ export function BullexConnectionPanel() {
     metricsMissing &&
     (account.isLoading || account.isFetching || statusBackoff);
   const email = account.data?.email?.trim() || "—";
-  const balance = maskMoney(
-    formatBullExBalance(account.data?.balance, account.data?.currency),
-    privacyOn,
-  );
+  const balance = formatBullExBalance(account.data?.balance, account.data?.currency);
   const mode =
     account.data?.mode === "REAL" || account.data?.mode === "PRACTICE"
       ? account.data.mode
