@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getStoppedRobotState, mergeRobotSessionScore, preserveRobotSessionScore } from "./robotState.ts";
+import {
+  getStoppedRobotState,
+  mergeRobotSessionScore,
+  preserveRobotSessionScore,
+  SESSION_SCORE_RESET_GUARD_MS,
+} from "./robotState.ts";
 
 describe("preserveRobotSessionScore", () => {
   it("mantém o placar da sessão quando start/stop chega zerado", () => {
@@ -86,6 +91,7 @@ describe("preserveRobotSessionScore", () => {
   });
 
   it("não deixa snapshot atrasado desfazer o Reiniciar placar", () => {
+    const resetAt = Date.parse("2026-08-15T19:00:00+00:00");
     const previous = {
       ...getStoppedRobotState(),
       wins: 0,
@@ -100,11 +106,37 @@ describe("preserveRobotSessionScore", () => {
       profit: 55,
       stop_reset_at: "2026-08-15T12:00:00+00:00",
     };
-    const merged = preserveRobotSessionScore(previous, incoming);
+    const merged = preserveRobotSessionScore(previous, incoming, { now: resetAt + 10_000 });
     assert.equal(merged.wins, 0);
     assert.equal(merged.losses, 0);
     assert.equal(merged.profit, 0);
     assert.equal(merged.stop_reset_at, previous.stop_reset_at);
+  });
+
+  it("passada a janela do reset, o placar do servidor volta a valer", () => {
+    // Sem prazo, o painel guardava o `stop_reset_at` mais novo e recusava
+    // TODO placar recebido depois: o cliente via 0x0 até apertar F5.
+    const resetAt = Date.parse("2026-08-15T19:00:00+00:00");
+    const previous = {
+      ...getStoppedRobotState(),
+      wins: 0,
+      losses: 0,
+      profit: 0,
+      stop_reset_at: "2026-08-15T19:00:00+00:00",
+    };
+    const incoming = {
+      ...getStoppedRobotState(),
+      wins: 3,
+      losses: 1,
+      profit: 12.5,
+      stop_reset_at: "2026-08-15T12:00:00+00:00",
+    };
+    const merged = preserveRobotSessionScore(previous, incoming, {
+      now: resetAt + SESSION_SCORE_RESET_GUARD_MS + 1,
+    });
+    assert.equal(merged.wins, 3);
+    assert.equal(merged.losses, 1);
+    assert.equal(merged.profit, 12.5);
   });
 
   it("grava o placar gerado no Shift+O por cima do 0-0 do overlay", () => {

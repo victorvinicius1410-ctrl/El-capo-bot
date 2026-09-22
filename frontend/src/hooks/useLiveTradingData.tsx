@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   useQuery,
   useQueryClient,
@@ -204,25 +204,35 @@ function useRobotStateQuery(
   isDocumentVisible: boolean,
 ): UseQueryResult<RobotState, Error> {
   const queryClient = useQueryClient();
+  // `robotStateWsLive` é variável de módulo: mudá-la não avisa o React Query,
+  // que só reprograma o `refetchInterval` quando as opções são reavaliadas.
+  // Sem este estado, o poll HTTP continuava parado depois da queda do WS e o
+  // painel só voltava a atualizar no F5.
+  const [wsLive, setWsLive] = useState(false);
+
+  const markWsLive = useCallback((live: boolean) => {
+    setRobotStateWsLive(live);
+    setWsLive(live);
+  }, []);
 
   useEffect(() => {
     if (!userId || !isDocumentVisible) {
-      setRobotStateWsLive(false);
+      markWsLive(false);
       return;
     }
     const disconnect = connectRobotStateWs({
-      onOpen: () => setRobotStateWsLive(true),
-      onClose: () => setRobotStateWsLive(false),
-      onError: () => setRobotStateWsLive(false),
+      onOpen: () => markWsLive(true),
+      onClose: () => markWsLive(false),
+      onError: () => markWsLive(false),
       onState: (data) => {
         commitRobotStateToCache(queryClient, userId, normalizeRobotState(data));
       },
     });
     return () => {
       disconnect();
-      setRobotStateWsLive(false);
+      markWsLive(false);
     };
-  }, [isDocumentVisible, queryClient, userId]);
+  }, [isDocumentVisible, markWsLive, queryClient, userId]);
 
   return useQuery({
     queryKey: [...ROBOT_STATE_QUERY_KEY, userId],
@@ -260,7 +270,9 @@ function useRobotStateQuery(
     },
     enabled: Boolean(userId),
     refetchInterval: (query) =>
-      isDocumentVisible ? robotStateRefetchInterval(query.state.data, userId) : false,
+      isDocumentVisible
+        ? robotStateRefetchInterval(query.state.data, userId, Date.now(), wsLive)
+        : false,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
     retry: 1,

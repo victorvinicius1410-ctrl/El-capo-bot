@@ -6,9 +6,48 @@ um ponto ao parar** (ex.: 10x12 → 9x12), **regredia no start/stop**
 (ex.: 5x3 → 2x0) ou **não baixava ao excluir** operação marketing do
 histórico.
 
-Atualizado em **2026-08-26**.
+Atualizado em **2026-09-22**.
 
 Espelho detalhado: [`Frontend/docs/PLACAR_OVERLAY.md`](../frontend/docs/PLACAR_OVERLAY.md).
+
+## Correção (2026-09-22) — placar zerado até apertar F5
+
+### Sintoma
+
+Entrar no painel e ver **0 x 0** com o robô tendo resultado do dia; o El Capo
+até narra o resultado, mas o placar não anda. **Recarregar a tela mostra o
+placar certo** — ou seja, o servidor sempre teve o número: quem estava preso
+era o painel.
+
+### Causas (as duas no cliente)
+
+| # | Onde | O que acontecia |
+|---|------|-----------------|
+| 1 | `robotStateRefetchInterval` | Com o WS conectado o poll HTTP era **desligado** (`return false`). Se o socket vira zumbi (fica `OPEN` e para de entregar, sem evento de `close` — rede móvel, proxy, suspensão), nada mais atualiza o painel. Pior: `robotStateWsLive` é variável de módulo, então a queda do WS **não** reprogramava o intervalo do React Query — o poll seguia parado mesmo depois do `onclose`. |
+| 2 | `preserveRobotSessionScore` | A trava do "Reiniciar placar" (placar em branco + `stop_reset_at` mais novo que o do snapshot) **não tinha prazo** e ainda regravava o `stop_reset_at` novo no estado exibido: a condição se auto-alimentava e TODO placar recebido depois era descartado até o F5. É o mesmo defeito que o backend tirou do `reconcile_session_score_on_gateway` em 15/09 (`PLACAR_DIAGNOSTICO_2026-09-15.md` §F1) — a cópia do painel tinha ficado para trás. |
+
+### Correção
+
+| Camada | Mudança |
+|--------|---------|
+| `robotStateWsUrl.ts` | `ROBOT_WS_STALE_AFTER_MS` (2 pings + folga = 45s) e `robotStateWsIsStale()` |
+| `robotStateWs.ts` | Watchdog: toda mensagem (inclusive o `pong` do ping) marca sinal de vida; socket calado além da janela é derrubado, avisa `onClose` e reconecta |
+| `robotState.ts` | Com WS vivo o HTTP não para mais: reconciliação a cada `ROBOT_STATE_WS_RECONCILE_POLL_MS` (60s). Backoff de erro continua tendo precedência |
+| `robotState.ts` | Trava do reset passa a valer só pela janela `SESSION_SCORE_RESET_GUARD_MS` (120s, mesmo TTL da marca `robot:score_authority` do backend) |
+| `useLiveTradingData.tsx` | `wsLive` também em estado React: a queda do WS reprograma o `refetchInterval` na hora |
+
+Testes: `robotState.poll.test.ts`, `robotStateWs.test.ts`, `robotSessionScore.test.ts`
+(260 testes do front, 0 falhas).
+
+### O que NÃO foi tocado
+
+O backend. O caminho de leitura do gateway (`enrich_robot_snapshot_session_score`
+→ maior placar entre Redis, memória e DB) está correto e foi conferido contra
+produção em 22/09: Redis e `robot_states` batem para todos os clientes com
+sessão viva. Fica pendente a visibilidade: o gateway roda em nível **WARNING**,
+e as linhas que explicam a decisão do placar (`[SCORE_SNAPSHOT_ENRICHED]`,
+`[SCORE_RECONCILED_ON_GATEWAY]`, `[ROBOT_SCORE_RESET]`) são `logger.info` — não
+aparecem em produção, o que impede provar o caminho de um incidente pelo log.
 
 ## Correção (2026-08-26) — excluir histórico marketing não baixava o placar
 

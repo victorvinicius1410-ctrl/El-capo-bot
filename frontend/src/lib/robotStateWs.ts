@@ -12,10 +12,18 @@ import { apiConfig, apiRequest } from "./api.ts";
 import {
   ROBOT_WS_FALLBACK_POLL_MS,
   ROBOT_WS_PING_INTERVAL_MS,
+  ROBOT_WS_STALE_AFTER_MS,
+  robotStateWsIsStale,
   robotStateWsUrl as buildRobotStateWsUrl,
 } from "./robotStateWsUrl.ts";
 
-export { ROBOT_WS_FALLBACK_POLL_MS, ROBOT_WS_PING_INTERVAL_MS, buildRobotStateWsUrl as robotStateWsUrl };
+export {
+  ROBOT_WS_FALLBACK_POLL_MS,
+  ROBOT_WS_PING_INTERVAL_MS,
+  ROBOT_WS_STALE_AFTER_MS,
+  robotStateWsIsStale,
+  buildRobotStateWsUrl as robotStateWsUrl,
+};
 
 export type RobotStateWsHandlers = {
   onState: (data: Record<string, unknown>) => void;
@@ -47,7 +55,9 @@ export function connectRobotStateWs(handlers: RobotStateWsHandlers): () => void 
   let closed = false;
   let socket: WebSocket | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let watchdogTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastMessageAt = 0;
   let attempt = 0;
 
   const clearTimers = () => {
@@ -55,10 +65,39 @@ export function connectRobotStateWs(handlers: RobotStateWsHandlers): () => void 
       clearInterval(pingTimer);
       pingTimer = null;
     }
+    if (watchdogTimer != null) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = null;
+    }
     if (reconnectTimer != null) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+  };
+
+  /**
+   * Derruba socket zumbi: OPEN, mas sem entregar nada (nem o `pong` do ping).
+   *
+   * Sem isto o painel ficava dependendo de um canal morto — o `onclose` nunca
+   * chega, o poll HTTP segue pausado e o placar congela no último valor até o
+   * F5. Avisa `onClose` na hora (é o que religa o poll) e reconecta.
+   */
+  const dropStaleSocket = () => {
+    if (closed || socket == null) return;
+    const dead = socket;
+    socket = null;
+    dead.onopen = null;
+    dead.onmessage = null;
+    dead.onerror = null;
+    dead.onclose = null;
+    try {
+      dead.close(4000);
+    } catch {
+      // socket já inutilizável: só os timers importam a partir daqui
+    }
+    clearTimers();
+    handlers.onClose?.();
+    scheduleReconnect();
   };
 
   const scheduleReconnect = () => {
@@ -80,14 +119,20 @@ export function connectRobotStateWs(handlers: RobotStateWsHandlers): () => void 
       socket = new WebSocket(url);
       socket.onopen = () => {
         attempt = 0;
+        lastMessageAt = Date.now();
         handlers.onOpen?.();
         pingTimer = setInterval(() => {
           if (socket?.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "ping" }));
           }
         }, ROBOT_WS_PING_INTERVAL_MS);
+        watchdogTimer = setInterval(() => {
+          if (robotStateWsIsStale(lastMessageAt)) dropStaleSocket();
+        }, ROBOT_WS_PING_INTERVAL_MS);
       };
       socket.onmessage = (event) => {
+        // Qualquer mensagem (inclusive o `pong`) conta como sinal de vida.
+        lastMessageAt = Date.now();
         try {
           const message = JSON.parse(String(event.data)) as {
             type?: string;

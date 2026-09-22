@@ -687,6 +687,22 @@ function sessionScoreTotal(state: Pick<RobotState, "wins" | "losses">): number {
 }
 
 /**
+ * Janela em que o "Reiniciar placar" do painel manda sobre snapshot atrasado.
+ *
+ * Mesmo prazo da marca de baixa intencional do backend
+ * (`robot:score_authority`, 120s): passado isso, quem tem a palavra final é o
+ * servidor — o painel não pode ficar recusando placar para sempre.
+ */
+export const SESSION_SCORE_RESET_GUARD_MS = 120_000;
+
+function sessionScoreResetIsRecent(value: string | null | undefined, now: number): boolean {
+  const resetAt = scoreResetAtMs(value);
+  if (resetAt <= 0) return false;
+  // Relógio do cliente atrasado deixa `now - resetAt` negativo: ainda é recente.
+  return now - resetAt <= SESSION_SCORE_RESET_GUARD_MS;
+}
+
+/**
  * Evita o overlay piscar 0-0 (ou “outro placar”) quando start/stop/refetch
  * aplica um snapshot de controle sem o placar da sessão.
  *
@@ -696,7 +712,13 @@ function sessionScoreTotal(state: Pick<RobotState, "wins" | "losses">): number {
  * placar vivo até o WS do runtime republicar os números.
  *
  * Depois de **Reiniciar placar**, um snapshot Redis/WS atrasado (ainda com
- * 10x12) não pode desfazer o 0-0: compara `stop_reset_at`.
+ * 10x12) não pode desfazer o 0-0: compara `stop_reset_at`. Essa trava vale
+ * só pela JANELA do reset (`SESSION_SCORE_RESET_GUARD_MS`): sem prazo ela se
+ * auto-alimentava — o estado exibido guardava o `stop_reset_at` mais novo, e
+ * TODO placar recebido depois (inclusive o WIN novo) era descartado até o F5.
+ * É o mesmo defeito que o backend tirou do `reconcile_session_score_on_gateway`
+ * em 15/09 (ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F1); a cópia do painel
+ * ficou para trás.
  *
  * A regra "nunca rebaixa" é o oposto do certo quando a queda foi PEDIDA
  * (exclusão no Shift+O / no Histórico). Quem sabe disso é
@@ -710,6 +732,7 @@ function sessionScoreTotal(state: Pick<RobotState, "wins" | "losses">): number {
  *   (exclusão) e o placar menor do servidor deve valer, inclusive 0-0
  * @param options.forceScorePreserve - True quando o snapshot recebido é a
  *   réplica atrasada repetindo o placar de antes da exclusão
+ * @param options.now - Relógio (injetável no teste) para medir a janela do reset
  * @returns Estado com placar da sessão preservado quando o novo vem em branco
  *   ou claramente atrasado em relação ao exibido
  */
@@ -720,6 +743,7 @@ export function preserveRobotSessionScore(
     allowBlankOverwrite?: boolean;
     allowScoreDecrease?: boolean;
     forceScorePreserve?: boolean;
+    now?: number;
   },
 ): RobotState {
   if (options?.allowBlankOverwrite || !previous) return incoming;
@@ -743,7 +767,8 @@ export function preserveRobotSessionScore(
   if (
     sessionScoreIsBlank(previous) &&
     sessionScoreHasValue(incoming) &&
-    scoreResetAtMs(previous.stop_reset_at) > scoreResetAtMs(incoming.stop_reset_at)
+    scoreResetAtMs(previous.stop_reset_at) > scoreResetAtMs(incoming.stop_reset_at) &&
+    sessionScoreResetIsRecent(previous.stop_reset_at, options?.now ?? Date.now())
   ) {
     return {
       ...incoming,
@@ -898,7 +923,17 @@ export function getStoppedRobotState(disconnected = false): RobotState {
 export const ROBOT_STATE_FAST_POLL_MS = 30_000;
 /** Poll lento idle (mesmo patamar do fallback WS). */
 export const ROBOT_STATE_SLOW_POLL_MS = 30_000;
-/** True quando o WS está conectado — o refetchInterval do RQ deve pausar. */
+/**
+ * Reconciliação HTTP mesmo com o WS vivo.
+ *
+ * Pausar o poll por completo deixava o painel dependente de um canal só: se o
+ * socket vira zumbi (fica OPEN e para de entregar, sem evento de close), o
+ * placar congela no último valor recebido — 0-0, se o usuário entrou logo
+ * depois de um reset — e só volta no F5. Um GET a cada 60s custa pouco e
+ * garante que o placar do servidor sempre alcança a tela.
+ */
+export const ROBOT_STATE_WS_RECONCILE_POLL_MS = 60_000;
+/** True quando o WS está conectado — o refetchInterval do RQ afrouxa. */
 export let robotStateWsLive = false;
 
 /** Marca se o push WS está ativo (pausa poll HTTP). */
@@ -934,12 +969,13 @@ export function robotStateRefetchInterval(
   now = Date.now(),
   wsLive = robotStateWsLive,
 ): number | false {
-  // Com WS vivo o HTTP vira só reconciliação ocasional (desligado aqui).
-  if (wsLive) return false;
   if (userId) {
     const entry = backoffEntry(userId);
     if (entry.backoffUntil > now) return entry.backoffUntil - now;
   }
+  // Com WS vivo o HTTP vira só reconciliação ocasional — nunca desligado: ver
+  // ROBOT_STATE_WS_RECONCILE_POLL_MS.
+  if (wsLive) return ROBOT_STATE_WS_RECONCILE_POLL_MS;
   const status = state?.status?.toUpperCase();
   const active =
     state?.operation_in_progress === true ||
