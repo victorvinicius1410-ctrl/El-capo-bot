@@ -241,24 +241,24 @@ def resolve_robot_stop_reason(
     *,
     wins: int | None = None,
     losses: int | None = None,
-    gross_profit: float | None = None,
-    gross_loss: float | None = None,
+    net_profit: float | None = None,
     profit: float | None = None,
 ) -> str | None:
     """
     Decide se o robô deve pausar por Stop Win ou Stop Loss.
 
-    Stop Loss tem prioridade sobre Stop Win. No modo ``money`` usa totais
-    brutos (quando informados) ou o ``profit`` líquido da sessão. No modo
-    ``operations`` usa a quantidade de WINs/LOSSes do placar.
+    Stop Loss tem prioridade sobre Stop Win. No modo ``money`` usa o resultado
+    **líquido** — o dinheiro que entrou ou saiu da conta, com os WINs abatendo
+    os LOSSes. No modo ``operations`` usa a quantidade de WINs/LOSSes do placar.
 
     Args:
         state: Estado do robô (``RobotState`` ou objeto compatível).
         wins: Contagem de vitórias a considerar (default: ``state.wins``).
         losses: Contagem de derrotas a considerar (default: ``state.losses``).
-        gross_profit: Lucro bruto acumulado (modo money).
-        gross_loss: Perda bruta acumulada (modo money).
-        profit: P/L líquido da sessão (fallback do modo money).
+        net_profit: Resultado líquido do dia já limpo de Shift+O e recortado
+            por ``stop_reset_at`` (``management_totals`` /
+            ``build_management_summary``). Tem prioridade sobre ``profit``.
+        profit: P/L líquido da sessão (placar exibido, ainda com Shift+O).
 
     Returns:
         ``STOP_WIN_HIT``, ``STOP_LOSS_HIT`` ou ``None``.
@@ -273,30 +273,37 @@ def resolve_robot_stop_reason(
     current_wins = max(0, current_wins - int(getattr(state, "stop_offset_wins", 0) or 0))
     current_losses = max(0, current_losses - int(getattr(state, "stop_offset_losses", 0) or 0))
     session_profit -= float(getattr(state, "stop_offset_profit", 0) or 0)
+    # `net_profit` já vem sem a linha do Shift+O e já recortado por
+    # `stop_reset_at`; descontar o offset de novo tiraria o mesmo dinheiro
+    # duas vezes.
+    if net_profit is not None:
+        session_profit = float(net_profit)
 
     if loss_mode == "operations":
         ops = max(0, int(getattr(state, "stop_loss_operations", 0) or 0))
         if ops > 0 and current_losses >= ops:
             return STATUS_STOP_LOSS_HIT
     else:
+        # Resultado LÍQUIDO: Stop Loss de R$30 para quando o dia estiver em
+        # -R$30 na conta. Antes somava só as ordens perdedoras e ignorava os
+        # WINs — em 21/09/2026 um cliente com Stop Loss R$20 foi parado com o
+        # dia em -R$9,03 (perdas R$21, ganhos R$11,97) e, como o placar
+        # continuava violando o stop, cada clique em Iniciar voltava 409.
         stop_loss = float(getattr(state, "stop_loss", 0) or 0)
-        if stop_loss > 0:
-            if gross_loss is not None and float(gross_loss) >= stop_loss:
-                return STATUS_STOP_LOSS_HIT
-            if gross_loss is None and session_profit <= -stop_loss:
-                return STATUS_STOP_LOSS_HIT
+        if stop_loss > 0 and session_profit <= -stop_loss:
+            return STATUS_STOP_LOSS_HIT
 
     if win_mode == "operations":
         ops = max(0, int(getattr(state, "stop_win_operations", 0) or 0))
         if ops > 0 and current_wins >= ops:
             return STATUS_STOP_WIN_HIT
     else:
+        # Mesma regra do outro lado: Stop Win de R$20 é R$20 de lucro de
+        # verdade. Pelo bruto, quem tivesse ganho R$20 e perdido R$18 levava
+        # "Stop Win atingido" com R$2 no bolso.
         stop_win = float(getattr(state, "stop_win", 0) or 0)
-        if stop_win > 0:
-            if gross_profit is not None and float(gross_profit) >= stop_win:
-                return STATUS_STOP_WIN_HIT
-            if gross_profit is None and session_profit >= stop_win:
-                return STATUS_STOP_WIN_HIT
+        if stop_win > 0 and session_profit >= stop_win:
+            return STATUS_STOP_WIN_HIT
 
     return None
 
@@ -3065,8 +3072,7 @@ class AutoTrader:
             resolve_robot_stop_reason(
                 state,
                 losses=projected_losses,
-                gross_profit=projected_totals["gross_profit"],
-                gross_loss=projected_totals["gross_loss"],
+                net_profit=projected_totals["net_profit"],
             )
             == STATUS_STOP_LOSS_HIT
         )
@@ -3185,8 +3191,7 @@ class AutoTrader:
             management_totals = self.management_totals(user_id)
             stop_reason = resolve_robot_stop_reason(
                 state,
-                gross_profit=management_totals["gross_profit"],
-                gross_loss=management_totals["gross_loss"],
+                net_profit=management_totals["net_profit"],
             )
             if stop_reason in {STATUS_STOP_WIN_HIT, STATUS_STOP_LOSS_HIT}:
                 state = self.pause_by_stop(user_id, stop_reason)

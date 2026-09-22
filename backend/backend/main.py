@@ -7128,8 +7128,7 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
         state,
         wins=int(getattr(state, "wins", 0) or 0),
         losses=int(getattr(state, "losses", 0) or 0),
-        gross_profit=gross_profit,
-        gross_loss=gross_loss,
+        net_profit=net_profit,
     )
 
     return {
@@ -7155,6 +7154,52 @@ def daily_stop_reason(user_id: str, state: Any) -> str | None:
     if summary["stop_reason"] == STATUS_STOP_WIN_HIT:
         return "STOP_WIN_HIT"
     return None
+
+
+def build_stop_hit_start_block(user_id: str, state: Any, reason: str) -> JSONResponse:
+    """409 do Iniciar com o stop já batido, dizendo QUAL stop e com que números.
+
+    Até 21/09/2026 este caminho devolvia ``RESET_CYCLE_REQUIRED`` seco e **sem
+    uma linha de log**: 39 das 68 recusas do dia eram invisíveis, e o cliente
+    só via um erro genérico (um deles clicou 4 vezes em 5 minutos). Agora o
+    payload carrega o motivo e o resumo de gestão para o painel dizer o que
+    aconteceu e as duas saídas — aumentar o limite nas configurações da
+    operação, ou Reiniciar placar.
+
+    Args:
+        user_id: Cliente autenticado.
+        state: Estado do robô no gateway.
+        reason: ``STOP_WIN_HIT`` ou ``STOP_LOSS_HIT``.
+
+    Returns:
+        Resposta 409 com ``error=RESET_CYCLE_REQUIRED`` e ``data`` explicando.
+    """
+    summary = build_management_summary(user_id, state)
+    logger.warning(
+        "[ROBOT_START_BLOCKED_STOP_HIT] user_id=%s reason=%s win_mode=%s loss_mode=%s "
+        "stop_win=%s stop_loss=%s stop_win_operations=%s stop_loss_operations=%s "
+        "wins=%s losses=%s net_profit=%s reset_at=%s",
+        user_id,
+        reason,
+        summary["stop_win_mode"],
+        summary["stop_loss_mode"],
+        summary["stop_win"],
+        summary["stop_loss"],
+        summary["stop_win_operations"],
+        summary["stop_loss_operations"],
+        getattr(state, "wins", 0),
+        getattr(state, "losses", 0),
+        summary["net_profit"],
+        summary["reset_at"],
+    )
+    payload = build_error("RESET_CYCLE_REQUIRED")
+    payload["data"] = {
+        "stop_reason": reason,
+        "wins": int(getattr(state, "wins", 0) or 0),
+        "losses": int(getattr(state, "losses", 0) or 0),
+        "management": summary,
+    }
+    return json_response(409, payload)
 
 
 def asset_cooldown_reason(user_id: str, symbol: str) -> str | None:
@@ -9205,8 +9250,20 @@ def reconcile_gateway_enabled_from_runtime_snapshot(user_id: str, state: Any) ->
     state.losses = preferred[1]
     state.profit = preferred[2]
 
-    if is_stop_status(remote_status):
-        state = auto_trader.pause_by_stop(user_id, remote_status)
+    # O runtime desliga por stop e publica no MESMO snapshot o status de
+    # exibição do resultado (`LOSS`/`WIN`). Sem consultar o placar, o gateway
+    # caía no `else` e gravava `STOPPED`: o motivo do stop se perdia e o painel
+    # dizia só "parado", sem o cliente saber que precisava mexer no limite ou
+    # reiniciar o placar. Visto 6 vezes em 21/09/2026 (`remote_status=LOSS`).
+    effective_stop = remote_status if is_stop_status(remote_status) else (
+        resolve_robot_stop_reason(
+            state,
+            profit=float(getattr(state, "profit", 0) or 0),
+        )
+        or ""
+    )
+    if is_stop_status(effective_stop):
+        state = auto_trader.pause_by_stop(user_id, effective_stop)
     else:
         state.enabled = False
         state.operation_in_progress = False
@@ -9220,10 +9277,11 @@ def reconcile_gateway_enabled_from_runtime_snapshot(user_id: str, state: Any) ->
 
     logger.warning(
         "[GATEWAY_ENABLED_RECONCILED_FROM_RUNTIME] user_id=%s previous_status=%s "
-        "remote_status=%s wins=%s losses=%s",
+        "remote_status=%s resolved_status=%s wins=%s losses=%s",
         user_id,
         previous_status or None,
         remote_status or None,
+        getattr(state, "status", None),
         getattr(state, "wins", None),
         getattr(state, "losses", None),
     )
@@ -16239,9 +16297,13 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
             state.last_order_error = None
             persist_robot(user_id)
         else:
-            return json_response(409, build_error("RESET_CYCLE_REQUIRED"))
+            return build_stop_hit_start_block(user_id, state, still_blocked)
     elif session_stop is not None or history_stop is not None:
-        return json_response(409, build_error("RESET_CYCLE_REQUIRED"))
+        return build_stop_hit_start_block(
+            user_id,
+            state,
+            session_stop or history_stop or STATUS_STOP_LOSS_HIT,
+        )
     if fresh_robot_connection(state) and state.connected and state.active_mode is not None:
         connected = True
         active_mode = state.active_mode

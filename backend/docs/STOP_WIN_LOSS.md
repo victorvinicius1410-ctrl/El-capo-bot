@@ -10,7 +10,7 @@ stop pode ser configurado de **duas formas**:
 
 | Modo | Stop Win | Stop Loss |
 |---|---|---|
-| **Por valor** (`money`) | Para quando o lucro bruto da sessão ≥ valor em R$ | Para quando a perda bruta da sessão ≥ valor em R$ |
+| **Por valor** (`money`) | Para quando o **resultado líquido** do dia ≥ valor em R$ | Para quando o **resultado líquido** do dia ≤ −valor em R$ |
 | **Por operações** (`operations`) | Para quando o placar de **WIN** ≥ quantidade | Para quando o placar de **LOSS** ≥ quantidade |
 
 O botão **Config** do overlay do robô foi removido: a configuração operacional
@@ -39,10 +39,19 @@ conservador).
 
 ### Modo `money`
 
-- Usa lucro/perda brutos do dia desde o último `stop_reset_at`
-  (`management_totals` / `build_management_summary`), igual ao comportamento
-  anterior.
+- Usa o **resultado líquido** do dia desde o último `stop_reset_at`
+  (`management_totals["net_profit"]` / `build_management_summary`): os WINs
+  abatem os LOSSes, que é o número que o painel mostra. Passa em
+  `resolve_robot_stop_reason(net_profit=...)`.
 - Em `robot_stop_reason` (checagem rápida no ciclo): `state.profit` da sessão.
+
+> **Mudou em 2026-09-21.** Até aqui o modo `money` somava **só as ordens
+> perdedoras** (`gross_loss`) contra o Stop Loss, e só as ganhadoras contra o
+> Stop Win. Um cliente com Stop Loss de R$ 20 foi parado com o dia em
+> **−R$ 9,03** (perdas R$ 21,00, ganhos R$ 11,97) — e, como o placar seguia
+> violando o stop, cada clique em Iniciar Operação voltava `409`
+> (4 cliques em 5 minutos no mesmo cliente). Nesse dia **68 das 250** chamadas
+> de `POST /robot/start` responderam 409.
 
 ### Modo `operations`
 
@@ -72,8 +81,15 @@ configurações.". Corrigido por
 2. Clique em **Iniciar Operação** (overlay) ou **Iniciar robô**
    (Configurações) de novo.
 
-Sem o passo 1, `POST /robot/start` responde `409 RESET_CYCLE_REQUIRED`
-(enquanto o placar ainda viola o stop). Se o placar já estiver zerado mas o
+Ou, em vez do passo 1, **aumentar o limite** em Iniciar Operação → Stop Win /
+Stop Loss: com o novo valor o placar deixa de violar o stop e o start libera
+sozinho. O placar **não** é zerado automaticamente em nenhum caminho — só o
+cliente zera.
+
+Sem uma das duas saídas, `POST /robot/start` responde `409 RESET_CYCLE_REQUIRED`
+(enquanto o placar ainda viola o stop). Desde 21/09/2026 a recusa traz
+`data.stop_reason` (`STOP_WIN_HIT`/`STOP_LOSS_HIT`) + `data.management`, e sai
+no log como `[ROBOT_START_BLOCKED_STOP_HIT]` — antes era muda. Se o placar já estiver zerado mas o
 status `STOP_*` ficou órfão, o start limpa o status sozinho
 (`[STOP_STATUS_CLEARED_ON_START]`).
 
@@ -127,6 +143,12 @@ modo correspondente é `money`.
 
 ## Histórico
 
+- **2026-09-21 (stop por valor = resultado líquido)** — `resolve_robot_stop_reason`
+  troca `gross_profit`/`gross_loss` por `net_profit`. Recusa do start passa a
+  logar `[ROBOT_START_BLOCKED_STOP_HIT]` e a devolver o motivo no payload;
+  `reconcile_gateway_enabled_from_runtime_snapshot` deixa de gravar `STOPPED`
+  por cima de um stop real quando o runtime publica `status=LOSS`/`WIN` no
+  mesmo snapshot em que desliga.
 - **2026-08-13 (reiniciar placar em mode=external)** — Snapshot Redis + cmd
   `reset_score` ao runtime + cache do painel; evita placar “voltar” após
   o clique. Ver `REINICIAR_PLACAR.md`.

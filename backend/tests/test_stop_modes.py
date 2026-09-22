@@ -27,17 +27,29 @@ class NormalizeStopModeTests(unittest.TestCase):
 
 
 class ResolveRobotStopReasonTests(unittest.TestCase):
-    def test_money_mode_uses_gross_totals(self) -> None:
+    def test_money_mode_uses_net_result(self) -> None:
         state = RobotState(stop_win=50, stop_loss=30, stop_win_mode="money", stop_loss_mode="money")
-        self.assertEqual(
-            resolve_robot_stop_reason(state, gross_profit=50, gross_loss=0),
-            STATUS_STOP_WIN_HIT,
-        )
-        self.assertEqual(
-            resolve_robot_stop_reason(state, gross_profit=10, gross_loss=30),
-            STATUS_STOP_LOSS_HIT,
-        )
-        self.assertIsNone(resolve_robot_stop_reason(state, gross_profit=10, gross_loss=10))
+        self.assertEqual(resolve_robot_stop_reason(state, net_profit=50), STATUS_STOP_WIN_HIT)
+        self.assertEqual(resolve_robot_stop_reason(state, net_profit=-30), STATUS_STOP_LOSS_HIT)
+        self.assertIsNone(resolve_robot_stop_reason(state, net_profit=-29.99))
+        self.assertIsNone(resolve_robot_stop_reason(state, net_profit=49.99))
+
+    def test_money_mode_ignores_wins_and_losses_that_se_anulam(self) -> None:
+        """Caso real de 21/09/2026: Stop Loss R$20, perdas R$21, ganhos R$11,97.
+
+        O dia fechou em -R$9,03 — longe do limite — e o robô parava assim
+        mesmo, porque a conta somava só as ordens perdedoras.
+        """
+        state = RobotState(stop_win=15, stop_loss=20, stop_win_mode="money", stop_loss_mode="money")
+        self.assertIsNone(resolve_robot_stop_reason(state, net_profit=11.97 - 21.0))
+        # E continua parando quando o prejuízo líquido chega no limite.
+        self.assertEqual(resolve_robot_stop_reason(state, net_profit=-20.0), STATUS_STOP_LOSS_HIT)
+
+    def test_money_mode_net_profit_ignores_stop_offset(self) -> None:
+        """`net_profit` já vem sem Shift+O: não pode descontar o offset de novo."""
+        state = RobotState(stop_win=50, stop_loss=30, stop_win_mode="money", stop_loss_mode="money")
+        state.stop_offset_profit = 500.0
+        self.assertEqual(resolve_robot_stop_reason(state, net_profit=-30), STATUS_STOP_LOSS_HIT)
 
     def test_operations_mode_uses_wins_and_losses(self) -> None:
         state = RobotState(
@@ -80,7 +92,7 @@ class ResolveRobotStopReasonTests(unittest.TestCase):
             profit=5,
         )
         self.assertEqual(
-            resolve_robot_stop_reason(state, gross_profit=5, gross_loss=0),
+            resolve_robot_stop_reason(state, net_profit=5),
             STATUS_STOP_LOSS_HIT,
         )
 

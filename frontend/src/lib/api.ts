@@ -332,11 +332,11 @@ const KNOWN_ERROR_MESSAGES: Record<string, string> = {
   INSUFFICIENT_FUNDS:
     "Saldo insuficiente para a entrada. Deposite na BullEx ou reduza o valor da entrada.",
   RESET_CYCLE_REQUIRED:
-    "Stop Win ou Stop Loss atingido. Clique em Reiniciar placar e depois em Iniciar Operação.",
+    "Stop Win ou Stop Loss já foi atingido. Para operar de novo, aumente o limite em Iniciar Operação → Gestão, ou clique em Reiniciar placar.",
   STOP_WIN_HIT:
-    "Stop Win atingido. Clique em Reiniciar placar para liberar uma nova operação.",
+    "Stop Win já foi atingido. Para operar de novo, aumente o Stop Win em Iniciar Operação, ou clique em Reiniciar placar.",
   STOP_LOSS_HIT:
-    "Stop Loss atingido. Clique em Reiniciar placar para liberar uma nova operação.",
+    "Stop Loss já foi atingido. Para operar de novo, aumente o Stop Loss em Iniciar Operação, ou clique em Reiniciar placar.",
   ACCESS_INACTIVE:
     "Seu acesso está inativo ou aguardando aprovação. Regularize no Financeiro ou aguarde a liberação.",
   SIMULATED_TRADE_NOT_FOUND:
@@ -441,7 +441,16 @@ export async function apiRequest<T = unknown>(
       : undefined;
     if (body.ok === false || !response.ok) {
       if (response.status === 401) clearSessionIdentityCache();
-      const code = errorMessage(body.code ?? nested?.code ?? body.error, "") || undefined;
+      let code = errorMessage(body.code ?? nested?.code ?? body.error, "") || undefined;
+      // RESET_CYCLE_REQUIRED vem com `data.stop_reason` desde 21/09/2026: usar
+      // o motivo real diz ao cliente QUAL stop bateu em vez de "um dos dois".
+      const stopReason =
+        typeof body.data === "object" && body.data
+          ? (body.data as Record<string, unknown>).stop_reason
+          : undefined;
+      if (code === "RESET_CYCLE_REQUIRED" && typeof stopReason === "string" && stopReason) {
+        code = stopReason;
+      }
       return {
         ok: false,
         error: describeApiErrorCode(

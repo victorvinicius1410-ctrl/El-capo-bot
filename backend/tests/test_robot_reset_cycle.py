@@ -370,6 +370,84 @@ class RobotResetCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"], "RESET_CYCLE_REQUIRED")
+        # A recusa tem de dizer QUAL stop bateu: o painel monta a mensagem com
+        # as duas saidas (aumentar o limite ou Reiniciar placar).
+        self.assertEqual(payload["data"]["stop_reason"], "STOP_WIN_HIT")
+        self.assertEqual(payload["data"]["management"]["stop_win"], 50.0)
+
+    async def test_raising_stop_limit_releases_start_without_reset_score(self) -> None:
+        """Aumentar o limite em Iniciar Operacao libera o start, sem zerar o placar.
+
+        O dono pediu em 21/09/2026: o placar so zera se o cliente zerar; quem
+        bateu o stop tem duas saidas, e uma delas e subir o Stop Win/Loss.
+        """
+        user_id = "user-stop-then-raise-limit"
+        state = main.auto_trader.get(user_id)
+        state.status = "STOP_LOSS_HIT"
+        state.wins = 2
+        state.losses = 4
+        state.profit = -30.0
+        state.stop_loss = 30.0
+        state.stop_loss_mode = "money"
+        state.enabled = False
+
+        # Recusa antes de mexer no limite.
+        blocked = await main.robot_start({"user_id": user_id})
+        self.assertEqual(blocked.status_code, 409)
+
+        state.stop_loss = 80.0
+
+        with (
+            patch.object(
+                main,
+                "fetch_and_sync_robot_connection",
+                new=AsyncMock(
+                    return_value=(200, {}, main.auto_trader.get(user_id), True, "REAL", "live")
+                ),
+            ),
+            patch.object(
+                main,
+                "call_bullex_service",
+                new=AsyncMock(
+                    return_value=(
+                        200,
+                        {
+                            "ok": True,
+                            "data": {
+                                "connected": True,
+                                "active_mode": "REAL",
+                                "balance": 500,
+                                "balance_real": 500,
+                                "currency": "BRL",
+                            },
+                        },
+                    )
+                ),
+            ),
+            patch.object(main, "build_real_account_contract", return_value={
+                "ok": True,
+                "data": {
+                    "connected": True,
+                    "active_mode": "REAL",
+                    "balance": 500,
+                    "balance_real": 500,
+                    "currency": "BRL",
+                },
+            }),
+            patch.object(main, "ensure_robot_worker"),
+            patch.object(main, "persist_robot"),
+            patch.object(main, "clear_session_backoff"),
+            patch.object(main, "real_block_reason", return_value=None),
+            patch.object(main, "fresh_robot_connection", return_value=False),
+        ):
+            start_response = await main.robot_start({"user_id": user_id})
+
+        start_payload = json.loads(start_response.body)
+        self.assertEqual(start_response.status_code, 200, start_payload)
+        self.assertTrue(start_payload["data"]["enabled"])
+        # O placar continua intacto: ninguem zerou por baixo do cliente.
+        self.assertEqual(start_payload["data"]["wins"], 2)
+        self.assertEqual(start_payload["data"]["losses"], 4)
 
     async def test_reset_score_clears_stop_hit_and_allows_start(self) -> None:
         """Reiniciar placar deve destravar Iniciar Operação após Stop Win."""
