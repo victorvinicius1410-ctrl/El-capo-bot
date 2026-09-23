@@ -130,7 +130,7 @@ job de meia-noite nem ciclo do robô que chame `reset_score` sem o cliente.
 |---------|--------------|-------|
 | `POST /robot/reset-score` | Botão **Reiniciar placar** no overlay | Todas |
 | `POST /robot/reset-cycle` com `reset_score` | Fluxo explícito de ciclo | Todas |
-| `MARKETING_AUTO_RESET_SCORE_ON_START` | `POST /robot/start` quando Stop Win/Loss bloquearia | **Só marketing** |
+| ~~`MARKETING_AUTO_RESET_SCORE_ON_START`~~ | `POST /robot/start` com o stop batendo | **Removido em 2026-09-23** — nenhuma conta zera sozinha |
 
 ### Evidência (produção, 2026-08-13)
 

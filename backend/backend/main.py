@@ -16221,14 +16221,6 @@ async def robot_settings(
     return await robot_config(body, auth)
 
 
-def is_marketing_simulation_session(auth: dict[str, str]) -> bool:
-    """True quando a sessão autenticada é conta marketing em modo simulação."""
-    return (
-        str(auth.get("account_type") or "").strip().lower() == "marketing"
-        and str(auth.get("marketing_mode") or "").strip().lower() == "simulation"
-    )
-
-
 async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
     user_id = auth["user_id"]
     mark_user_active(user_id)
@@ -16262,23 +16254,14 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
         profit=float(getattr(state, "profit", 0) or 0),
     )
     history_stop = daily_stop_reason(user_id, state)
-    stop_blocks = is_stop_status(state.status) or session_stop is not None or history_stop is not None
-    if stop_blocks and is_marketing_simulation_session(auth):
-        previous_status = state.status
-        state = auto_trader.reset_score(user_id)
-        # Zerar aqui é intencional (destrava o start da conta marketing): sem a
-        # marca o `persist_robot` recusaria gravar o zero.
-        mark_session_score_authority(user_id, 0, 0, 0.0)
-        persist_robot(user_id)
-        logger.info(
-            "[MARKETING_AUTO_RESET_SCORE_ON_START] user_id=%s previous_status=%s "
-            "session_stop=%s history_stop=%s",
-            user_id,
-            previous_status,
-            session_stop,
-            history_stop,
-        )
-    elif is_stop_status(state.status):
+    # NENHUMA conta zera o placar sozinha aqui. Até 23/09/2026 a conta
+    # marketing em simulação era exceção: com o stop batendo, o start zerava o
+    # placar do dia para destravar a transmissão — e quem estava operando com
+    # ela via o placar sumir sem ter tocado em nada ("parei, iniciei de novo e
+    # zerou", conta do Sergio em 23/09 17:14). Por decisão do dono a conta
+    # marketing passou a se comportar como cliente comum: o start recusa com
+    # `RESET_CYCLE_REQUIRED` e quem decide zerar é a pessoa, no botão.
+    if is_stop_status(state.status):
         # Se o placar já não viola o stop (ex.: após "Reiniciar placar"), libera.
         # Caso contrário, pede o reset explícito do placar/ciclo.
         still_blocked = resolve_robot_stop_reason(

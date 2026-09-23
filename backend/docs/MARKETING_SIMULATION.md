@@ -39,10 +39,14 @@ Isso fazia o `POST /robot/start` responder **403 `STOP_WIN_HIT` /
 `STOP_LOSS_HIT`** (via `daily_stop_reason` / placar), enquanto Configurações
 também “não iniciava”.
 
-**Comportamento (2026-08-07):** em sessão `account_type=marketing` +
-`marketing_mode=simulation`, o start **zera automaticamente o placar da
-sessão** (`reset_score`, com `stop_reset_at`) quando o stop bloquearia e
-segue o fluxo normal. Log: `[MARKETING_AUTO_RESET_SCORE_ON_START]`.
+**Comportamento (2026-08-07, REVOGADO em 2026-09-23):** o start da conta
+marketing **zerava automaticamente o placar da sessão** quando o stop
+bloquearia (`[MARKETING_AUTO_RESET_SCORE_ON_START]`). Quem operava com ela via
+o placar do dia sumir sem ter tocado em nada — aconteceu na conta do Sergio em
+23/09 17:14. Por decisão do dono, **nenhuma conta zera placar sozinha**: a
+marketing agora recebe o mesmo `409 RESET_CYCLE_REQUIRED` do cliente comum, com
+`stop_reason`, e quem zera é a pessoa, no botão Reiniciar placar (ou subindo o
+limite do stop).
 
 Além disso, o start limpa o backoff de sessão **antes** de consultar
 status/account (evita falso `BULLEX_NOT_CONNECTED`) e o estado em memória

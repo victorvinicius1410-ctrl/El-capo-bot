@@ -375,6 +375,42 @@ class RobotResetCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["stop_reason"], "STOP_WIN_HIT")
         self.assertEqual(payload["data"]["management"]["stop_win"], 50.0)
 
+    async def test_marketing_start_nao_zera_placar_com_stop_batido(self) -> None:
+        """Conta marketing bate o stop e o start recusa, igual a cliente comum.
+
+        Ate 23/09/2026 a conta marketing em simulacao era excecao: o proprio
+        `POST /robot/start` zerava o placar do dia para destravar a
+        transmissao. Quem operava com ela via o placar sumir sem ter tocado em
+        nada (conta do Sergio em 23/09 17:14). O dono mandou tirar: nenhuma
+        conta zera placar sozinha, quem zera e a pessoa, no botao.
+        """
+        user_id = "user-marketing-stop-hit"
+        state = main.auto_trader.get(user_id)
+        state.status = "STOP_LOSS_HIT"
+        state.wins = 2
+        state.losses = 3
+        state.profit = -45.0
+        state.stop_loss = 30.0
+        state.stop_loss_mode = "money"
+        state.enabled = False
+
+        response = await main.robot_start(
+            {
+                "user_id": user_id,
+                "account_type": "marketing",
+                "marketing_mode": "simulation",
+            }
+        )
+        payload = json.loads(response.body)
+        depois = main.auto_trader.get(user_id)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(payload["error"], "RESET_CYCLE_REQUIRED")
+        self.assertEqual(payload["data"]["stop_reason"], "STOP_LOSS_HIT")
+        # O placar continua inteiro: nada de reset automatico.
+        self.assertEqual((depois.wins, depois.losses, depois.profit), (2, 3, -45.0))
+        self.assertIsNone(main.get_session_score_authority(user_id))
+
     async def test_raising_stop_limit_releases_start_without_reset_score(self) -> None:
         """Aumentar o limite em Iniciar Operacao libera o start, sem zerar o placar.
 
@@ -577,85 +613,6 @@ class RobotResetCycleTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(response.body)
         self.assertEqual(response.status_code, 200, payload)
         self.assertTrue(payload.get("ok"), payload)
-
-    async def test_marketing_start_auto_resets_score_when_stop_would_block(self) -> None:
-        """Conta marketing com placar do Shift+O não pode travar Iniciar Operação."""
-        user_id = "user-marketing-stop"
-        state = main.auto_trader.get(user_id)
-        state.status = "STOPPED"
-        state.wins = 12
-        state.losses = 2
-        state.profit = 2500.0
-        state.stop_win = 1000.0
-        state.stop_win_mode = "money"
-        state.entry_value = 5.0
-
-        with (
-            patch.object(
-                main,
-                "fetch_and_sync_robot_connection",
-                new=AsyncMock(
-                    return_value=(200, {}, main.auto_trader.get(user_id), True, "REAL", "live")
-                ),
-            ),
-            patch.object(
-                main,
-                "call_bullex_service",
-                new=AsyncMock(
-                    return_value=(
-                        200,
-                        {
-                            "ok": True,
-                            "data": {
-                                "connected": True,
-                                "active_mode": "REAL",
-                                "balance": 5000,
-                                "balance_real": 5000,
-                                "currency": "BRL",
-                            },
-                        },
-                    )
-                ),
-            ),
-            patch.object(
-                main,
-                "build_real_account_contract",
-                return_value={
-                    "ok": True,
-                    "data": {
-                        "connected": True,
-                        "active_mode": "REAL",
-                        "balance": 5000,
-                        "balance_real": 5000,
-                        "currency": "BRL",
-                    },
-                },
-            ),
-            patch.object(main, "ensure_robot_worker"),
-            patch.object(main, "persist_robot"),
-            patch.object(main, "clear_session_backoff"),
-            patch.object(main, "fresh_robot_connection", return_value=False),
-        ):
-            # Cliente normal continuaria bloqueado; marketing auto-zera e inicia.
-            blocked = await main.robot_start({"user_id": user_id, "account_type": "client"})
-            self.assertEqual(blocked.status_code, 409, json.loads(blocked.body))
-            self.assertEqual(json.loads(blocked.body)["error"], "RESET_CYCLE_REQUIRED")
-
-            response = await main.robot_start(
-                {
-                    "user_id": user_id,
-                    "account_type": "marketing",
-                    "marketing_mode": "simulation",
-                }
-            )
-
-        payload = json.loads(response.body)
-        refreshed = main.auto_trader.get(user_id)
-        self.assertEqual(response.status_code, 200, payload)
-        self.assertTrue(payload.get("ok"), payload)
-        self.assertTrue(refreshed.enabled)
-        self.assertEqual(refreshed.wins, 0)
-        self.assertEqual(refreshed.profit, 0.0)
 
     async def test_get_user_robot_state_does_not_clobber_running_memory(self) -> None:
         """Estado em memória ligado não pode ser sobrescrito com enabled=False do disco."""
