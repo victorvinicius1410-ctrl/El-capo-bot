@@ -615,6 +615,9 @@ export function RobotOverlay({
               </button>
             ) : null}
             {onResetScore ? (
+              // Folga proposital (`mt-3`) entre operar e zerar o placar: com os
+              // 6px do gap original, o toque seguinte ao Parar/Iniciar caía aqui
+              // e apagava o placar do dia — origem dos relatos de 23/09/2026.
               <button
                 type="button"
                 onClick={(event) => {
@@ -622,7 +625,7 @@ export function RobotOverlay({
                   onResetScore();
                 }}
                 disabled={resetScoreDisabled}
-                className="pointer-events-auto inline-flex cursor-pointer items-center gap-1 rounded-full border border-border/60 bg-transparent px-2.5 py-0.5 text-[10px] font-medium tracking-wide text-muted-foreground/90 transition hover:border-border hover:bg-card/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 sm:text-[11px]"
+                className="pointer-events-auto mt-3 inline-flex cursor-pointer items-center gap-1 rounded-full border border-border/60 bg-transparent px-2.5 py-0.5 text-[10px] font-medium tracking-wide text-muted-foreground/90 transition hover:border-border hover:bg-card/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 sm:text-[11px]"
                 aria-label="Reiniciar placar do robô"
                 title="Zerar wins, loss e resultado financeiro"
               >

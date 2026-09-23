@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { MarketingControlPanel } from "./MarketingControlPanel";
+import { ResetScoreDialog } from "./ResetScoreDialog";
 import { RobotOverlay } from "./RobotOverlay";
 import { StartOperationDialog } from "./StartOperationDialog";
 import {
@@ -59,6 +60,7 @@ import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { prefetchAdminClientsSegment } from "@/lib/adminClientsQuery";
 import { resetBullExAccountState } from "@/hooks/useBullExAccount";
 import { resetRobotSettingsForUser } from "@/lib/robotSettings";
+import { shouldConfirmResetScore } from "@/lib/resetScoreConfirm";
 import { isRobotOperationRunning, type RobotState } from "@/lib/robotState";
 import { TRIAL_DISCOUNT, formatTrialRemaining, remainingMs } from "@/lib/trial";
 import { useAuth, type AuthUser } from "@/lib/useAuth";
@@ -158,6 +160,7 @@ const ADMIN_MODEL_CYCLE_MS = 45_000;
 function FloatingRobot({ userId }: { userId?: string | null }) {
   const [visible, setVisible] = useState(true);
   const [startDialogOpen, setStartDialogOpen] = useState(false);
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [modelWins, setModelWins] = useState(0);
@@ -270,7 +273,14 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
     }
   }
 
-  async function resetScore(): Promise<void> {
+  /**
+   * Zera o placar de fato. Só chamado depois da confirmação (ou com 0-0).
+   *
+   * O botão vive colado no Iniciar/Parar Operação e não tem desfazer: em
+   * 23/09/2026 os relatos de "parei, iniciei e o placar zerou" eram todos
+   * este clique, alguns segundos antes do start.
+   */
+  async function confirmResetScore(): Promise<void> {
     if (!apiConfig.BASE_URL || resetting || adminModelMode) return;
     setResetting(true);
     try {
@@ -290,7 +300,20 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
       toast.error(message);
     } finally {
       setResetting(false);
+      setResetDialogOpen(false);
     }
+  }
+
+  /** Clique no "Reiniciar placar": pergunta antes quando há placar do dia. */
+  function requestResetScore(): void {
+    if (!apiConfig.BASE_URL || resetting || adminModelMode) return;
+    if (!shouldConfirmResetScore(displayState)) {
+      void confirmResetScore();
+      return;
+    }
+    // Mesmo adiamento de um tick do Iniciar Operação: no mobile o próprio
+    // toque que abre o diálogo chegava a fechá-lo (dismiss do overlay Radix).
+    scheduleDialogOpen(() => setResetDialogOpen(true));
   }
 
   return (
@@ -315,7 +338,7 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
         onClose={() => setVisible(false)}
         layerClassName={layerClassName}
         operationRunning={operationRunning}
-        interactionLocked={startDialogOpen}
+        interactionLocked={startDialogOpen || resetDialogOpen}
         onStartOperation={
           adminModelMode
             ? undefined
@@ -343,7 +366,7 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
           adminModelMode
             ? undefined
             : () => {
-                void resetScore();
+                requestResetScore();
               }
         }
         startOperationDisabled={!canStart}
@@ -369,6 +392,18 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
               applyRobotMutationToCache(queryClient, userId, startedPayload);
             }
             void robotState.refetch();
+          }}
+        />
+      )}
+      {adminModelMode ? null : (
+        <ResetScoreDialog
+          open={resetDialogOpen}
+          onOpenChange={setResetDialogOpen}
+          score={displayState}
+          currency={account.data?.currency ?? null}
+          resetting={resetting}
+          onConfirm={() => {
+            void confirmResetScore();
           }}
         />
       )}

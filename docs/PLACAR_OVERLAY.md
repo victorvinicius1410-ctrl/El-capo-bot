@@ -6,9 +6,57 @@ um ponto ao parar** (ex.: 10x12 → 9x12), **regredia no start/stop**
 (ex.: 5x3 → 2x0) ou **não baixava ao excluir** operação marketing do
 histórico.
 
-Atualizado em **2026-09-22**.
+Atualizado em **2026-09-23**.
 
 Espelho detalhado: [`Frontend/docs/PLACAR_OVERLAY.md`](../frontend/docs/PLACAR_OVERLAY.md).
+
+## Correção (2026-09-23) — "parei, iniciei de novo e o placar zerou"
+
+### O que os dados mostram
+
+Não é o servidor. Medido nos logs de produção de 23/09 e no Supabase:
+
+| Cliente | Placar depois | `stop_reset_at` | Start | Histórico do dia |
+|---------|---------------|-----------------|-------|------------------|
+| `9571168d` | 1 × 1 | 16:44:23 | 16:44:35 | **18 operações** |
+| `c5cc331d` | 1 × 0 | 16:59:39 | 17:00:21 | 4 operações |
+| `824aa422` | 4 × 1 | 15:45:56 | 15:46:52 | 5 operações |
+
+Em **todos** os casos o log tem um `POST /robot/reset-score` alguns segundos
+antes do `POST /robot/start` — o servidor só obedeceu. O caso de controle
+fecha o argumento: `0bf8d0c8` fez `stop` 16:47:24 → `start` 16:47:48 **sem**
+reset e continuou com o placar inteiro (8 × 5, marca de reset ainda de 20/09).
+Ou seja: **parar e iniciar não zera placar; o que zera é o botão.**
+
+No dia: **63 resets**, e **40 deles (63%) seguidos de um start em até 90s** —
+contra só 13 recusas de start por stop batido. Não é gente reiniciando o placar
+de propósito: é o botão sendo apertado como se fizesse parte de ligar o robô.
+
+### Causa
+
+No overlay, **"Reiniciar placar" fica 6px abaixo do Iniciar/Parar Operação**
+(`gap-1.5`), zera no primeiro clique, **sem confirmação e sem desfazer**. Depois
+de "Parar Operação" o botão verde reaparece no mesmo lugar e o toque seguinte
+cai no vizinho de baixo — no celular, com folga de 6px, é o caminho natural.
+
+### Correção (frontend)
+
+| Camada | Mudança |
+|--------|---------|
+| `lib/resetScoreConfirm.ts` | `shouldConfirmResetScore` / `resetScoreHighlight`: só pergunta quando há placar a perder (com 0-0 o clique segue direto, que é o uso para destravar start com stop batido) |
+| `components/ResetScoreDialog.tsx` | Diálogo dizendo o que some ("Vai sumir do placar: 4 WINs × 1 LOSS"), que o **Histórico não é apagado**, com **Cancelar em destaque** |
+| `components/AppShell.tsx` | O clique abre a confirmação (mesmo adiamento de um tick do Iniciar Operação, contra dismiss acidental no mobile); o reset real só acontece no confirmar |
+| `components/RobotOverlay.tsx` | `mt-3` separando operar de zerar |
+
+Testes: `resetScoreConfirm.test.ts` (novo, na lista manual do `npm test`) —
+265 testes do front, 0 falhas.
+
+### O que NÃO foi mexido
+
+A conta **marketing em simulação** continua zerando o placar sozinha dentro do
+`POST /robot/start` quando o stop está batendo (`MARKETING_AUTO_RESET_SCORE_ON_START`,
+`main.py`): é proposital, para a transmissão não travar. Só ela faz isso —
+cliente pagante recebe 409 pedindo para aumentar o limite ou reiniciar o placar.
 
 ## Correção (2026-09-22) — placar zerado até apertar F5
 
