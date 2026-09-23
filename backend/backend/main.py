@@ -8606,7 +8606,11 @@ def reconcile_session_score_on_gateway(user_id: str) -> bool:
     state.wins = preferred[0]
     state.losses = preferred[1]
     state.profit = preferred[2]
-    logger.info(
+    # `warning` de propósito: o gateway roda em nível WARNING em produção, e
+    # como `info` esta linha — a que explica de onde veio o placar servido ao
+    # painel — não existia no log. Sem ela, todo diagnóstico de placar vira
+    # adivinhação (ver docs/PLACAR_OVERLAY.md §2026-09-22).
+    logger.warning(
         "[SCORE_RECONCILED_ON_GATEWAY] user_id=%s previous=%sx%s/%s "
         "preferred=%sx%s/%s",
         normalized,
@@ -8687,7 +8691,9 @@ def enrich_robot_snapshot_session_score(
     patched["wins"] = preferred[0]
     patched["losses"] = preferred[1]
     patched["profit"] = preferred[2]
-    logger.info(
+    # Mesmo motivo do SCORE_RECONCILED_ON_GATEWAY: em nível WARNING para
+    # aparecer em produção. Só sai quando o placar do Redis foi corrigido.
+    logger.warning(
         "[SCORE_SNAPSHOT_ENRICHED] user_id=%s redis=%sx%s/%s enriched=%sx%s/%s",
         user_id,
         current[0],
@@ -16761,8 +16767,10 @@ async def robot_reset_score(auth: dict[str, str] = Depends(require_headers)) -> 
     control_payload = publish_robot_control_snapshot(user_id)
     if robot_runtime_mode() == "external":
         robot_bus.publish_command(user_id, "reset_score")
-        logger.info("[ROBOT_SCORE_RESET_DELEGATED] user_id=%s mode=external", user_id)
-    logger.info(
+        logger.warning("[ROBOT_SCORE_RESET_DELEGATED] user_id=%s mode=external", user_id)
+    # Quem zerou o placar do dia é a pergunta nº 1 de todo relato: precisa
+    # estar no log de produção, não só no nível info.
+    logger.warning(
         "[ROBOT_SCORE_RESET] user_id=%s wins=%s losses=%s profit=%s",
         user_id,
         state.wins,
