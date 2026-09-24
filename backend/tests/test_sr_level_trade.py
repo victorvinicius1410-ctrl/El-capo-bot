@@ -452,5 +452,81 @@ class CamposDoNivelTest(unittest.TestCase):
         self.assertIn("sr_level", robot_persistence.TRADE_ANALYSIS_FIELDS)
 
 
+class ForcaDaRegiaoTest(unittest.TestCase):
+    """Só região forte: pivô com N toques, sem as fontes de um toque.
+
+    Pedido do dono em 23/09/2026 (relato do Sergio: "está pegando muita operação
+    em região próxima"). Os padrões do módulo têm de continuar reproduzindo o
+    comportamento anterior — quem muda o robô é o `.env`.
+    """
+
+    def _so_pivo(self, toques: int):
+        return (
+            mock.patch.object(sr_level_trade, "SR_LEVEL_PIVOT_MIN_TOUCHES", toques),
+            mock.patch.object(sr_level_trade, "SR_LEVEL_VISIBLE_ENABLED", False),
+            mock.patch.object(sr_level_trade, "SR_LEVEL_EXTREME_ENABLED", False),
+        )
+
+    def test_padrao_mantem_as_tres_fontes(self) -> None:
+        self.assertEqual(sr_level_trade.SR_LEVEL_PIVOT_MIN_TOUCHES, 2)
+        self.assertTrue(sr_level_trade.SR_LEVEL_VISIBLE_ENABLED)
+        self.assertTrue(sr_level_trade.SR_LEVEL_EXTREME_ENABLED)
+        velas = serie()
+        atr = sr_level_trade.average_true_range(velas[-120:], periodo=14)
+        res, sup = sr_level_trade._levels(velas, atr)
+        fontes = {n["source"] for n in res} | {n["source"] for n in sup}
+        self.assertEqual(
+            fontes,
+            {"PIVO_2_TOQUES", "TOPO_VISIVEL", "FUNDO_VISIVEL", "MAXIMA_RECENTE", "MINIMA_RECENTE"},
+        )
+
+    def test_so_pivo_descarta_as_fontes_de_um_toque(self) -> None:
+        velas = serie()
+        atr = sr_level_trade.average_true_range(velas[-120:], periodo=14)
+        p1, p2, p3 = self._so_pivo(3)
+        with p1, p2, p3:
+            res, sup = sr_level_trade._levels(velas, atr)
+        fontes = {n["source"] for n in res} | {n["source"] for n in sup}
+        self.assertEqual(fontes, {"PIVO_3_TOQUES"})
+        self.assertTrue(all(n["touches"] >= 3 for n in res + sup))
+
+    def test_regiao_de_dois_toques_nao_serve_quando_exige_tres(self) -> None:
+        """Um topo tocado 2x deixa de ser nível; a série do zigue-zague tem muitos."""
+        velas = serie()
+        atr = sr_level_trade.average_true_range(velas[-120:], periodo=14)
+        p1, p2, p3 = self._so_pivo(99)
+        with p1, p2, p3:
+            res, sup = sr_level_trade._levels(velas, atr)
+        self.assertEqual(res, [])
+        self.assertEqual(sup, [])
+
+    def test_sem_nivel_forte_nao_ha_entrada_de_nivel(self) -> None:
+        velas = com_preco(ALTO - 0.00005, subindo_ate(ALTO - 0.1 * PASSO))
+        self.assertIsNotNone(find_level_trade(velas))
+        p1, p2, p3 = self._so_pivo(99)
+        with p1, p2, p3:
+            self.assertIsNone(find_level_trade(velas))
+
+    def test_o_nivel_forte_continua_valendo(self) -> None:
+        """Com 3 toques exigidos, a resistência do zigue-zague (muitos toques) fica."""
+        velas = com_preco(ALTO - 0.00005, subindo_ate(ALTO - 0.1 * PASSO))
+        p1, p2, p3 = self._so_pivo(3)
+        with p1, p2, p3:
+            veredito = find_level_trade(velas)
+        self.assertIsNotNone(veredito)
+        self.assertEqual(veredito["direction"], "PUT")
+        self.assertEqual(veredito["source"], "PIVO_3_TOQUES")
+        self.assertGreaterEqual(veredito["touches"], 3)
+
+    def test_extremo_recente_sai_de_cena(self) -> None:
+        velas = serie()
+        atr = sr_level_trade.average_true_range(velas[-120:], periodo=14)
+        with mock.patch.object(sr_level_trade, "SR_LEVEL_EXTREME_ENABLED", False):
+            res, sup = sr_level_trade._levels(velas, atr)
+        fontes = {n["source"] for n in res} | {n["source"] for n in sup}
+        self.assertNotIn("MAXIMA_RECENTE", fontes)
+        self.assertNotIn("MINIMA_RECENTE", fontes)
+
+
 if __name__ == "__main__":
     unittest.main()

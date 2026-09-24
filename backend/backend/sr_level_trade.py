@@ -88,6 +88,30 @@ SR_LEVEL_TREND_ATR = float(os.getenv("SR_LEVEL_TREND_ATR", "0.3"))
 # nova, que é o caso EURAUD 12/09 00:37 (preço caindo 2,8 ATR, CALL, LOSS).
 SR_LEVEL_MIN_AGE_CANDLES = int(os.getenv("SR_LEVEL_MIN_AGE", "3"))
 SR_LEVEL_MIN_CANDLES = 40
+# Força mínima da região, configurável desde 23/09/2026 (antes era fixa no
+# `_levels`). Pedido do dono, a partir do relato do Sergio: "está pegando muita
+# operação em região próxima; tem de identificar região mais forte, como o
+# terceiro toque". Os padrões aqui reproduzem o comportamento anterior, então
+# quem muda o robô é o `.env`, não este arquivo.
+#
+# ⚠️ ISTO NÃO MELHORA O ACERTO. Medido em 60 dias (21 pares OTC, 1,81 milhão de
+# minutos, holdout nas duas metades): pivô 3+ toques dá 50,04% contra 50,05% da
+# configuração anterior, e 4+ toques dá 49,76%. O empate com payout 86,7% é
+# 53,6%. Por toques, dentro da fonte de pivô: 2→49,94% · 3→50,24% · 4→49,76% ·
+# 5→50,26% · 6+→48,84% — sobe e desce sem ordem. O 53,6% que apareceu na semana
+# de 16-23/09 era n=312 (a mesma ilusão do "4º toque", 53,5% na semana e 49,63%
+# em 60 dias).
+# O que a restrição entrega: as entradas de nível caem de 15,6% para ~4,9% dos
+# minutos. Como o retorno por operação é NEGATIVO (−6,5%), menos volume é menos
+# dinheiro perdido, e o nível passa a ser o que o cliente vê no gráfico.
+# Ver backend/docs/ESTRATEGIA_SR_NIVEL.md.
+SR_LEVEL_PIVOT_MIN_TOUCHES = max(1, int(os.getenv("SR_LEVEL_PIVOT_MIN_TOUCHES", "2")))
+# Topo/fundo de UM toque na última hora (`TOPO_VISIVEL`/`FUNDO_VISIVEL`). Era
+# metade das entradas: 47% dos sinais dos 7 dias vinham daqui, com um toque só.
+SR_LEVEL_VISIBLE_ENABLED = os.getenv("SR_LEVEL_VISIBLE", "true").strip().lower() in {"1", "true", "yes"}
+# Extremo dos últimos 30 minutos (`MAXIMA_RECENTE`/`MINIMA_RECENTE`), sempre de
+# um toque. 2,5% dos sinais e o pior acerto medido (49,14% em 60 dias).
+SR_LEVEL_EXTREME_ENABLED = os.getenv("SR_LEVEL_EXTREME", "true").strip().lower() in {"1", "true", "yes"}
 # Teto de entradas de nível por conta por hora (dono, 11/09 23h). Sem ele, um
 # nível que o preço não larga virava metralhada: 15 ordens em 12 minutos, 13
 # com perda, e duas contas no stop loss.
@@ -176,32 +200,46 @@ def _agrupa(
 
 
 def _levels(fechadas: list[dict[str, Any]], atr: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Resistências e suportes vistos no gráfico, com a origem de cada um."""
+    """Resistências e suportes vistos no gráfico, com a origem de cada um.
+
+    As três fontes têm forças diferentes e são ligadas/desligadas por env — ver
+    ``SR_LEVEL_PIVOT_MIN_TOUCHES``, ``SR_LEVEL_VISIBLE`` e ``SR_LEVEL_EXTREME``.
+    O rótulo da fonte de pivô carrega o número de toques exigido
+    (``PIVO_3_TOQUES``), senão uma auditoria futura leria um nível de 3 toques
+    como se fosse de 2.
+    """
     tolerancia = atr * SR_RESPECT_TOLERANCE_ATR
     longas = fechadas[-SR_RESPECT_LOOKBACK:]
-    curtas = fechadas[-SR_LEVEL_VISIBLE_LOOKBACK:]
     topos_longos, fundos_longos = _pivos_com_indice(
         longas, SR_RESPECT_PIVOT_RADIUS, len(fechadas) - len(longas)
     )
-    topos_curtos, fundos_curtos = _pivos_com_indice(
-        curtas, SR_RESPECT_PIVOT_RADIUS, len(fechadas) - len(curtas)
+    fonte_pivo = f"PIVO_{SR_LEVEL_PIVOT_MIN_TOUCHES}_TOQUES"
+    resistencias = _agrupa(
+        topos_longos, tolerancia=tolerancia, min_touches=SR_LEVEL_PIVOT_MIN_TOUCHES, source=fonte_pivo
     )
-    resistencias = _agrupa(topos_longos, tolerancia=tolerancia, min_touches=2, source="PIVO_2_TOQUES")
-    resistencias += _agrupa(topos_curtos, tolerancia=tolerancia, min_touches=1, source="TOPO_VISIVEL")
-    suportes = _agrupa(fundos_longos, tolerancia=tolerancia, min_touches=2, source="PIVO_2_TOQUES")
-    suportes += _agrupa(fundos_curtos, tolerancia=tolerancia, min_touches=1, source="FUNDO_VISIVEL")
-    janela = fechadas[-SR_LEVEL_EXTREME_WINDOW:]
-    base = len(fechadas) - len(janela)
-    topo = max(range(len(janela)), key=lambda i: candle_high(janela[i]))
-    fundo = min(range(len(janela)), key=lambda i: candle_low(janela[i]))
-    resistencias.append({
-        "price": candle_high(janela[topo]), "touches": 1, "source": "MAXIMA_RECENTE",
-        "last_touch": base + topo,
-    })
-    suportes.append({
-        "price": candle_low(janela[fundo]), "touches": 1, "source": "MINIMA_RECENTE",
-        "last_touch": base + fundo,
-    })
+    suportes = _agrupa(
+        fundos_longos, tolerancia=tolerancia, min_touches=SR_LEVEL_PIVOT_MIN_TOUCHES, source=fonte_pivo
+    )
+    if SR_LEVEL_VISIBLE_ENABLED:
+        curtas = fechadas[-SR_LEVEL_VISIBLE_LOOKBACK:]
+        topos_curtos, fundos_curtos = _pivos_com_indice(
+            curtas, SR_RESPECT_PIVOT_RADIUS, len(fechadas) - len(curtas)
+        )
+        resistencias += _agrupa(topos_curtos, tolerancia=tolerancia, min_touches=1, source="TOPO_VISIVEL")
+        suportes += _agrupa(fundos_curtos, tolerancia=tolerancia, min_touches=1, source="FUNDO_VISIVEL")
+    if SR_LEVEL_EXTREME_ENABLED:
+        janela = fechadas[-SR_LEVEL_EXTREME_WINDOW:]
+        base = len(fechadas) - len(janela)
+        topo = max(range(len(janela)), key=lambda i: candle_high(janela[i]))
+        fundo = min(range(len(janela)), key=lambda i: candle_low(janela[i]))
+        resistencias.append({
+            "price": candle_high(janela[topo]), "touches": 1, "source": "MAXIMA_RECENTE",
+            "last_touch": base + topo,
+        })
+        suportes.append({
+            "price": candle_low(janela[fundo]), "touches": 1, "source": "MINIMA_RECENTE",
+            "last_touch": base + fundo,
+        })
     return resistencias, suportes
 
 
