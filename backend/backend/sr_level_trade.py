@@ -118,6 +118,25 @@ SR_LEVEL_EXTREME_ENABLED = os.getenv("SR_LEVEL_EXTREME", "true").strip().lower()
 SR_LEVEL_MAX_PER_HOUR = int(os.getenv("SR_LEVEL_MAX_PER_HOUR", "3"))
 SR_LEVEL_HOUR_SECONDS = 3600.0
 
+# Nível GASTO (item 5 do texto do dono, 24/09/2026): "muitos testes consecutivos
+# diminuem a força, a região pode estar sendo consumida". O nível escolhido não
+# opera quando tem SR_LEVEL_SPENT_MAX_TOUCHES+ toques, ou quando o preço já
+# encostou nele SR_LEVEL_SPENT_RECENT_MAX+ vezes na última hora (topos e fundos
+# a até SR_LEVEL_SPENT_RECENT_ATR do nível, sem contar as 3 velas mais novas).
+# Padrão desligado: quem liga é o `.env`.
+#
+# ⚠️ NÃO É GANHO DE ACERTO QUE SE POSSA PROMETER. Simulado sobre a regra que
+# está no ar (60 dias, 21 pares OTC, conta com 10 pares, 1 operação por vez e
+# teto de 3 por hora): 50,15% → 50,84% de acerto, 69 → 65 operações/dia ligada
+# 24 h. Empate com payout 86,7% = 53,6%. Nos sinais, 50,03% → 50,31% (IC ±0,47),
+# as duas metades a favor (50,12% / 50,50%), mas dentro do ruído de quem
+# escolheu o melhor de ~20 recortes. Ver /root/pesquisa/sr-texto.
+SR_LEVEL_SPENT_ENABLED = os.getenv("SR_LEVEL_SPENT", "false").strip().lower() in {"1", "true", "yes"}
+SR_LEVEL_SPENT_MAX_TOUCHES = int(os.getenv("SR_LEVEL_SPENT_MAX_TOUCHES", "6"))
+SR_LEVEL_SPENT_RECENT_WINDOW = int(os.getenv("SR_LEVEL_SPENT_RECENT_WINDOW", "60"))
+SR_LEVEL_SPENT_RECENT_MAX = int(os.getenv("SR_LEVEL_SPENT_RECENT_MAX", "3"))
+SR_LEVEL_SPENT_RECENT_ATR = float(os.getenv("SR_LEVEL_SPENT_RECENT_ATR", "0.25"))
+
 # Pavio na entrada de nível (frações do range da vela).
 SR_LEVEL_WICK_AGAINST_RATIO = float(os.getenv("SR_LEVEL_WICK_AGAINST_RATIO", "0.40"))
 SR_LEVEL_WICK_TWO_SIDED_RATIO = float(os.getenv("SR_LEVEL_WICK_TWO_SIDED_RATIO", "0.30"))
@@ -263,6 +282,37 @@ def _nearest(niveis: list[dict[str, Any]], distancia, idade_minima: int) -> dict
     return melhor
 
 
+def _toques_recentes(fechadas: list[dict[str, Any]], preco_nivel: float, atr: float) -> int:
+    """Quantas vezes o preço encostou no nível na última hora.
+
+    Conta topos e fundos (pivôs de raio ``SR_RESPECT_PIVOT_RADIUS``) a até
+    ``SR_LEVEL_SPENT_RECENT_ATR`` do nível, com índice entre a última fechada
+    menos ``SR_LEVEL_SPENT_RECENT_WINDOW`` e a última fechada menos
+    ``SR_LEVEL_MIN_AGE_CANDLES`` — a mesma idade mínima do nível. Uma vela que é
+    topo e fundo ao mesmo tempo conta duas vezes, como no backtest.
+    """
+    fim = len(fechadas) - 1
+    primeiro = fim - SR_LEVEL_SPENT_RECENT_WINDOW
+    ultimo = fim - SR_LEVEL_MIN_AGE_CANDLES
+    folga = SR_RESPECT_PIVOT_RADIUS
+    inicio = max(0, primeiro - folga)
+    topos, fundos = _pivos_com_indice(fechadas[inicio:], SR_RESPECT_PIVOT_RADIUS, inicio)
+    raio = SR_LEVEL_SPENT_RECENT_ATR * atr
+    return sum(
+        1
+        for idx, preco in topos + fundos
+        if primeiro <= idx <= ultimo and abs(preco - preco_nivel) <= raio
+    )
+
+
+def nivel_gasto(nivel: dict[str, Any], toques_recentes: int) -> bool:
+    """Região consumida: toques demais no total ou na última hora."""
+    return (
+        int(nivel.get("touches", 0)) >= SR_LEVEL_SPENT_MAX_TOUCHES
+        or toques_recentes >= SR_LEVEL_SPENT_RECENT_MAX
+    )
+
+
 def _movimento_atr(fechadas: list[dict[str, Any]], atr: float) -> float:
     """Quanto o preço andou nas últimas velas, em ATR (positivo = subindo)."""
     if len(fechadas) <= SR_LEVEL_TREND_CANDLES or atr <= 0:
@@ -318,6 +368,14 @@ def find_level_trade(candles: list[dict[str, Any]]) -> dict[str, Any] | None:
     nivel = resistencia or suporte
     if nivel is None:
         return None
+    recentes = None
+    if SR_LEVEL_SPENT_ENABLED:
+        # Nível gasto não opera, e o outro lado NÃO é promovido no lugar: o
+        # backtest mediu exatamente "o nível escolhido pela regra de hoje, se não
+        # estiver gasto". Sem nível, a vela volta ao motor clássico.
+        recentes = _toques_recentes(fechadas, float(nivel["price"]), atr)
+        if nivel_gasto(nivel, recentes):
+            return None
     direcao = "PUT" if resistencia else "CALL"
     confianca = SR_LEVEL_CONFIDENCE_BASE
     if nivel["touches"] >= 2:
@@ -330,6 +388,7 @@ def find_level_trade(candles: list[dict[str, Any]]) -> dict[str, Any] | None:
         "movement_atr": round(movimento, 2),
         "level": float(nivel["price"]),
         "touches": int(nivel["touches"]),
+        "recent_touches": recentes,
         "source": nivel["source"],
         "distance_atr": round(float(nivel["distance_atr"]), 3),
         "atr": atr,

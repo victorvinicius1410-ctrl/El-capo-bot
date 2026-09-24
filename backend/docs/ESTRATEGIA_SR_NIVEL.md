@@ -126,13 +126,39 @@ ordens, 13 perdas, 6 sinais distintos, 2 contas no stop loss): **teto de 3
 entradas de nível por conta por hora**. Com 18 contas ligadas isso limita o
 sinal de nível a ~54 ordens/hora no sistema, e cada conta a 3.
 
+## Nível gasto (24/09/2026)
+
+Item 5 do texto de S/R que o dono trouxe ("muitos testes consecutivos diminuem a
+força, a região pode estar sendo consumida"). O nível que a regra escolheu **não
+opera** quando:
+
+- tem 6 ou mais toques (`SR_LEVEL_SPENT_MAX_TOUCHES`), ou
+- o preço encostou nele 3 ou mais vezes na última hora (`SR_LEVEL_SPENT_RECENT_MAX`),
+  contando topos e fundos a até 0,25 ATR do nível (`SR_LEVEL_SPENT_RECENT_ATR`,
+  janela `SR_LEVEL_SPENT_RECENT_WINDOW`=60, sem as 3 velas mais novas).
+
+O outro lado não é promovido no lugar; a vela volta ao motor clássico. A contagem
+recente vai no veredito como `recent_touches`. Liga com `SR_LEVEL_SPENT=true`
+(padrão desligado).
+
+Simulado antes de subir (60 dias, 21 pares OTC, conta com 10 pares, uma operação
+por vez, teto de 3/hora): **69 → 65 operações/dia ligada 24 h, acerto 50,15% →
+50,84%**. Empate 53,6%. Os sinais de nível caem ~51%, mas o teto por hora segura
+o volume da conta. **Não é ganho de acerto que se possa prometer**: IC ±0,5 e o
+item saiu do melhor de ~20 recortes. O texto inteiro (pontuação 0-100 e as
+condições obrigatórias) também foi medido e ficou em 50–51%; ferramentas e
+números em `/root/pesquisa/sr-texto`. O código real foi conferido contra a
+simulação em EURUSD e GBPAUD: 632 entradas idênticas + 627 barradas, zero
+diferenças.
+
 ## Reversibilidade
 
 - `SR_LEVEL_TRADE=false` — desliga o sinal de nível (o filtro continua).
 - `SR_LEVEL_PROXIMITY_ATR`, `SR_LEVEL_BREAK_ATR`, `SR_LEVEL_SQUEEZE_ATR`,
   `SR_LEVEL_WICK_AGAINST_RATIO`, `SR_LEVEL_WICK_TWO_SIDED_RATIO` — limites.
 - `WICK_FILTER=false` — desliga também o pavio do nível.
+- `SR_LEVEL_SPENT=false` — volta a operar nível gasto.
 
-Testes: `tests/test_sr_level_trade.py` (36),
+Testes: `tests/test_sr_level_trade.py` (48),
 `tests/test_entry_filter_cancel_message.py` (3),
 `frontend/src/lib/robotPresentation.anuncio.test.ts` (5).

@@ -528,5 +528,80 @@ class ForcaDaRegiaoTest(unittest.TestCase):
         self.assertNotIn("MINIMA_RECENTE", fontes)
 
 
+class NivelGastoTest(unittest.TestCase):
+    """Item 5 do texto do dono (24/09/2026): região consumida não opera.
+
+    Gasto = SR_LEVEL_SPENT_MAX_TOUCHES+ toques no total, ou
+    SR_LEVEL_SPENT_RECENT_MAX+ toques na última hora. Padrão desligado.
+    """
+
+    def _ligado(self, maximo=6, recentes=3):
+        return (
+            mock.patch.object(sr_level_trade, "SR_LEVEL_SPENT_ENABLED", True),
+            mock.patch.object(sr_level_trade, "SR_LEVEL_SPENT_MAX_TOUCHES", maximo),
+            mock.patch.object(sr_level_trade, "SR_LEVEL_SPENT_RECENT_MAX", recentes),
+        )
+
+    def _na_resistencia(self):
+        return com_preco(ALTO - 0.00005, subindo_ate(ALTO - 0.1 * PASSO))
+
+    def test_padrao_desligado_nao_muda_nada(self) -> None:
+        self.assertFalse(sr_level_trade.SR_LEVEL_SPENT_ENABLED)
+        veredito = find_level_trade(self._na_resistencia())
+        self.assertIsNotNone(veredito)
+        self.assertIsNone(veredito["recent_touches"])
+
+    def test_limites(self) -> None:
+        self.assertFalse(sr_level_trade.nivel_gasto({"touches": 5}, 2))
+        self.assertTrue(sr_level_trade.nivel_gasto({"touches": 6}, 0))
+        self.assertTrue(sr_level_trade.nivel_gasto({"touches": 3}, 3))
+
+    def test_zigue_zague_martelando_o_topo_e_nivel_gasto(self) -> None:
+        """O topo da série é tocado a cada poucas velas: consumido."""
+        velas = self._na_resistencia()
+        a, b, c = self._ligado()
+        with a, b, c:
+            self.assertIsNone(find_level_trade(velas))
+
+    def test_quem_barra_e_o_nivel_gasto(self) -> None:
+        """Com os limites fora de alcance a mesma vela volta a operar, com a contagem gravada."""
+        velas = self._na_resistencia()
+        a, b, c = self._ligado(maximo=999, recentes=999)
+        with a, b, c:
+            veredito = find_level_trade(velas)
+        self.assertIsNotNone(veredito)
+        self.assertEqual(veredito["direction"], "PUT")
+        self.assertIsInstance(veredito["recent_touches"], int)
+
+    def test_so_os_toques_da_ultima_hora_barram(self) -> None:
+        """Com o total liberado, o limite de toques recentes decide sozinho."""
+        velas = self._na_resistencia()
+        a, b, c = self._ligado(maximo=999, recentes=999)
+        with a, b, c:
+            recentes = find_level_trade(velas)["recent_touches"]
+        self.assertGreater(recentes, 0)
+        a, b, c = self._ligado(maximo=999, recentes=recentes + 1)
+        with a, b, c:
+            self.assertIsNotNone(find_level_trade(velas))
+        a, b, c = self._ligado(maximo=999, recentes=recentes)
+        with a, b, c:
+            self.assertIsNone(find_level_trade(velas))
+
+    def test_toques_recentes_respeita_janela_e_idade(self) -> None:
+        """Conta topos/fundos perto do nível entre fim-60 e fim-3, nada fora disso."""
+        plano = [_vela(1.0, 1.0, i * 60) for i in range(150)]
+        fim = len(plano) - 1
+
+        def espeta(i):
+            plano[i] = {**plano[i], "max": 1.0010}
+
+        for i in (fim - 90, fim - 50, fim - 20, fim - 1):
+            espeta(i)
+        atr = 0.0004  # raio 0,25 ATR = 0,0001: só os espetos a 1,0010 contam
+        n = sr_level_trade._toques_recentes(plano, 1.0010, atr)
+        # fim-90 é velho demais e fim-1 é novo demais (idade mínima de 3 velas)
+        self.assertEqual(n, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
