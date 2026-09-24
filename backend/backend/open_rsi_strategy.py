@@ -221,15 +221,18 @@ def rsi_open_evaluate(
 def rsi_open_confidence(rsi: float | None, timeframe: str) -> int:
     """Confiança exibida, na mesma escala curta da REV-Z (55 a 75).
 
-    Cresce com a distância além do limite de CONFIRMAÇÃO. Indicação que ainda
-    não chegou ao limite cheio fica no chão (55), que é o piso do portão.
+    Cresce com a distância além do limite de INDICAÇÃO. Serve para ORDENAR os
+    candidatos do ciclo: o mais esticado vem primeiro e, se a vela fechada não
+    confirmar, o próximo da fila ainda é o segundo mais esticado. Até 24/09 a
+    escala partia do limite de confirmação, e quase toda indicação empatava em
+    55 — a ordem virava a do motor clássico, que não tem relação com o RSI.
     """
-    limites = rsi_open_limits(timeframe)
+    limites = rsi_open_limits(timeframe, nominate=True)
     if rsi is None or limites is None:
         return 0
     baixo, alto = limites
     excesso = max(0.0, baixo - rsi, rsi - alto)
-    return int(round(min(float(REVZ_CONFIDENCE_MAX), REVZ_CONFIDENCE_FLOOR + excesso * 2.0)))
+    return int(round(min(float(REVZ_CONFIDENCE_MAX), REVZ_CONFIDENCE_FLOOR + excesso * 1.5)))
 
 
 def rsi_open_confirm_at_entry(

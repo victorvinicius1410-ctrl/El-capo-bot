@@ -2018,6 +2018,7 @@ class AutoTrader:
         analysis_result: str = "NO_OPPORTUNITY_FOUND",
         last_rejection_reason: str = "NO_PATTERN_FOUND",
         clear_pending: bool = True,
+        analyze_current_candle: bool = False,
     ) -> RobotState:
         """
         Agenda a próxima varredura contínua do mercado.
@@ -2025,6 +2026,13 @@ class AutoTrader:
         Sem oportunidade: espera a próxima janela de análise da vela do
         timeframe (M1/M5/M15). Falhas operacionais usam backoff curto.
         A compra continua restrita à janela 0–8s do início da vela.
+
+        ``analyze_current_candle`` (24/09/2026): quando a entrada foi cancelada
+        no segundo 0-3 da vela (confirmação do mercado aberto recusada), não há
+        ordem em andamento e a janela de análise DESTA vela (segundos 5-20)
+        ainda vai abrir. Pular para a próxima vela custava um minuto inteiro no
+        M1 — às 18:03 de 24/09 a conta 81c49f33 ficou sem analisar justamente a
+        vela em que quatro pares chegaram ao extremo.
         """
         state = self.get(user_id)
         if clear_pending:
@@ -2075,7 +2083,7 @@ class AutoTrader:
         operational = last_rejection_reason in non_market_reasons
         wait_seconds = self._schedule_continuous_wait(
             state,
-            force_next_candle=not operational,
+            force_next_candle=not operational and not analyze_current_candle,
             operational_backoff=operational,
         )
         logger.info(

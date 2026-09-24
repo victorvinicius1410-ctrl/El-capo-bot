@@ -354,6 +354,18 @@ SR_LEVEL_NON_WAIVABLE = frozenset(
 # RSI) é a mesma coisa — a análise só INDICOU, e a vela fechada não confirmou.
 # Caía em "Entrada rejeitada: nenhum ativo disponível"; com o RSI indicando
 # várias vezes por hora, o cliente via isso o tempo todo sem ter havido ordem.
+# Os do mercado aberto, à parte: depois deles a análise volta NA VELA ATUAL
+# (ver `schedule_next_analysis_session(analyze_current_candle=True)`).
+OPEN_MARKET_CONFIRM_CANCEL_REASONS = frozenset(
+    {
+        "REVZ_SEM_EXTREMO_NO_FECHAMENTO",
+        "REVZ_DIRECAO_VIROU",
+        "REVZ_CONFIRMACAO_SEM_DADOS",
+        "RSI_SEM_EXTREMO_NO_FECHAMENTO",
+        "RSI_DIRECAO_VIROU",
+        "RSI_CONFIRMACAO_SEM_DADOS",
+    }
+)
 ENTRY_FILTER_CANCEL_REASONS = frozenset(
     {
         "PAVIO_NA_ENTRADA",
@@ -4653,6 +4665,25 @@ def analysis_payload_allows_early_stop(payload: Any) -> bool:
         return False
     signal = str(data.get("signal") or data.get("direction") or "").upper()
     return bool(data.get("trade_allowed")) and signal in {"CALL", "PUT"}
+
+
+def analysis_payload_is_open_market_strategy(payload: Any) -> bool:
+    """Indica se o sinal aprovado veio da estratégia do mercado aberto.
+
+    O early stop não vale para ele (24/09/2026). A indicação do aberto é feita
+    com a vela em formação e só vira ordem se a vela FECHADA confirmar — e a
+    maioria não confirma. Parando no primeiro par aprovado, o ciclo ficava com
+    um candidato só: às 18:04 de 24/09 a conta 81c49f33 parou no USDJPY, a
+    confirmação dele falhou e AUDUSD e GBPUSD, no extremo, nunca foram olhados.
+    São 11 pares; varrer todos cabe na janela de análise.
+    """
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    symbol = str(data.get("symbol") or data.get("active") or "")
+    return is_revz_candidate(data) and not is_otc_symbol(symbol)
 
 
 def should_keep_pending_on_cycle_timeout(state: Any) -> bool:
@@ -11721,7 +11752,11 @@ async def scan_local_signals(
         results.append(result)
         advance_analysis_asset_cursor(user_id, market_mode=resolved_mode)
         robot_worker_last_tick_at[user_id] = utc_now()
-        if ANALYSIS_EARLY_STOP_ENABLED and analysis_payload_allows_early_stop(result[2]):
+        if (
+            ANALYSIS_EARLY_STOP_ENABLED
+            and analysis_payload_allows_early_stop(result[2])
+            and not analysis_payload_is_open_market_strategy(result[2])
+        ):
             remaining = analysis_assets[index + 1 :]
             logger.info(
                 "[ANALYSIS_EARLY_STOP] user_id=%s symbol=%s remaining=%s",
@@ -11883,9 +11918,14 @@ def candidate_quality_tier(candidate: dict[str, Any] | None) -> int:
     """
     if not isinstance(candidate, dict):
         return -1
+    symbol = str(candidate.get("symbol") or candidate.get("active") or "")
+    if is_revz_candidate(candidate) and not is_otc_symbol(symbol):
+        # Mercado aberto (REV-Z/RSI): o setup de price action é do motor
+        # clássico e não diz nada sobre esta tese. Tier fixo, e quem ordena é
+        # o `strategy_score`, que no RSI cresce com o quão esticado está.
+        return 3
     setup = candidate_price_action_setup(candidate)
     direction = str(candidate.get("direction") or candidate.get("signal") or "").upper()
-    symbol = str(candidate.get("symbol") or candidate.get("active") or "")
 
     if setup in {"", "WEAK", "NONE", "UNKNOWN", "?"}:
         return 0
@@ -14854,6 +14894,7 @@ async def execute_robot_cycle(
                     user_id,
                     analysis_result="NO_OPPORTUNITY_FOUND",
                     last_rejection_reason=last_filter_cancel,
+                    analyze_current_candle=last_filter_cancel in OPEN_MARKET_CONFIRM_CANCEL_REASONS,
                 )
                 return 200, build_robot_payload(state)
             state = auto_trader.reject_order(

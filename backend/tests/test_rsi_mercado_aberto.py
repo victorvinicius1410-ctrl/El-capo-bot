@@ -317,6 +317,72 @@ class ConfirmacaoNoDisparoTest(RsiLigado):
         self.assertEqual(motivo, "RSI_CONFIRMACAO_SEM_DADOS")
 
 
+class CicloDoAbertoTest(unittest.TestCase):
+    """24/09 18:02-18:05, conta 81c49f33: o sinal real das 18:04 foi perdido.
+
+    A confirmação das 18:03 (GBPUSD) foi recusada e o ciclo pulou a análise da
+    própria vela; às 18:04 o scan parou no primeiro par (USDJPY), a confirmação
+    dele falhou e não havia segundo candidato — AUDUSD e GBPUSD estavam no
+    extremo e nunca foram olhados.
+    """
+
+    def test_confirmacao_recusada_analisa_a_vela_atual(self) -> None:
+        from datetime import datetime, timezone
+
+        from backend import auto_trader as at
+
+        segundo_2 = datetime(2026, 9, 24, 18, 3, 2, tzinfo=timezone.utc)
+        for analisa_agora, espera_maxima in ((True, 5), (False, 70)):
+            trader = at.AutoTrader()
+            trader.start("user-ciclo-aberto")
+            trader.get("user-ciclo-aberto").timeframe = "M1"
+            with mock.patch.object(at, "utc_now", return_value=segundo_2):
+                state = trader.schedule_next_analysis_session(
+                    "user-ciclo-aberto",
+                    last_rejection_reason="RSI_SEM_EXTREMO_NO_FECHAMENTO",
+                    analyze_current_candle=analisa_agora,
+                )
+            espera = (state.next_cycle_at - segundo_2).total_seconds()
+            if analisa_agora:
+                # Volta no segundo 5 da MESMA vela: entra na abertura da próxima.
+                self.assertLessEqual(espera, espera_maxima)
+            else:
+                self.assertGreater(espera, 60)
+
+    def test_so_a_recusa_do_aberto_volta_na_vela_atual(self) -> None:
+        for codigo in ("RSI_SEM_EXTREMO_NO_FECHAMENTO", "RSI_CONFIRMACAO_SEM_DADOS", "REVZ_DIRECAO_VIROU"):
+            self.assertIn(codigo, main.OPEN_MARKET_CONFIRM_CANCEL_REASONS)
+            self.assertIn(codigo, main.ENTRY_FILTER_CANCEL_REASONS)
+        # OTC continua como estava: S/R e pavio esperam a próxima vela.
+        for codigo in ("PAVIO_NA_ENTRADA", "SR_ZONE_NA_ENTRADA"):
+            self.assertNotIn(codigo, main.OPEN_MARKET_CONFIRM_CANCEL_REASONS)
+
+    def test_early_stop_nao_para_no_candidato_do_aberto(self) -> None:
+        aberto = {"ok": True, "data": {"symbol": "USDJPY", "signal": "PUT", "trade_allowed": True,
+                                       "revz": {"strategy": "RSI", "direction": "PUT"}}}
+        otc = {"ok": True, "data": {"symbol": "USDJPY-OTC", "signal": "PUT", "trade_allowed": True}}
+        self.assertTrue(main.analysis_payload_allows_early_stop(aberto))
+        self.assertTrue(main.analysis_payload_is_open_market_strategy(aberto))
+        self.assertFalse(main.analysis_payload_is_open_market_strategy(otc))
+
+    def test_mais_esticado_vem_primeiro(self) -> None:
+        # Mesmo limite de indicação (28/72 no M1 com 22 e folga 6).
+        with mock.patch.dict(rsi.RSI_OPEN_LOW, {"M1": 22}):
+            conf = {nome: rsi.rsi_open_confidence(valor, "M1")
+                    for nome, valor in (("USDJPY", 74.7), ("AUDUSD", 19.6), ("GBPUSD", 20.0))}
+        self.assertGreater(conf["AUDUSD"], conf["GBPUSD"])
+        self.assertGreater(conf["GBPUSD"], conf["USDJPY"])
+        candidatos = [
+            {"symbol": s, "direction": d, "strategy_score": conf[s], "payout": 85.0, "confidence": conf[s],
+             "revz": {"strategy": "RSI", "direction": d}, "price_action_setup": setup}
+            # O setup do clássico NÃO pode decidir: USDJPY com "REVERSAL" e os
+            # outros "WEAK" ordenariam ao contrário.
+            for s, d, setup in (("USDJPY", "PUT", "REVERSAL"), ("AUDUSD", "CALL", "WEAK"), ("GBPUSD", "CALL", "WEAK"))
+        ]
+        ordem = [c["symbol"] for c in sorted(candidatos, key=main.candidate_rank, reverse=True)]
+        self.assertEqual(ordem, ["AUDUSD", "GBPUSD", "USDJPY"])
+
+
 class CacheDeVelasTest(unittest.TestCase):
     """O defeito que escondia o aberto: vela de outro ativo e de minutos atrás."""
 
