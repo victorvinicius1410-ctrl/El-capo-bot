@@ -92,6 +92,30 @@ class MensagemDeCancelamentoTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["status"], STATUS_WAITING_NEXT_CYCLE)
         self.assertEqual(data["last_rejection_reason"], "SR_ZONE_NA_ENTRADA")
 
+    async def test_confirmacao_do_aberto_nao_vira_entrada_rejeitada(self) -> None:
+        """24/09: RSI/REV-Z indicou e a vela fechada não confirmou — sem ordem."""
+        for codigo in (
+            "RSI_SEM_EXTREMO_NO_FECHAMENTO",
+            "RSI_DIRECAO_VIROU",
+            "RSI_CONFIRMACAO_SEM_DADOS",
+            "REVZ_SEM_EXTREMO_NO_FECHAMENTO",
+        ):
+            with self.subTest(codigo=codigo):
+                usuario = f"user-cancel-{codigo.lower()}"
+                # O caminho da recusa não depende do ativo; o -OTC só evita a
+                # revalidação de canal (`/payouts`) que o mock não atende.
+                _preparar(usuario, ("EURUSD-OTC",))
+                state = main.auto_trader.get(usuario)
+                veredito = {"strategy": "RSI", "direction": "CALL", "timeframe": "M1"}
+                for candidato in [state.pending_signal, *state.candidates]:
+                    candidato["revz"] = dict(veredito)
+                with patch.object(main, "confirm_revz_before_entry", new=AsyncMock(return_value=codigo)):
+                    _, payload = await self._rodar(usuario, [None])
+                data = payload["data"]
+                self.assertEqual(data["status"], STATUS_WAITING_NEXT_CYCLE)
+                self.assertEqual(data["last_rejection_reason"], codigo)
+                self.assertEqual(self.compras, [])
+
     async def test_corretora_recusando_os_outros_ainda_e_rejeicao(self) -> None:
         """Filtro no primeiro, corretora recusando os seguintes: houve compra."""
         _preparar("user-cancel-misto", ("EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC"))

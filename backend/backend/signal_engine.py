@@ -55,6 +55,14 @@ from backend.support_resistance_strategy import (  # noqa: E402
     sr_evaluate,
 )
 from backend.live_demo_mode import apply_live_demo  # noqa: E402
+from backend.open_rsi_strategy import (  # noqa: E402
+    STRATEGY_RSI_OPEN,
+    is_rsi_open_active,
+    rsi_open_candle_timeframe,
+    rsi_open_confidence,
+    rsi_open_evaluate,
+    rsi_open_text,
+)
 from backend.narrativa_analise import monta_narrativa  # noqa: E402
 from backend.named_strategies import (  # noqa: E402
     STRATEGY_LABELS,
@@ -801,7 +809,12 @@ def analyze_signal(
     # velas do próprio timeframe mediria outra coisa (49,59% em M5 e 41,67% em
     # M15, medido em 05/09) — melhor não operar a vela.
     velas_revz = normalized if str(timeframe).upper() == "M1" else velas_m1
-    resultado = apply_revz_override(resultado, symbol, velas_revz)
+    if is_rsi_open_active():
+        # RSI (24/09): M1 e M5 leem as velas M1; M15 lê a própria vela M15 —
+        # foi o que o backtest mediu melhor em cada timeframe.
+        velas_tf = rsi_open_candle_timeframe(timeframe)
+        velas_revz = normalized if velas_tf == str(timeframe).upper() else velas_m1
+    resultado = apply_revz_override(resultado, symbol, velas_revz, timeframe=timeframe)
     resultado = apply_sr_override(resultado, symbol, normalized)
     resultado = apply_vertex_override(resultado, symbol, velas_z)
     # Depois de todas as estratégias: com o preço perto de um nível, quem manda
@@ -1144,8 +1157,15 @@ def apply_revz_override(
     signal: dict[str, Any],
     symbol: str,
     normalized: list[dict[str, float]],
+    *,
+    timeframe: str = "M1",
 ) -> dict[str, Any]:
     """Sobrepõe a decisão do motor clássico pela estratégia REV-Z.
+
+    Com ``OPEN_MARKET_STRATEGY=RSI`` (24/09/2026) quem decide o mercado aberto
+    é o RSI extremo por timeframe (``open_rsi_strategy``), pelo MESMO caminho:
+    veredito no campo ``revz``, respeito ao nível, portões e confirmação no
+    disparo. Só o cálculo e o texto mudam.
 
     Roda DEPOIS do pipeline clássico de propósito: o sinal já vem com o
     contrato completo (métricas, filtros, score), e aqui só a decisão de
@@ -1177,12 +1197,21 @@ def apply_revz_override(
     if not REVZ_ENABLED or is_otc_symbol(symbol):
         return signal
 
-    veredito = revz_evaluate(
-        symbol,
-        [c["close"] for c in normalized],
-        threshold=REVZ_NOMINATE_THRESHOLD,
-    )
-    veredito["confirm_threshold"] = REVZ_THRESHOLD
+    usa_rsi = is_rsi_open_active()
+    if usa_rsi:
+        veredito = rsi_open_evaluate(
+            symbol,
+            [c["close"] for c in normalized],
+            timeframe,
+            nominate=True,
+        )
+    else:
+        veredito = revz_evaluate(
+            symbol,
+            [c["close"] for c in normalized],
+            threshold=REVZ_NOMINATE_THRESHOLD,
+        )
+        veredito["confirm_threshold"] = REVZ_THRESHOLD
     direcao = veredito["direction"]
     if direcao is not None and normalized:
         # "Nunca contra o nível" vale para toda estratégia (regra do dono,
@@ -1191,12 +1220,18 @@ def apply_revz_override(
         # REV-Z não pede rejeição confirmada: o extremo do z é a tese dela.
         respeita, motivo = evaluate_respect(direcao, _support_resistance_context(normalized), normalized[-1])
         if not respeita and motivo in NIVEL_A_FRENTE:
-            veredito = dict(veredito, direction=None, blocked="REVZ_CONTRA_O_NIVEL")
+            contra = "RSI_CONTRA_O_NIVEL" if usa_rsi else "REVZ_CONTRA_O_NIVEL"
+            veredito = dict(veredito, direction=None, blocked=contra)
     bloqueados = [f for f in (signal.get("blocked_filters") or []) if not str(f).startswith("REVZ_")]
     signal["revz"] = veredito
-    signal["strategy_name"] = "REV-Z reversão em desvio extremo"
-    signal["strategy_key"] = STRATEGY_REVZ
-    signal["confidence_model_version"] = "revz-v1"
+    if usa_rsi:
+        signal["strategy_name"] = "RSI extremo — reversão no mercado aberto"
+        signal["strategy_key"] = STRATEGY_RSI_OPEN
+        signal["confidence_model_version"] = "rsi-aberto-v1"
+    else:
+        signal["strategy_name"] = "REV-Z reversão em desvio extremo"
+        signal["strategy_key"] = STRATEGY_REVZ
+        signal["confidence_model_version"] = "revz-v1"
 
     if veredito["direction"] is None:
         signal["signal"] = "WAIT"
@@ -1211,7 +1246,9 @@ def apply_revz_override(
         signal["quality_reason"] = str(veredito["blocked"])
         # A leitura do motor clássico ("Vou de PUT — o desenho está claro")
         # não pode ficar na tela de uma vela em que o aberto não opera.
-        if veredito.get("z") is not None:
+        if usa_rsi:
+            texto = rsi_open_text(symbol, veredito)
+        elif veredito.get("z") is not None:
             texto = (
                 f"{symbol}: preço a {abs(veredito['z']):.1f} desvios da média das últimas "
                 f"{veredito['lookback']} velas. Sem esticão suficiente para a reversão — "
@@ -1223,7 +1260,10 @@ def apply_revz_override(
             signal[campo] = texto
         return signal
 
-    conf = revz_confidence(veredito["z"])
+    if usa_rsi:
+        conf = rsi_open_confidence(veredito["rsi"], timeframe)
+    else:
+        conf = revz_confidence(veredito["z"])
     signal["signal"] = veredito["direction"]
     signal["direction"] = veredito["direction"]
     signal["analyzed_direction"] = veredito["direction"]
@@ -1237,6 +1277,18 @@ def apply_revz_override(
     signal["blocked_filters"] = []
     signal["block_reasons"] = []
     signal["quality_reason"] = "OK"
+    if usa_rsi:
+        texto = rsi_open_text(symbol, veredito)
+        for campo in (
+            "reason",
+            "entry_reason",
+            "signal_explanation",
+            "narrator_text",
+            "analysis_detail",
+            "candle_reading",
+        ):
+            signal[campo] = texto
+        return signal
     z = veredito["z"]
     lado = "abaixo" if veredito["direction"] == "CALL" else "acima"
     # Sem "a tendência é voltar" (convicção) nem "se o fechamento confirmar"

@@ -90,6 +90,11 @@ from backend.reversion_strategy import (
     revz_min_confidence,
     revz_passa_portao,
 )
+from backend.open_rsi_strategy import (
+    is_rsi_open_active,
+    rsi_open_candle_timeframe,
+    rsi_open_confirm_at_entry,
+)
 from backend.live_demo_mode import (
     LIVE_CONFIDENCE,
     LIVE_MAX_EXPIRATION_MINUTES,
@@ -344,8 +349,23 @@ SR_LEVEL_NON_WAIVABLE = frozenset(
 # silencioso: o ciclo segue como "sem oportunidade" em vez de virar "entrada
 # rejeitada" — antes disso eram 66 falsos "rejeitada" em 5 horas, com a
 # mensagem genérica de "nenhum ativo disponível".
+#
+# 24/09/2026: a confirmação do mercado aberto no fechamento da vela (REV-Z e
+# RSI) é a mesma coisa — a análise só INDICOU, e a vela fechada não confirmou.
+# Caía em "Entrada rejeitada: nenhum ativo disponível"; com o RSI indicando
+# várias vezes por hora, o cliente via isso o tempo todo sem ter havido ordem.
 ENTRY_FILTER_CANCEL_REASONS = frozenset(
-    {"PAVIO_NA_ENTRADA", "SR_ZONE_NA_ENTRADA", "SR_ZONE_SEM_VERIFICACAO"}
+    {
+        "PAVIO_NA_ENTRADA",
+        "SR_ZONE_NA_ENTRADA",
+        "SR_ZONE_SEM_VERIFICACAO",
+        "REVZ_SEM_EXTREMO_NO_FECHAMENTO",
+        "REVZ_DIRECAO_VIROU",
+        "REVZ_CONFIRMACAO_SEM_DADOS",
+        "RSI_SEM_EXTREMO_NO_FECHAMENTO",
+        "RSI_DIRECAO_VIROU",
+        "RSI_CONFIRMACAO_SEM_DADOS",
+    }
 )
 CRITICAL_TRADE_BLOCKS = {
     STATUS_ACCOUNT_DISCONNECTED,
@@ -2205,19 +2225,53 @@ def cached_market_response(
     for cache_key, entry in cache.last_successful_responses.items():
         if not cache_key.startswith(f"{path}?") or utc_now() > entry.expires_at + timedelta(seconds=max_age_seconds):
             continue
-        if f"active={symbol}" not in cache_key:
+        # Comparação EXATA dos parâmetros (24/09). O teste antigo era por
+        # pedaço de texto: `active=AUDJPY` casava `active=AUDJPY-OTC`, e a
+        # conta em BOTH analisava o par aberto com a vela (e o payout) do OTC —
+        # a REV-Z indicou AUDJPY com o z do AUDJPY-OTC às 08:20 de 24/09.
+        parametros = cache_key_params(cache_key)
+        if parametros.get("active") != symbol:
             continue
         if path == "/candles":
             interval = str(params.get("interval") or "")
             count = str(params.get("count") or "")
-            if interval and f"interval={interval}" not in cache_key:
+            if interval and parametros.get("interval") != interval:
                 continue
-            if count and f"count={count}" not in cache_key:
+            if count and parametros.get("count") != count:
                 continue
         candidates.append(entry)
     if not candidates:
         return None
     return max(candidates, key=lambda item: item.expires_at)
+
+
+def cache_key_params(cache_key: str) -> dict[str, str]:
+    """Parâmetros de uma chave de ``build_cache_key`` (``/path?a=1&b=2``)."""
+    _, _, consulta = cache_key.partition("?")
+    parametros: dict[str, str] = {}
+    for parte in consulta.split("&"):
+        nome, separador, valor = parte.partition("=")
+        if separador:
+            parametros[nome] = valor
+    return parametros
+
+
+def exact_cached_candles_for_active(
+    user_id: str,
+    symbol: str,
+    timeframe: str,
+    *,
+    endtime: int,
+) -> list[dict[str, Any]]:
+    """Velas em cache SÓ se forem da mesma vela (mesma chave, mesmo ``endtime``)."""
+    params: dict[str, Any] = {
+        "active": normalize_binary_active(symbol),
+        "interval": TIMEFRAME_SECONDS[timeframe],
+        "count": ROBOT_CANDLE_COUNT,
+        "endtime": endtime,
+    }
+    cached = stale_successful_response(user_id, build_cache_key("/candles", params))
+    return extract_candles(cached.payload) if cached is not None else []
 
 
 def cached_candles_for_active(
@@ -9880,6 +9934,14 @@ async def confirm_revz_before_entry(
     Returns:
         ``None`` quando confirmado; senão o código do bloqueio.
     """
+    veredito = candidate.get("revz") if isinstance(candidate.get("revz"), dict) else {}
+    if str(veredito.get("strategy") or "").upper() == "RSI":
+        return await confirm_rsi_before_entry(
+            user_id,
+            candidate,
+            server_timestamp=server_timestamp,
+            timeout_seconds=timeout_seconds,
+        )
     direction = str(candidate.get("direction") or candidate.get("signal") or "").strip().upper()
     symbol = normalize_binary_active(str(candidate.get("symbol") or candidate.get("active") or ""))
     agora = float(server_timestamp) if server_timestamp else utc_now().timestamp()
@@ -9933,6 +9995,95 @@ async def confirm_revz_before_entry(
         direction,
         revz.get("z_indicacao"),
         None if z is None else round(z, 2),
+        motivo,
+        len(candles),
+    )
+    return motivo
+
+
+async def confirm_rsi_before_entry(
+    user_id: str,
+    candidate: dict[str, Any],
+    *,
+    server_timestamp: float | None,
+    timeout_seconds: float = REVZ_ENTRY_CONFIRM_TIMEOUT_SECONDS,
+) -> str | None:
+    """Refaz o RSI do mercado aberto com a vela que acabou de fechar.
+
+    Mesmo desenho de ``confirm_revz_before_entry``: a análise só INDICOU
+    (limite afrouxado, vela em formação); a ordem sai se o RSI da vela fechada
+    passa do limite cheio do timeframe, na mesma direção. Falha FECHADA: sem a
+    vela fechada, não opera.
+
+    As velas são as do RSI da conta — M1 para M1/M5, M15 para M15 — então a
+    vela "atual" é alinhada ao intervalo delas.
+
+    Returns:
+        ``None`` quando confirmado; senão o código do bloqueio.
+    """
+    veredito = dict(candidate.get("revz") or {})
+    timeframe = str(veredito.get("timeframe") or "M1").strip().upper()
+    velas_tf = rsi_open_candle_timeframe(timeframe) or "M1"
+    intervalo = TIMEFRAME_SECONDS.get(velas_tf, 60)
+    direction = str(candidate.get("direction") or candidate.get("signal") or "").strip().upper()
+    symbol = normalize_binary_active(str(candidate.get("symbol") or candidate.get("active") or ""))
+    agora = float(server_timestamp) if server_timestamp else utc_now().timestamp()
+    vela_atual = int(agora // intervalo) * intervalo
+    try:
+        # Direto na corretora, sem o cache da análise (ver a função da REV-Z).
+        status_code, payload = await asyncio.wait_for(
+            call_bullex_service(
+                "GET",
+                "/candles",
+                user_id,
+                params={
+                    "active": symbol,
+                    "interval": intervalo,
+                    "count": ROBOT_CANDLE_COUNT + 10,
+                },
+            ),
+            timeout=timeout_seconds,
+        )
+        candles = extract_candles(payload) if status_code < 400 and payload.get("ok") else []
+    except Exception:
+        logger.warning(
+            "[RSI_ENTRY_CONFIRM_ERRO] user_id=%s symbol=%s acao=NAO_OPERA",
+            user_id,
+            symbol,
+            exc_info=True,
+        )
+        return "RSI_CONFIRMACAO_SEM_DADOS"
+    closes = closes_of_closed_candles(
+        candles,
+        current_candle_start=vela_atual,
+        interval_seconds=intervalo,
+    )
+    confirmado, rsi, motivo = rsi_open_confirm_at_entry(closes, direction, timeframe)
+    veredito["rsi_indicacao"] = veredito.get("rsi")
+    veredito["rsi_confirmacao"] = rsi
+    veredito["confirmacao"] = motivo
+    candidate["revz"] = veredito
+    if confirmado:
+        logger.info(
+            "[RSI_ENTRY_CONFIRMED] user_id=%s symbol=%s timeframe=%s direction=%s "
+            "rsi_indicacao=%s rsi_fechamento=%.1f",
+            user_id,
+            symbol,
+            timeframe,
+            direction,
+            veredito.get("rsi_indicacao"),
+            rsi,
+        )
+        return None
+    logger.warning(
+        "[RSI_ENTRY_NOT_CONFIRMED] user_id=%s symbol=%s timeframe=%s direction=%s "
+        "rsi_indicacao=%s rsi_fechamento=%s motivo=%s velas=%s",
+        user_id,
+        symbol,
+        timeframe,
+        direction,
+        veredito.get("rsi_indicacao"),
+        None if rsi is None else round(rsi, 1),
         motivo,
         len(candles),
     )
@@ -10959,7 +11110,15 @@ async def load_candles_for_active(
         Tupla (candles, used_cache, error_code). ``error_code`` pode ser
         ``SESSION_DISCONNECTED`` quando a sessao Bullex caiu.
     """
-    cached_candles = cached_candles_for_active(user_id, symbol, timeframe, endtime=endtime)
+    # Antes de buscar, só vale o cache da MESMA vela (24/09). O fallback
+    # largo ignora o `endtime` e devolvia velas de 1-3 min atrás: medido em
+    # 24/09, 58 buscas para 194 análises numa conta M1; nos 165 eventos da
+    # REV-Z de 14-24/09 isso derrubava de 20% a 63% das indicações. O fallback
+    # largo continua abaixo, para quando a corretora falha ou demora.
+    if endtime is not None:
+        cached_candles = exact_cached_candles_for_active(user_id, symbol, timeframe, endtime=endtime)
+    else:
+        cached_candles = cached_candles_for_active(user_id, symbol, timeframe)
     if cached_candles:
         return cached_candles, True, None
 
@@ -11180,7 +11339,13 @@ async def analyze_active_signal(
     # e 41,67% (M15), contra 60,56% em M1. A expiração maior é que ajuda —
     # M5 mede 67,31% no holdout com o SINAL vindo do M1.
     velas_m1: list[dict[str, Any]] | None = None
-    if REVZ_ENABLED and operation_timeframe != "M1" and not is_otc_symbol(symbol):
+    # Com o RSI (24/09) só o M5 precisa das M1: o M15 lê a própria vela M15.
+    precisa_m1 = (
+        rsi_open_candle_timeframe(operation_timeframe) == "M1"
+        if is_rsi_open_active()
+        else True
+    )
+    if REVZ_ENABLED and precisa_m1 and operation_timeframe != "M1" and not is_otc_symbol(symbol):
         # Buscar de verdade, não só ler o cache: conta M5/M15 não tem ninguém
         # enchendo o cache M1 daquele par, e sem as M1 a vela fica sem entrada.
         # Só no mercado aberto — o OTC não usa a REV-Z.
