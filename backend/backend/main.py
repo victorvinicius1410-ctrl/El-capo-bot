@@ -3392,10 +3392,12 @@ def sync_marketing_display_to_robot(
                 value = item.get(field)
                 if value is not None:
                     trade[field] = value
-            robot_persistence.save_trade_history(user_id, trade)
-            invalidate_daily_history_cache(user_id)
-            synced_trades.append(trade)
-            memory_by_id[trade_id] = trade
+            # Centraliza a regra do LIVE também neste caminho de sincronização
+            # do painel marketing. Sem isso, uma perda podia reaparecer no
+            # Histórico ao sincronizar uma operação já espelhada.
+            if save_visible_trade_history(user_id, trade):
+                synced_trades.append(trade)
+                memory_by_id[trade_id] = trade
         merged = list(memory_by_id.values())
         merged.sort(key=lambda trade: str(trade.get("finished_at") or trade.get("sent_at") or ""))
         auto_trader.replace_history(user_id, merged)
@@ -13365,8 +13367,7 @@ async def timeout_monitored_trade(user_id: str, order_id: str) -> None:
         timed_out, state = auto_trader.timeout_trade(user_id, order_id)
         if timed_out and state.last_trade:
             try:
-                robot_persistence.save_trade_history(user_id, state.last_trade)
-                invalidate_daily_history_cache(user_id)
+                save_visible_trade_history(user_id, state.last_trade)
                 logger.info(
                     "[HISTORY_SAVED] user_id=%s order_id=%s result=TIMEOUT final_result=TIMEOUT",
                     user_id,

@@ -336,6 +336,15 @@ def should_hide_live_loss(trade: dict[str, Any], state: Any | None = None) -> bo
     return trade.get("live_mode_active") is True
 
 
+def is_live_mode_trade(trade: dict[str, Any]) -> bool:
+    """Indica se a ordem foi aberta enquanto o modo LIVE estava ativo.
+
+    Não consulta o estado atual do painel porque o modo pode ser desligado
+    antes do resultado chegar. A marca da própria ordem é a fonte de verdade.
+    """
+    return trade.get("live_mode_active") is True
+
+
 GALE_STEPS_MIN = 1
 GALE_STEPS_MAX = 10
 
@@ -2887,16 +2896,21 @@ class AutoTrader:
             return None
         amount = float(trade.get("amount") or 0)
         lucro = float(profit or 0)
+        ocultar_loss = should_hide_live_loss({**trade, "result": normalizado}, state)
         if normalizado == "WIN":
             lucro = lucro if lucro > 0 else amount
             state.wins += 1
         elif normalizado == "LOSS":
             lucro = lucro if lucro < 0 else -amount
-            if not should_hide_live_loss({**trade, "result": normalizado}, state):
+            if not ocultar_loss:
                 state.losses += 1
         else:
             lucro = 0.0
-        state.profit = round(float(state.profit or 0) + lucro, 2)
+        # No LIVE, uma perda não participa de nenhum valor mostrado no
+        # placar. Mantemos `lucro` no espelho técnico da ordem, mas não o
+        # aplicamos no saldo público da sessão.
+        saldo_do_placar = 0.0 if ocultar_loss else lucro
+        state.profit = round(float(state.profit or 0) + saldo_do_placar, 2)
         completed.add(order_id)
         fechado = dict(trade)
         fechado.update(
@@ -2960,7 +2974,10 @@ class AutoTrader:
         ocultar_loss = should_hide_live_loss(trade, state)
         if not ocultar_loss:
             state.losses += 1
-        state.profit = round(float(state.profit or 0) + cycle_profit, 2)
+        # O prejuízo da perna abandonada do LIVE fica apenas no espelho
+        # técnico para reconciliação; não reduz o saldo do placar.
+        saldo_do_placar = 0.0 if ocultar_loss else cycle_profit
+        state.profit = round(float(state.profit or 0) + saldo_do_placar, 2)
         state.cycle_result = "LOSS"
         trade.update({"cycle_result": "LOSS", "final_result": "LOSS"})
         state.last_trade = trade
@@ -3136,7 +3153,12 @@ class AutoTrader:
             state.cycle_result = "LOSS"
 
         cycle_profit = trade_profit
-        if is_gale_trade:
+        if is_live_mode_trade(trade):
+            # LIVE mostra exclusivamente o valor das vitórias. Em um gale,
+            # `gale_chain_profit` contém as perdas anteriores; somá-lo faria
+            # o saldo cair de forma indireta mesmo ocultando o LOSS.
+            cycle_profit = trade_profit if normalized_result == "WIN" else 0.0
+        elif is_gale_trade:
             # Soma a sequência inteira (entrada original + todas as etapas
             # anteriores), não só a etapa imediatamente anterior.
             cycle_profit = round(float(state.gale_chain_profit or 0) + trade_profit, 2)
@@ -3301,6 +3323,7 @@ class AutoTrader:
             for trade in trades
             if str(trade.get("result") or "").strip().upper()
             in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
+            and not should_hide_live_loss(trade)
         ][-100:]
         self._histories[normalized_user] = finished
         # Ordens concluídas nunca são esquecidas: o set evita reprocessar um
