@@ -116,6 +116,56 @@ class MensagemDeCancelamentoTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(data["last_rejection_reason"], codigo)
                 self.assertEqual(self.compras, [])
 
+    async def test_velas_antes_da_revalidacao_do_canal(self) -> None:
+        """25/09: o `/payouts` do aberto (4-5 s) ocupava a sessão da conta e a
+        busca de velas da confirmação estourava o tempo na fila atrás dele."""
+        usuario = "user-ordem-disparo"
+        _preparar(usuario, ("EURUSD",))
+        state = main.auto_trader.get(usuario)
+        veredito = {"strategy": "RSI", "direction": "CALL", "timeframe": "M1"}
+        for candidato in [state.pending_signal, *state.candidates]:
+            candidato["revz"] = dict(veredito)
+        ordem: list[str] = []
+
+        async def confirmar(*_a, **_k):
+            ordem.append("confirmacao")
+            return None
+
+        async def nivel(*_a, **_k):
+            ordem.append("nivel")
+            return None
+
+        async def canal(_u, candidato, *_a, **_k):
+            ordem.append("canal")
+            return dict(candidato)
+
+        with (
+            patch.object(main, "confirm_revz_before_entry", new=AsyncMock(side_effect=confirmar)),
+            patch.object(main, "refresh_candidate_execution_channel", new=AsyncMock(side_effect=canal)),
+        ):
+            await self._rodar(usuario, nivel)
+        self.assertEqual(ordem[:3], ["confirmacao", "nivel", "canal"])
+
+    async def test_confirmacao_recusada_nao_revalida_o_canal(self) -> None:
+        usuario = "user-ordem-recusa"
+        _preparar(usuario, ("EURUSD",))
+        state = main.auto_trader.get(usuario)
+        for candidato in [state.pending_signal, *state.candidates]:
+            candidato["revz"] = {"strategy": "RSI", "direction": "CALL", "timeframe": "M1"}
+        canal = AsyncMock(side_effect=lambda _u, c, *_a, **_k: dict(c))
+        with (
+            patch.object(
+                main,
+                "confirm_revz_before_entry",
+                new=AsyncMock(return_value="RSI_SEM_EXTREMO_NO_FECHAMENTO"),
+            ),
+            patch.object(main, "refresh_candidate_execution_channel", new=canal),
+        ):
+            _, payload = await self._rodar(usuario, [None])
+        canal.assert_not_called()
+        self.assertEqual(payload["data"]["status"], STATUS_WAITING_NEXT_CYCLE)
+        self.assertEqual(self.compras, [])
+
     async def test_corretora_recusando_os_outros_ainda_e_rejeicao(self) -> None:
         """Filtro no primeiro, corretora recusando os seguintes: houve compra."""
         _preparar("user-cancel-misto", ("EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC"))

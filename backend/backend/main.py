@@ -14240,16 +14240,13 @@ async def execute_robot_cycle(
                         state.order_attempts,
                     )
                     continue
-                if not is_gale_order:
-                    candidate = await refresh_candidate_execution_channel(
-                        user_id,
-                        candidate,
-                        state.timeframe,
-                        fresh_timeout_seconds=min(
-                            CHANNEL_REVALIDATION_TIMEOUT_SECONDS,
-                            revalidation_deadline - monotonic(),
-                        ),
-                    )
+                # As velas vêm ANTES da revalidação do canal (25/09/2026). A
+                # sessão da conta no bullex-service atende uma chamada por vez:
+                # o `/payouts` do par aberto leva 4-5 s na corretora, o robô
+                # desiste dele em 0,9 s, mas a chamada segue ocupando a sessão
+                # e a busca de velas da confirmação fica na fila até o segundo
+                # 4-5. Em 6 h foram 55 confirmações do RSI perdidas por
+                # timeout — 49 logo depois de um CHANNEL_REVALIDATION_TIMEOUT.
                 validation_reason = None
                 if not is_gale_order and is_revz_candidate(candidate):
                     # REV-Z: a condição simulada (|z| no FECHAMENTO da vela
@@ -14271,6 +14268,16 @@ async def execute_robot_cycle(
                         candidate,
                         state.timeframe,
                         server_timestamp=entry_window.get("server_timestamp"),
+                    )
+                if validation_reason is None and not is_gale_order:
+                    candidate = await refresh_candidate_execution_channel(
+                        user_id,
+                        candidate,
+                        state.timeframe,
+                        fresh_timeout_seconds=min(
+                            CHANNEL_REVALIDATION_TIMEOUT_SECONDS,
+                            revalidation_deadline - monotonic(),
+                        ),
                     )
                 if validation_reason is None and not is_gale_order:
                     validation_reason = resolve_entry_validation_reason(
