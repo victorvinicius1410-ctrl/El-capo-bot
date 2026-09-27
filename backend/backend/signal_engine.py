@@ -95,6 +95,9 @@ TIMEFRAME_SECONDS_BY_NAME: dict[str, int] = {
 }
 # Janela em que a análise técnica varre o mercado dentro de cada vela.
 ANALYSIS_WINDOW_BOUNDS: tuple[int, int] = (5, 20)
+# Timeframes que varrem todos os pares e não perdem a vela depois de um
+# resultado (27/09/2026). Ver `main.timeframe_scans_full_market`.
+FULL_SCAN_TIMEFRAMES = frozenset({"M5", "M15", "M30"})
 # Backoff curto quando candles/payout/sessão falham (não espera ciclo legado).
 OPERATIONAL_RETRY_SECONDS = 30
 MIN_OPERATIONS_PER_HOUR_BY_TIMEFRAME: dict[str, int] = {
@@ -587,6 +590,41 @@ def seconds_until_next_analysis(
     if seconds_in_candle < start:
         return max(1, int(math.ceil(start - seconds_in_candle)))
     return max(1, int(math.ceil(expiration - seconds_in_candle + start)))
+
+
+def seconds_until_analysis_after_result(
+    timeframe: str | None,
+    finished_timestamp: float | None,
+    server_timestamp: float,
+) -> int:
+    """Espera até a próxima análise quando o resultado sai da tela.
+
+    O resultado fica 5 s no painel e o ciclo é reagendado quando ele sai — no
+    segundo ~6 da vela, com a janela de análise (5-20 s) já aberta. Para
+    ``seconds_until_next_analysis`` "dentro da janela" significa "esta vela já
+    foi analisada" e manda para a próxima: o M5 perdia 5 min e o M15 15 min
+    depois de cada operação (27/09/2026, 305 s medianos). Mas a conta estava
+    esperando o resultado e não analisou esta vela. No M5/M15, se a operação
+    fechou nesta vela e a janela ainda está aberta (ou por abrir), analisa
+    agora. O M1 segue a regra antiga.
+
+    Args:
+        timeframe: Timeframe da conta.
+        finished_timestamp: Unix do fechamento da operação (None se não há).
+        server_timestamp: Relógio de referência (Unix).
+
+    Returns:
+        Segundos até a próxima análise (0 = já).
+    """
+    normalized = str(timeframe or "").strip().upper()
+    if normalized in FULL_SCAN_TIMEFRAMES and finished_timestamp is not None:
+        expiration = timeframe_seconds(normalized)
+        start, end = ANALYSIS_WINDOW_BOUNDS
+        seconds_in_candle = float(server_timestamp) % expiration
+        candle_start = float(server_timestamp) - seconds_in_candle
+        if float(finished_timestamp) >= candle_start and seconds_in_candle <= end:
+            return max(0, int(math.ceil(start - seconds_in_candle)))
+    return seconds_until_next_analysis(timeframe, server_timestamp, force_next_candle=False)
 
 
 def minimum_operations_per_hour(timeframe: str | None) -> int:

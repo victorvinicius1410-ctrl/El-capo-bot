@@ -60,6 +60,7 @@ from backend.status import (
 from backend.signal_engine import (
     ACTIVE_ENTRY_STRATEGIES,
     cycle_minutes_for_timeframe,
+    seconds_until_analysis_after_result,
     seconds_until_next_analysis,
 )
 
@@ -1569,10 +1570,11 @@ class AutoTrader:
         # (não espera mais o cooldown legado 5/15/45 minutos).
         state.cycle_minutes = cycle_minutes_for_timeframe(state.timeframe)
         if state.enabled:
-            wait_seconds = seconds_until_next_analysis(
+            finished_at = parse_datetime((state.last_trade or {}).get("finished_at"))
+            wait_seconds = seconds_until_analysis_after_result(
                 state.timeframe,
+                finished_at.timestamp() if finished_at is not None else None,
                 now.timestamp(),
-                force_next_candle=False,
             )
             state.next_cycle_at = now + timedelta(seconds=wait_seconds)
         else:

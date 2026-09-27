@@ -126,6 +126,7 @@ from backend.sr_level_trade import (
 from backend.vertex_strategy import vertex_min_confidence
 from backend.signal_engine import (
     ANALYSIS_TIMEFRAMES,
+    FULL_SCAN_TIMEFRAMES,
     CONTINUATION_DEAD_RSI_HARD_BLOCK,
     CONTINUATION_DEAD_RSI_MAX,
     CONTINUATION_DEAD_RSI_MIN,
@@ -680,6 +681,16 @@ BULLEX_REQUESTS_LIMIT_EXCEEDED = "BULLEX_REQUESTS_LIMIT_EXCEEDED"
 # Quando a corretora bloqueia login por IP, o auto-reconnect NÃO deve tentar
 # a cada 60s (piora o TTL). Usa o retry_after do upstream (default 1h).
 BULLEX_LOGIN_RATE_LIMIT_DEFAULT_SECONDS = 3600
+# Conta da corretora com verificação em 2 etapas: o login pede código, o
+# bullexapi só sabe pedir por SMS e o painel não tem campo para o código.
+# Antes caía em BULLEX_TEMPORARY_UNAVAILABLE ("aguarde") e o cliente esperava
+# um erro que é permanente (26/09/2026, conta 88fc8c94).
+BULLEX_2FA_ENABLED = "BULLEX_2FA_ENABLED"
+BULLEX_2FA_ENABLED_MESSAGE = (
+    "Sua conta BullEx está com a verificação em duas etapas ativada, e o El Capo "
+    "não consegue conectar assim. Entre na BullEx, desative a verificação em duas "
+    "etapas nas configurações de segurança e conecte de novo."
+)
 PASSTHROUGH_CONNECT_ERRORS = {
     BULLEX_REQUESTS_LIMIT_EXCEEDED,
     "LOGIN_TIMEOUT",
@@ -906,12 +917,17 @@ def build_controlled_upstream_error(
     payload_data: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
     if retry_after is not None:
         payload_data.setdefault("retry_after_seconds", retry_after)
-    return {
+    payload = {
         "ok": False,
         "data": payload_data or None,
         "error": code,
         "detail": detail_text[:240] if detail_text else code,
     }
+    if code == BULLEX_2FA_ENABLED:
+        # O painel usa `message` quando não conhece o código: assim o texto
+        # chega mesmo num bundle publicado antes deste código existir.
+        payload["message"] = BULLEX_2FA_ENABLED_MESSAGE
+    return payload
 
 
 def classify_bullex_connect_error(
@@ -952,6 +968,11 @@ def classify_bullex_connect_error(
     broker_code = _extract_embedded_broker_code(text)
     if broker_code == "invalid_credentials":
         return "invalid_credentials", retry_after, text
+
+    # "This verification method is not supported..." = a corretora recusou o
+    # pedido de código por SMS; "2FA" = o SMS saiu mas o painel não recebe código.
+    if upper == BULLEX_2FA_ENABLED or upper == "2FA" or "verification method" in text.lower():
+        return BULLEX_2FA_ENABLED, retry_after, text
 
     for known in PASSTHROUGH_CONNECT_ERRORS:
         if upper == known.upper() or text == known:
@@ -2636,6 +2657,17 @@ def seconds_until_next_candle_after_trade(state: Any) -> float | None:
     if seconds_since_finish < 0:
         return 1.0
     seconds_into_candle = now.timestamp() % interval
+    if timeframe_scans_full_market(timeframe):
+        # A ordem expira na virada da vela, então o resultado chega no segundo
+        # 0-1 da vela seguinte — antes da janela de análise dela (5-20 s). Não
+        # houve análise nesta vela para "não repetir"; dormir até a próxima
+        # custava 5 min no M5 e 15 no M15 a cada operação (27/09/2026). O M1
+        # continua dormindo, como antes.
+        finished_into_candle = finished_at.timestamp() % interval
+        candle_start = now.timestamp() - seconds_into_candle
+        _, analysis_window_end = ANALYSIS_WINDOWS.get(timeframe, (5, 20))
+        if finished_at.timestamp() >= candle_start and finished_into_candle <= analysis_window_end:
+            return None
     remaining = interval - seconds_into_candle
     if remaining <= 0:
         remaining = interval
@@ -4648,6 +4680,45 @@ ANALYSIS_EARLY_STOP_ENABLED = os.getenv("ANALYSIS_EARLY_STOP", "false").strip().
     "true",
     "yes",
 }
+
+# M5/M15 varrem o mercado inteiro, sem early stop (27/09/2026). Conta M5 do
+# Sergio: 5 h ligada, 12 sinais, 0 ordens. Medido em 25-27/09 nas contas M5:
+# 66% das varreduras paradas no 1º par "aprovado" terminaram sem sinal — o
+# early stop só olha `trade_allowed` e para em par com confiança 44 que o ciclo
+# depois reprova, e os outros 9 pares nem são vistos. E com um candidato só, a
+# troca de candidato no disparo (`order_attempt_candidates`) não tem para quem
+# ir quando a reconferência de S/R cancela — e ela cancela ~87% no M5. Varrer
+# 21 pares leva ~13 s e a entrada é daqui a ~5 min. O M1 fica como está: lá a
+# janela até a compra é de ~40 s. `FULL_SCAN_TIMEFRAMES` vem do signal_engine.
+
+
+def timeframe_scans_full_market(timeframe: Any) -> bool:
+    """Indica se o timeframe varre todos os pares, sem early stop.
+
+    Args:
+        timeframe: Timeframe da conta (M1, M5, M15...).
+
+    Returns:
+        True para M5 e acima; False para M1 ou valor desconhecido.
+    """
+    return str(timeframe or "").strip().upper() in FULL_SCAN_TIMEFRAMES
+
+
+def cycle_analysis_max_assets(timeframe: Any, market_mode: Any) -> int:
+    """Quantos pares o ciclo do robô analisa.
+
+    Args:
+        timeframe: Timeframe da conta.
+        market_mode: OTC, OPEN ou BOTH.
+
+    Returns:
+        Todos os pares do mercado no M5/M15; no M1, até
+        ``ROBOT_ANALYSIS_MAX_ASSETS`` (10) por ciclo, em rodízio.
+    """
+    total = len(resolve_analysis_assets(market_mode))
+    if timeframe_scans_full_market(timeframe):
+        return total
+    return min(ROBOT_ANALYSIS_MAX_ASSETS, total)
 
 
 def analysis_payload_allows_early_stop(payload: Any) -> bool:
@@ -11756,6 +11827,7 @@ async def scan_local_signals(
         robot_worker_last_tick_at[user_id] = utc_now()
         if (
             ANALYSIS_EARLY_STOP_ENABLED
+            and not timeframe_scans_full_market(timeframe)
             and analysis_payload_allows_early_stop(result[2])
             and not analysis_payload_is_open_market_strategy(result[2])
         ):
@@ -12479,10 +12551,7 @@ async def update_cycle_analysis(
         timeframe=state.timeframe,
         endtime=int(entry_window["server_timestamp"]),
         strategy_mode=state.strategy_mode,
-        max_assets=min(
-            ROBOT_ANALYSIS_MAX_ASSETS,
-            len(resolve_analysis_assets(state.market_mode)),
-        ),
+        max_assets=cycle_analysis_max_assets(state.timeframe, state.market_mode),
         asset_sleep_seconds=ROBOT_ASSET_QUEUE_SLEEP_SECONDS,
         market_mode=state.market_mode,
     )
@@ -14902,7 +14971,14 @@ async def execute_robot_cycle(
                     user_id,
                     analysis_result="NO_OPPORTUNITY_FOUND",
                     last_rejection_reason=last_filter_cancel,
-                    analyze_current_candle=last_filter_cancel in OPEN_MARKET_CONFIRM_CANCEL_REASONS,
+                    # No M5/M15 pular a vela custava 5/15 min a cada cancelamento
+                    # (27/09/2026: 305 s medianos até a próxima análise). O
+                    # cancelamento é no segundo 0-3 e a janela desta vela
+                    # (5-20 s) ainda vai abrir.
+                    analyze_current_candle=(
+                        last_filter_cancel in OPEN_MARKET_CONFIRM_CANCEL_REASONS
+                        or timeframe_scans_full_market(state.timeframe)
+                    ),
                 )
                 return 200, build_robot_payload(state)
             state = auto_trader.reject_order(
@@ -17221,6 +17297,12 @@ async def _bullex_connect_impl(
                 },
             )
         return json_response(200, build_controlled_upstream_error(detail, data=data))
+    upstream_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if upstream_data.get("requires_2fa"):
+        # A corretora mandou o código por SMS, mas o painel não tem onde
+        # digitá-lo: sem isto o cliente via "Conta Bullex conectada" sem sessão.
+        logger.warning("[CONNECT_FAILED_HANDLED] user_id=%s detail=%s", user_id, BULLEX_2FA_ENABLED)
+        return json_response(200, build_controlled_upstream_error(BULLEX_2FA_ENABLED))
     sync_user_store_from_payload(
         user_id,
         payload,
