@@ -320,6 +320,8 @@ const KNOWN_ERROR_MESSAGES: Record<string, string> = {
   invalid_credentials: "Email ou senha Bullex inválidos",
   BULLEX_TEMPORARY_UNAVAILABLE:
     "A corretora está temporariamente indisponível. Aguarde alguns segundos e tente de novo.",
+  BULLEX_2FA_ENABLED:
+    "Sua conta BullEx está com a verificação em duas etapas ativada, e o El Capo não consegue conectar assim. Entre na BullEx, desative a verificação em duas etapas nas configurações de segurança e conecte de novo.",
   BULLEX_REQUESTS_LIMIT_EXCEEDED:
     "A Bullex limitou as conexões deste servidor. Aguarde cerca de 60 minutos e tente de novo.",
   BULLEX_NOT_CONNECTED:
