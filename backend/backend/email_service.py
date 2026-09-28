@@ -681,7 +681,31 @@ class EmailService:
             limit=limit,
             offset=offset,
         )
+        await self._fill_recipient_emails(actor.company_id, items)
         return await self._reconcile_orphan_pending(items)
+
+    async def _fill_recipient_emails(
+        self,
+        company_id: str,
+        items: list[EmailDelivery],
+    ) -> None:
+        """
+        Completa o e-mail de entregas antigas, que só guardaram o hash.
+
+        Falha na consulta do cadastro não derruba a listagem: a coluna só fica
+        vazia.
+        """
+        missing = {item.recipient_email_hash for item in items if not item.recipient_email}
+        if not missing:
+            return
+        try:
+            known = await self.repository.resolve_recipient_emails(company_id, missing)
+        except Exception:
+            logger.warning("email.recipient_resolve_failed", exc_info=True)
+            return
+        for item in items:
+            if not item.recipient_email:
+                item.recipient_email = known.get(item.recipient_email_hash)
 
     async def _reconcile_orphan_pending(
         self,
@@ -886,6 +910,7 @@ class EmailService:
             event_id=event_id,
             event_type=event_type,
             recipient_email_hash=hashlib.sha256(recipient_email.encode()).hexdigest(),
+            recipient_email=recipient_email,
             subject=subject[:200],
             status=EmailDeliveryStatus.PENDING,
             attempt_count=0,

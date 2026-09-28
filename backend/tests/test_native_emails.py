@@ -674,5 +674,150 @@ class EmailOrphanPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].last_error_code, "DISPATCH_TIMEOUT")
 
 
+
+def _delivery(delivery_id: str, email_hash: str, *, recipient: str | None = None):
+    """Entrega entregue mínima para os testes de destinatário."""
+    from backend.email_models import EmailDelivery, EmailDeliveryStatus
+
+    now = datetime.now(timezone.utc)
+    return EmailDelivery(
+        id=delivery_id,
+        company_id=COMPANY_ID,
+        event_id=f"evt-{delivery_id}",
+        event_type=DomainEventType.PURCHASE_COMPLETED,
+        recipient_email_hash=email_hash,
+        subject="Bem-vindo",
+        status=EmailDeliveryStatus.DELIVERED,
+        attempt_count=1,
+        provider_message_id="smtp:1",
+        latency_ms=100,
+        next_attempt_at=None,
+        last_error_code=None,
+        request_id=f"req-{delivery_id}",
+        created_at=now,
+        updated_at=now,
+        recipient_email=recipient,
+    )
+
+
+class EmailRecipientTests(unittest.IsolatedAsyncioTestCase):
+    """O admin vê o e-mail de quem recebeu cada entrega."""
+
+    async def asyncSetUp(self) -> None:
+        self.repository = InMemoryEmailRepository()
+        self.service = EmailService(
+            self.repository,
+            EmailConfig(
+                enabled=True,
+                api_key="re_test",
+                from_address="ElCapo <noreply@example.com>",
+                frontend_url="https://app.example.com",
+            ),
+        )
+
+    async def test_new_delivery_keeps_recipient_email(self) -> None:
+        """Entrega nova guarda o e-mail em claro além do hash."""
+        delivery = await self.service._create_delivery(
+            company_id=COMPANY_ID,
+            event_id="evt-1",
+            event_type=DomainEventType.PURCHASE_COMPLETED,
+            recipient_email="Cliente@Example.com",
+            subject="Bem-vindo",
+            request_id="req-1",
+        )
+        self.assertEqual(delivery.recipient_email, "Cliente@Example.com")
+        items = await self.service.list_deliveries(owner())
+        self.assertEqual(items[0].recipient_email, "Cliente@Example.com")
+
+    async def test_old_delivery_is_resolved_from_hash(self) -> None:
+        """Entrega antiga, só com hash, é completada pelo cadastro."""
+        import hashlib
+
+        email_hash = hashlib.sha256(b"antigo@example.com").hexdigest()
+        await self.repository.save_delivery(_delivery("old", email_hash))
+        self.repository.resolve_recipient_emails = AsyncMock(
+            return_value={email_hash: "antigo@example.com"}
+        )
+        items = await self.service.list_deliveries(owner())
+        self.assertEqual(items[0].recipient_email, "antigo@example.com")
+        self.repository.resolve_recipient_emails.assert_awaited_once_with(
+            COMPANY_ID, {email_hash}
+        )
+
+    async def test_resolve_failure_keeps_listing(self) -> None:
+        """Erro ao consultar o cadastro não derruba a lista de entregas."""
+        await self.repository.save_delivery(_delivery("old", "abc"))
+        self.repository.resolve_recipient_emails = AsyncMock(
+            side_effect=httpx.ConnectError("offline")
+        )
+        items = await self.service.list_deliveries(owner())
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0].recipient_email)
+
+    async def test_supabase_resolver_matches_case_variants(self) -> None:
+        """O hash do evento pode ter sido feito com o e-mail em minúsculas."""
+        import hashlib
+
+        repository = SupabaseEmailRepository("https://example.supabase.co", "service")
+        lower = hashlib.sha256(b"maria@example.com").hexdigest()
+        exact = hashlib.sha256(b"Joao@Example.com").hexdigest()
+        with patch.object(
+            repository,
+            "_get",
+            AsyncMock(
+                return_value=[
+                    {"email": "Maria@Example.com"},
+                    {"email": "Joao@Example.com"},
+                    {"email": None},
+                ]
+            ),
+        ) as get:
+            found = await repository.resolve_recipient_emails(
+                COMPANY_ID, {lower, exact, "desconhecido"}
+            )
+        self.assertEqual(
+            found,
+            {lower: "Maria@Example.com", exact: "Joao@Example.com"},
+        )
+        params = get.await_args.args[1]
+        self.assertEqual(get.await_args.args[0], "user_access_profiles")
+        self.assertEqual(params["company_id"], f"eq.{COMPANY_ID}")
+
+    def test_storage_row_round_trip_and_legacy_row(self) -> None:
+        """Storage guarda o e-mail; linha antiga sem o campo continua legível."""
+        repository = SupabaseEmailRepository("https://example.supabase.co", "service")
+        row = repository._delivery_to_row(_delivery("a", "h", recipient="x@example.com"))
+        self.assertEqual(row["recipient_email"], "x@example.com")
+        self.assertEqual(
+            repository._delivery_from_row(row).recipient_email, "x@example.com"
+        )
+        row.pop("recipient_email")
+        self.assertIsNone(repository._delivery_from_row(row).recipient_email)
+
+    def test_router_exposes_recipient(self) -> None:
+        """A API de entregas devolve o e-mail no campo `recipient`."""
+        import asyncio
+
+        asyncio.run(
+            self.repository.save_delivery(_delivery("r", "h", recipient="y@example.com"))
+        )
+        app = FastAPI()
+
+        async def require_admin() -> dict[str, str]:
+            return {
+                "user_id": "owner",
+                "company_id": COMPANY_ID,
+                "email": "admin@example.com",
+                "permissions": ",".join(p.value for p in AdminPermission),
+                "manageable_role_ids": "*",
+                "is_admin": "true",
+            }
+
+        app.include_router(create_email_router(self.service, require_admin))
+        response = TestClient(app).get("/admin/emails/deliveries")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"][0]["recipient"], "y@example.com")
+
+
 if __name__ == "__main__":
     unittest.main()

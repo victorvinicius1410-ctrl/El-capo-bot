@@ -115,3 +115,17 @@ export function validateEmailTemplateDraft(draft: {
 export function emailEventLabel(eventType: string): string {
   return EMAIL_EVENT_LABELS[eventType] ?? eventType;
 }
+
+/**
+ * Filtra entregas pelo e-mail de quem recebeu (sem diferenciar maiúsculas).
+ * Busca vazia devolve a lista inteira; entrega sem destinatário conhecido só
+ * aparece nesse caso.
+ */
+export function filterEmailDeliveriesByRecipient<T extends { recipient?: string | null }>(
+  items: T[],
+  query: string,
+): T[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return items;
+  return items.filter((item) => (item.recipient ?? "").toLowerCase().includes(needle));
+}

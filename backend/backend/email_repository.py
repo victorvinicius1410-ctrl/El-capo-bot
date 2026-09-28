@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -70,6 +71,14 @@ class EmailRepository(ABC):
         offset: int,
     ) -> list[EmailDelivery]:
         """Lista entregas recentes do tenant."""
+
+    async def resolve_recipient_emails(
+        self,
+        company_id: str,
+        hashes: set[str],
+    ) -> dict[str, str]:
+        """Traduz hashes de destinatário em e-mails conhecidos do tenant."""
+        return {}
 
 
 class InMemoryEmailRepository(EmailRepository):
@@ -267,6 +276,8 @@ class SupabaseEmailRepository(EmailRepository):
             await self._storage_save_deliveries(delivery.company_id, rows)
             return delivery
         payload = self._delivery_to_row(delivery)
+        # A tabela `email_deliveries` não tem coluna para o e-mail em claro.
+        payload.pop("recipient_email", None)
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{self.base_url}/rest/v1/email_deliveries",
@@ -357,6 +368,46 @@ class SupabaseEmailRepository(EmailRepository):
             },
         )
         return [self._delivery_from_row(row) for row in rows]
+
+    async def resolve_recipient_emails(
+        self,
+        company_id: str,
+        hashes: set[str],
+    ) -> dict[str, str]:
+        """
+        Cruza os hashes com os e-mails do cadastro (`user_access_profiles`).
+
+        O hash foi calculado sobre o e-mail como veio do evento, que pode diferir
+        do cadastro em maiúsculas; por isso cada e-mail entra com as duas grafias.
+        """
+        if not hashes:
+            return {}
+        found: dict[str, str] = {}
+        page_size = 1000
+        offset = 0
+        while True:
+            rows = await self._get(
+                "user_access_profiles",
+                {
+                    "company_id": f"eq.{company_id}",
+                    "email": "not.is.null",
+                    "select": "email",
+                    "order": "user_id.asc",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+            )
+            for row in rows:
+                email = str(row.get("email") or "").strip()
+                if not email:
+                    continue
+                for variant in (email, email.lower()):
+                    digest = hashlib.sha256(variant.encode()).hexdigest()
+                    if digest in hashes:
+                        found.setdefault(digest, email)
+            if len(rows) < page_size or len(found) == len(hashes):
+                return found
+            offset += page_size
 
     async def _prefer_storage(self) -> bool:
         """
@@ -655,6 +706,7 @@ class SupabaseEmailRepository(EmailRepository):
             "request_id": delivery.request_id,
             "created_at": delivery.created_at.isoformat(),
             "updated_at": delivery.updated_at.isoformat(),
+            "recipient_email": delivery.recipient_email,
         }
 
     def _template_from_row(self, row: dict[str, Any]) -> EmailTemplate:
@@ -692,6 +744,7 @@ class SupabaseEmailRepository(EmailRepository):
             request_id=str(row["request_id"]),
             created_at=self._parse_dt(row.get("created_at")),
             updated_at=self._parse_dt(row.get("updated_at")),
+            recipient_email=str(row["recipient_email"]) if row.get("recipient_email") else None,
         )
 
 

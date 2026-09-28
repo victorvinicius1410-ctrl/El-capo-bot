@@ -7,6 +7,7 @@ import {
   Mail,
   RadioTower,
   Save,
+  Search,
   Send,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -28,6 +29,7 @@ import {
   emailDeliveryErrorLabel,
   emailDeliveryStatusLabel,
   emailEventLabel,
+  filterEmailDeliveriesByRecipient,
   renderEmailPreview,
   sampleEmailVariables,
   validateEmailTemplateDraft,
@@ -525,6 +527,9 @@ function DeliveriesPanel({
   items: EmailDelivery[];
   error: string | null;
 }) {
+  const [busca, setBusca] = useState("");
+  const visiveis = useMemo(() => filterEmailDeliveriesByRecipient(items, busca), [items, busca]);
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-muted-foreground">
@@ -543,38 +548,68 @@ function DeliveriesPanel({
     );
   }
   return (
-    <div className="overflow-hidden rounded-2xl border border-border bg-card">
-      <table className="w-full text-left text-sm">
-        <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
-          <tr>
-            <th className="px-4 py-3">Evento</th>
-            <th className="px-4 py-3">Assunto</th>
-            <th className="px-4 py-3">Status</th>
-            <th className="px-4 py-3">Quando</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item) => (
-            <tr key={item.id} className="border-b border-border/60 last:border-0">
-              <td className="px-4 py-3">{emailEventLabel(item.event_type)}</td>
-              <td className="px-4 py-3">{item.subject}</td>
-              <td className="px-4 py-3">
-                <div className="flex flex-col gap-0.5">
-                  <span>{emailDeliveryStatusLabel(item.status)}</span>
-                  {emailDeliveryErrorLabel(item.last_error_code ?? item.error) ? (
-                    <span className="text-[11px] text-muted-foreground">
-                      {emailDeliveryErrorLabel(item.last_error_code ?? item.error)}
-                    </span>
-                  ) : null}
-                </div>
-              </td>
-              <td className="px-4 py-3 text-muted-foreground">
-                {formatBrasiliaDateTime(item.created_at) || item.created_at}
-              </td>
+    <div className="space-y-3">
+      <label className="relative block max-w-md">
+        <span className="sr-only">Buscar por e-mail</span>
+        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <input
+          type="search"
+          value={busca}
+          onChange={(event) => setBusca(event.target.value)}
+          placeholder="Buscar por e-mail do cliente"
+          className="w-full rounded-xl border border-border bg-background py-2 pl-9 pr-3 text-sm outline-none ring-primary/30 focus:ring-2"
+        />
+      </label>
+      <p className="text-xs text-muted-foreground">
+        {busca.trim()
+          ? `${visiveis.length} de ${items.length} entregas recentes`
+          : `${items.length} entregas mais recentes`}
+      </p>
+      <div className="overflow-x-auto rounded-2xl border border-border bg-card">
+        <table className="w-full min-w-[720px] text-left text-sm">
+          <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-4 py-3">Destinatário</th>
+              <th className="px-4 py-3">Evento</th>
+              <th className="px-4 py-3">Assunto</th>
+              <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">Quando</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {visiveis.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="px-4 py-6 text-center text-muted-foreground">
+                  Nenhuma entrega para esse e-mail entre as recentes.
+                </td>
+              </tr>
+            ) : (
+              visiveis.map((item) => (
+                <tr key={item.id} className="border-b border-border/60 last:border-0">
+                  <td className="px-4 py-3 font-medium break-all">
+                    {item.recipient ?? <span className="text-muted-foreground">—</span>}
+                  </td>
+                  <td className="px-4 py-3">{emailEventLabel(item.event_type)}</td>
+                  <td className="px-4 py-3">{item.subject}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex flex-col gap-0.5">
+                      <span>{emailDeliveryStatusLabel(item.status)}</span>
+                      {emailDeliveryErrorLabel(item.last_error_code ?? item.error) ? (
+                        <span className="text-[11px] text-muted-foreground">
+                          {emailDeliveryErrorLabel(item.last_error_code ?? item.error)}
+                        </span>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap text-muted-foreground">
+                    {formatBrasiliaDateTime(item.created_at) || item.created_at}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

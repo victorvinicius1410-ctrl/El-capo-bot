@@ -60,6 +60,9 @@ class EmailDelivery:
     request_id: str
     created_at: datetime
     updated_at: datetime
+    # E-mail em claro para o admin ver quem recebeu. Entregas antigas só têm o
+    # hash; o serviço tenta resolvê-lo pelo cadastro na hora de listar.
+    recipient_email: str | None = None
 
 
 @dataclass(frozen=True)

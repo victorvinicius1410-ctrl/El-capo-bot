@@ -213,7 +213,7 @@ def create_email_router(
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
     ) -> Response:
-        """Histórico sanitizado de entregas."""
+        """Histórico de entregas com o destinatário."""
         try:
             items = await service.list_deliveries(
                 _actor(auth),
@@ -270,11 +270,12 @@ def _template_view(template: Any) -> dict[str, Any]:
 
 
 def _delivery_view(delivery: Any) -> dict[str, Any]:
-    """Serializa entrega sem PII do destinatário."""
+    """Serializa entrega para o admin, com o e-mail de quem recebeu."""
     return {
         "id": delivery.id,
         "event_id": delivery.event_id,
         "event_type": delivery.event_type.value,
+        "recipient": delivery.recipient_email,
         "subject": delivery.subject,
         "status": delivery.status.value,
         "attempt_count": delivery.attempt_count,

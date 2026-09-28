@@ -263,7 +263,7 @@ export interface EmailTemplate {
 export interface EmailDelivery {
   id: string;
   event_type: EmailEventType;
-  recipient?: string;
+  recipient?: string | null;
   subject: string;
   status: string;
   created_at: string;
@@ -782,7 +782,7 @@ export const adminSendTestEmail = (event: EmailEventType, recipientEmail?: strin
       recipientEmail?.trim() ? { recipient_email: recipientEmail.trim() } : {},
     ),
   });
-export const adminEmailDeliveries = (offset = 0, limit = 20) => apiRequest<EmailDelivery[]>(`/admin/emails/deliveries?offset=${offset}&limit=${limit}`);
+export const adminEmailDeliveries = (offset = 0, limit = 100) => apiRequest<EmailDelivery[]>(`/admin/emails/deliveries?offset=${offset}&limit=${limit}`);
 
 export const bullexApi = {
   connect: (payload: { email: string; password: string }, options?: { signal?: AbortSignal }) =>
