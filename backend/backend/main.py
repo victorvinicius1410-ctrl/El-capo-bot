@@ -126,6 +126,7 @@ from backend.sr_level_trade import (
 from backend.vertex_strategy import vertex_min_confidence
 from backend.signal_engine import (
     ANALYSIS_TIMEFRAMES,
+    ANALYSIS_WINDOWS_BY_TIMEFRAME,
     FULL_SCAN_TIMEFRAMES,
     CONTINUATION_DEAD_RSI_HARD_BLOCK,
     CONTINUATION_DEAD_RSI_MAX,
@@ -4688,8 +4689,9 @@ ANALYSIS_EARLY_STOP_ENABLED = os.getenv("ANALYSIS_EARLY_STOP", "false").strip().
 # depois reprova, e os outros 9 pares nem são vistos. E com um candidato só, a
 # troca de candidato no disparo (`order_attempt_candidates`) não tem para quem
 # ir quando a reconferência de S/R cancela — e ela cancela ~87% no M5. Varrer
-# 21 pares leva ~13 s e a entrada é daqui a ~5 min. O M1 fica como está: lá a
-# janela até a compra é de ~40 s. `FULL_SCAN_TIMEFRAMES` vem do signal_engine.
+# 21 pares leva ~13 s (BOTH, 32 pares, até o orçamento de 38 s); desde 28/09 o
+# M5 analisa aos 245-260 s da vela e a varredura ainda cabe antes da abertura.
+# O M1 fica como está: 10 pares. `FULL_SCAN_TIMEFRAMES` vem do signal_engine.
 
 
 def timeframe_scans_full_market(timeframe: Any) -> bool:
@@ -6637,12 +6639,10 @@ ENTRY_WINDOWS = {
     "M15": (0, ENTRY_WINDOW_END_SECOND),
     "M30": (0, ENTRY_WINDOW_END_SECOND),
 }
-ANALYSIS_WINDOWS = {
-    "M1": (5, 20),
-    "M5": (5, 20),
-    "M15": (5, 20),
-    "M30": (5, 20),
-}
+# Uma tabela só, no signal_engine: quem agenda o próximo ciclo
+# (`seconds_until_next_analysis`) e quem abre a janela (`get_entry_window`)
+# precisam concordar. M5 analisa no fim da vela desde 28/09/2026.
+ANALYSIS_WINDOWS = dict(ANALYSIS_WINDOWS_BY_TIMEFRAME)
 EXPIRATION_SAFETY_SECONDS = 1
 ORDER_EXPIRATION_FIELDS = (
     "expected_expire_at",

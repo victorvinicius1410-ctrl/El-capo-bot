@@ -95,6 +95,28 @@ TIMEFRAME_SECONDS_BY_NAME: dict[str, int] = {
 }
 # Janela em que a análise técnica varre o mercado dentro de cada vela.
 ANALYSIS_WINDOW_BOUNDS: tuple[int, int] = (5, 20)
+# M5 analisa no FIM da vela e entra na abertura da seguinte (28/09/2026, pedido
+# do dono: "o El Capo tem que operar sempre em M5 no início da vela"). Com a
+# análise nos segundos 5-20 a decisão saía ~4min55s antes da compra e a
+# reconferência de nível/pavio no disparo cancelava ~80% dos sinais: em 28/09,
+# 18 sinais M5 → 0 ordens em 2 h. Backtest com o código de produção, 21 pares
+# OTC, 59 dias, uma conta: passa no disparo 21% → 49-71%, 14,8 → 39-52 ops/dia,
+# acerto igual (49,2% → 50,7-50,8%, abaixo do empate de 53,5% nos dois).
+# 245-260 s: mesma folga do M1 — pior caso 260 s + orçamento de varredura
+# (38 s) = 298 s, antes da janela de compra (0-3 s da vela seguinte).
+ANALYSIS_WINDOWS_BY_TIMEFRAME: dict[str, tuple[int, int]] = {
+    "M1": ANALYSIS_WINDOW_BOUNDS,
+    "M5": (245, 260),
+    "M15": ANALYSIS_WINDOW_BOUNDS,
+    "M30": ANALYSIS_WINDOW_BOUNDS,
+}
+
+
+def analysis_window_bounds(timeframe: str | None) -> tuple[int, int]:
+    """Segundos da vela em que a análise roda, por timeframe."""
+    normalized = str(timeframe or "M1").strip().upper()
+    return ANALYSIS_WINDOWS_BY_TIMEFRAME.get(normalized, ANALYSIS_WINDOW_BOUNDS)
+
 # Timeframes que varrem todos os pares e não perdem a vela depois de um
 # resultado (27/09/2026). Ver `main.timeframe_scans_full_market`.
 FULL_SCAN_TIMEFRAMES = frozenset({"M5", "M15", "M30"})
@@ -580,7 +602,7 @@ def seconds_until_next_analysis(
         return int(OPERATIONAL_RETRY_SECONDS)
 
     expiration = timeframe_seconds(timeframe)
-    start, end = ANALYSIS_WINDOW_BOUNDS
+    start, end = analysis_window_bounds(timeframe)
     if server_timestamp is None:
         server_timestamp = datetime.now(timezone.utc).timestamp()
     seconds_in_candle = float(server_timestamp) % expiration
@@ -600,7 +622,8 @@ def seconds_until_analysis_after_result(
     """Espera até a próxima análise quando o resultado sai da tela.
 
     O resultado fica 5 s no painel e o ciclo é reagendado quando ele sai — no
-    segundo ~6 da vela, com a janela de análise (5-20 s) já aberta. Para
+    segundo ~6 da vela. No M1 a janela de análise (5-20 s) já está aberta; no
+    M5 ela só abre em 245 s e a espera cai até lá. Para
     ``seconds_until_next_analysis`` "dentro da janela" significa "esta vela já
     foi analisada" e manda para a próxima: o M5 perdia 5 min e o M15 15 min
     depois de cada operação (27/09/2026, 305 s medianos). Mas a conta estava
@@ -619,7 +642,7 @@ def seconds_until_analysis_after_result(
     normalized = str(timeframe or "").strip().upper()
     if normalized in FULL_SCAN_TIMEFRAMES and finished_timestamp is not None:
         expiration = timeframe_seconds(normalized)
-        start, end = ANALYSIS_WINDOW_BOUNDS
+        start, end = analysis_window_bounds(normalized)
         seconds_in_candle = float(server_timestamp) % expiration
         candle_start = float(server_timestamp) - seconds_in_candle
         if float(finished_timestamp) >= candle_start and seconds_in_candle <= end:
