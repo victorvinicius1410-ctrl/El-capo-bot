@@ -607,6 +607,16 @@ def seconds_until_next_analysis(
         server_timestamp = datetime.now(timezone.utc).timestamp()
     seconds_in_candle = float(server_timestamp) % expiration
 
+    # "Próxima vela" quer dizer "esta vela já foi analisada na janela dela".
+    # No M5 a janela é no fim da vela (245 s): uma análise ANTES dela — robô
+    # ligado no meio da vela, ou o primeiro ciclo depois de um deploy com o
+    # horário salvo pela regra antiga — não gastou a janela desta vela. Pular
+    # para a seguinte custava 5 min (28/09/2026 15:00: análise aos 5 s,
+    # próxima às 15:09:05 em vez de 15:04:05). Só vale para janela no fim da
+    # vela; M1 e M15 (janela 5-20 s) seguem como eram.
+    janela_no_fim_da_vela = start > ANALYSIS_WINDOW_BOUNDS[1]
+    if force_next_candle and janela_no_fim_da_vela and seconds_in_candle < start:
+        return max(1, int(math.ceil(start - seconds_in_candle)))
     if force_next_candle or (start <= seconds_in_candle <= end):
         return max(1, int(math.ceil(expiration - seconds_in_candle + start)))
     if seconds_in_candle < start:

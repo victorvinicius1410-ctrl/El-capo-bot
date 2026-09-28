@@ -193,6 +193,16 @@ class M5AnalisaNoFimDaVelaTest(unittest.TestCase):
         # M1 igual a antes
         self.assertEqual(seconds_until_next_analysis("M1", VIRADA.timestamp() + 1), 4)
 
+    def test_analise_antes_da_janela_nao_pula_a_janela_desta_vela(self) -> None:
+        from backend.signal_engine import seconds_until_next_analysis
+
+        # 28/09 15:00: análise aos 18 s (horário salvo pela regra antiga), sem
+        # sinal -> tem que voltar aos 245 s DESTA vela, não da seguinte.
+        self.assertEqual(seconds_until_next_analysis("M5", VIRADA.timestamp() + 18, force_next_candle=True), 227)
+        # M1 e M15 continuam pulando a vela
+        self.assertEqual(seconds_until_next_analysis("M1", VIRADA.timestamp() + 2, force_next_candle=True), 63)
+        self.assertEqual(seconds_until_next_analysis("M15", VIRADA.timestamp() + 2, force_next_candle=True), 903)
+
     def test_varredura_cabe_antes_da_abertura_no_pior_caso(self) -> None:
         _, fim_analise = main.ANALYSIS_WINDOWS["M5"]
         _, fim_compra = main.ENTRY_WINDOWS["M5"]

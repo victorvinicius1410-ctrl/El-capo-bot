@@ -61,12 +61,14 @@ class ContinuousCadenceHelpersTests(unittest.TestCase):
         self.assertEqual(wait, 40)
 
     def test_m5_and_m15_align_to_candle_not_multiples(self) -> None:
-        # "Próxima vela" = janela de análise da vela seguinte, nunca múltiplos
-        # do ciclo legado. Desde 28/09/2026 a janela do M5 é 245-260 s (fim da
-        # vela), então do segundo 100 até lá são 200 + 245 = 445 s.
+        # Nunca múltiplos do ciclo legado. Desde 28/09/2026 a janela do M5 é
+        # 245-260 s (fim da vela): uma análise aos 100 s foi ANTES da janela,
+        # então a próxima é a janela desta mesma vela (145 s); depois da
+        # janela (250 s) é a janela da vela seguinte (295 s).
         wait_m5 = seconds_until_next_analysis("M5", 100.0, force_next_candle=True)
         wait_m15 = seconds_until_next_analysis("M15", 400.0, force_next_candle=True)
-        self.assertEqual(wait_m5, 300 - 100 + 245)
+        self.assertEqual(wait_m5, 245 - 100)
+        self.assertEqual(seconds_until_next_analysis("M5", 250.0, force_next_candle=True), 300 - 250 + 245)
         self.assertLessEqual(wait_m15, 900)
         self.assertGreater(wait_m15, 400)
 
