@@ -636,6 +636,83 @@ async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
             )
 
 
+# Religar no boot quem estava ligado (28/09/2026). Desde 18/08 o boot não subia
+# worker nenhum: o painel seguia dizendo "ligado" e a conta ficava parada em
+# silêncio até alguém abrir o painel. A conta do dono (81c49f33, mercado
+# aberto) ficou de 27/09 08:54 UTC — restart do runtime — até 28/09 09:36 sem
+# worker, com o mercado aberto pagando para as outras contas; be431b01 e
+# b2ddb2c4 idem. O que derrubou a religação automática em 18/08 foram 35
+# usuários de teste (`user-demo`...) com enabled=true: aqui só entra UUID,
+# só quem operou nos últimos dias, e um por vez, pelo mesmo `ensure` do painel
+# (preserva o placar; conta desligada ou em stop é ignorada lá dentro).
+# `ROBOT_BOOT_RESUME=false` no .env desliga sem deploy.
+BOOT_RESUME_ENABLED = os.getenv("ROBOT_BOOT_RESUME", "true").strip().lower() in {"1", "true", "yes"}
+BOOT_RESUME_MAX_IDLE_DAYS = float(os.getenv("ROBOT_BOOT_RESUME_MAX_IDLE_DAYS", "7"))
+BOOT_RESUME_SPACING_SECONDS = 2.0
+
+
+def _contas_para_religar(gateway: object, agora: object) -> list[str]:
+    """Contas que estavam ligadas antes do restart e devem voltar sozinhas.
+
+    Args:
+        gateway: Módulo ``backend.main`` já com os estados restaurados.
+        agora: ``datetime`` UTC de referência.
+
+    Returns:
+        ``user_id`` reais com ``enabled=True`` e última entrada há no máximo
+        ``BOOT_RESUME_MAX_IDLE_DAYS`` dias (sem entrada nenhuma também entra:
+        é quem ligou e ainda não operou). Contas abandonadas ficam de fora.
+    """
+    from datetime import timedelta
+
+    auto_trader = getattr(gateway, "auto_trader", None)
+    restauradas = getattr(gateway, "restorable_robot_states", {}) or {}
+    if auto_trader is None:
+        return []
+    limite = agora - timedelta(days=BOOT_RESUME_MAX_IDLE_DAYS)  # type: ignore[operator]
+    contas: list[str] = []
+    for user_id in list(restauradas):
+        if not _is_valid_account_user_id(user_id) or not auto_trader.has_state(user_id):
+            continue
+        state = auto_trader.get(user_id)
+        if not getattr(state, "enabled", False):
+            continue
+        ultima = getattr(state, "last_entry_at", None)
+        if ultima is not None and ultima.tzinfo is None:
+            ultima = ultima.replace(tzinfo=limite.tzinfo)
+        if ultima is not None and ultima < limite:
+            logger.info(
+                "[BOOT_RESUME_SKIPPED] user_id=%s reason=inativa ultima_entrada=%s",
+                user_id,
+                ultima,
+            )
+            continue
+        contas.append(user_id)
+    return contas
+
+
+async def _religar_quem_estava_ligado(gateway: object, stop: asyncio.Event) -> None:
+    """Manda ``ensure`` para cada conta de ``_contas_para_religar``, uma por vez."""
+    from datetime import datetime, timezone
+
+    if not BOOT_RESUME_ENABLED:
+        logger.warning("[BOOT_RESUME_DISABLED] ROBOT_BOOT_RESUME=false")
+        return
+    contas = _contas_para_religar(gateway, datetime.now(timezone.utc))
+    logger.warning("[BOOT_RESUME_START] contas=%s", len(contas))
+    for indice, user_id in enumerate(contas):
+        if stop.is_set():
+            return
+        if indice:
+            await asyncio.sleep(BOOT_RESUME_SPACING_SECONDS)
+        try:
+            await _handle_command(gateway, {"action": "ensure", "user_id": user_id})
+            logger.warning("[BOOT_RESUME_ENSURE] user_id=%s", user_id)
+        except Exception:
+            logger.warning("[BOOT_RESUME_FAILED] user_id=%s", user_id, exc_info=True)
+    logger.warning("[BOOT_RESUME_DONE] contas=%s", len(contas))
+
+
 async def amain() -> None:
     """Boot do robot-runtime."""
     os.environ.setdefault("ROBOT_RUNTIME_MODE", "worker")
@@ -669,6 +746,7 @@ async def amain() -> None:
 
     listener = asyncio.create_task(_cmd_listener(gateway, stop), name="robot-cmd-listener")
     publisher = asyncio.create_task(_snapshot_publisher(gateway, stop), name="robot-snapshot")
+    religar = asyncio.create_task(_religar_quem_estava_ligado(gateway, stop), name="boot-resume")
     # Denuncia no log qualquer chamada síncrona que trave o loop (ver
     # backend/loop_watchdog.py — incidente de entradas atrasadas de 10/09).
     from backend.loop_watchdog import EVENT_LOOP_WATCHDOG_ENABLED, EventLoopWatchdog
@@ -681,6 +759,7 @@ async def amain() -> None:
     await stop.wait()
     listener.cancel()
     publisher.cancel()
+    religar.cancel()
     if watchdog is not None:
         watchdog.cancel()
     await gateway.shutdown_robot_workers()
