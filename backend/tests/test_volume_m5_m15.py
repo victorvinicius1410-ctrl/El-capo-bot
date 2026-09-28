@@ -121,5 +121,37 @@ class ReagendaDepoisDoResultadoTest(unittest.TestCase):
         self.assertEqual(espera, 300 - 6 + 5)
 
 
+class FimDaExibicaoNoSnapshotTest(unittest.TestCase):
+    """Caminho real (28/09/2026): o snapshot do painel reagenda antes do worker.
+
+    WIN às 11:35:00,9, resultado na tela até 11:35:05,9, snapshot às 11:35:06,2
+    marcou a próxima análise para 11:40:05 — a vela inteira perdida.
+    """
+
+    def _snapshot(self, timeframe: str) -> float:
+        from backend.auto_trader import STATUS_WIN
+
+        trader = AutoTrader()
+        state = trader.start("00000000-0000-4000-8000-000000000028")
+        state.timeframe = timeframe
+        state.status = STATUS_WIN
+        fechou = VIRADA + timedelta(seconds=0.94)
+        state.result_display_until = fechou + timedelta(seconds=5)
+        state.last_trade = {"result": "WIN", "finished_at": fechou.isoformat()}
+        agora = VIRADA + timedelta(seconds=6.2)
+        with patch.object(auto_trader_module, "utc_now", return_value=agora):
+            state.to_dict()
+        return (state.next_cycle_at - agora).total_seconds()
+
+    def test_m5_analisa_a_mesma_vela(self) -> None:
+        self.assertEqual(self._snapshot("M5"), 0)
+
+    def test_m15_analisa_a_mesma_vela(self) -> None:
+        self.assertEqual(self._snapshot("M15"), 0)
+
+    def test_m1_segue_para_a_proxima_vela(self) -> None:
+        self.assertAlmostEqual(self._snapshot("M1"), 60 - 6.2 + 5, delta=1)
+
+
 if __name__ == "__main__":
     unittest.main()

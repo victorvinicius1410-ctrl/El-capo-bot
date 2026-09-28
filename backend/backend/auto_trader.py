@@ -655,10 +655,16 @@ class RobotState:
                 data["gale_parent_trade"] = None
             self.status = STATUS_WAITING_NEXT_CYCLE if self.enabled else STATUS_STOPPED
             if self.enabled:
-                wait_seconds = seconds_until_next_analysis(
+                # É AQUI que o fim da exibição do resultado reagenda o ciclo: o
+                # snapshot publicado a cada ~1 s chega antes do worker, troca o
+                # status e `reset_cycle_after_result` nem roda. Com a regra
+                # antiga o M5 ia para a vela seguinte (28/09/2026: WIN às
+                # 11:35:00, próxima análise 11:40:05).
+                finished_at = parse_datetime((self.last_trade or {}).get("finished_at"))
+                wait_seconds = seconds_until_analysis_after_result(
                     self.timeframe,
+                    finished_at.timestamp() if finished_at is not None else None,
                     now.timestamp(),
-                    force_next_candle=False,
                 )
                 self.next_cycle_at = now + timedelta(seconds=wait_seconds)
             else:
