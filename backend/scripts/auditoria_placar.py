@@ -248,7 +248,9 @@ def auditar(
                 "banco": placar,
                 "historico": (wins, losses),
                 "status": estado.get("status"),
-                "chave": f"placar:{user_id}:{placar[0]}x{placar[1]}:{wins}x{losses}",
+                # Sem o placar na chave: cada operação nova mudava os números e
+                # o mesmo problema virava um e-mail novo (29/09, 3 e-mails).
+                "chave": f"placar:{user_id}",
             })
 
     return {

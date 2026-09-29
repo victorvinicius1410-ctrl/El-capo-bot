@@ -8713,6 +8713,84 @@ def _load_persisted_session_score(user_id: str) -> tuple[int, int, float] | None
     return None
 
 
+# Dia (Brasília) do placar que está na memória do gateway. O "nunca rebaixa"
+# não sabe de que dia é cada réplica: depois da meia-noite o 1x1 de ONTEM na
+# memória do gateway ganhava do 0x0 de hoje do runtime e o painel mostrava o
+# placar de ontem por horas (29/09, cliente e3b52de7, 00:00→01:50).
+_gateway_score_day: dict[str, Any] = {}
+
+
+def adopt_new_day_score_on_gateway(user_id: str, data: dict[str, Any] | None = None) -> bool:
+    """Na primeira leitura de um dia novo, adota o placar do runtime como está.
+
+    Só age quando o snapshot do runtime está carimbado com o dia de hoje
+    (``score_day``) e a memória do gateway ainda não foi alinhada hoje — aí o
+    placar do runtime vale mesmo sendo MENOR, porque o maior é o de ontem.
+
+    Args:
+        user_id: Dono da sessão.
+        data: ``data`` do snapshot Redis já lido; ``None`` lê.
+
+    Returns:
+        True se a memória do gateway foi trocada pelo placar do runtime.
+    """
+    normalized = str(user_id or "").strip()
+    if not normalized or robot_runtime_mode() != "external":
+        return False
+    hoje = brasilia_today()
+    if _gateway_score_day.get(normalized) == hoje:
+        return False
+    if data is None:
+        try:
+            remote = robot_bus.get_snapshot(normalized)
+        except Exception:
+            return False
+        data = remote.get("data") if isinstance(remote, dict) else None
+    if not isinstance(data, dict) or data.get("score_day") != hoje.isoformat():
+        return False
+    _gateway_score_day[normalized] = hoje
+    state = auto_trader.get(normalized)
+    local = _parse_session_score_from_mapping(
+        {
+            "wins": getattr(state, "wins", 0),
+            "losses": getattr(state, "losses", 0),
+            "profit": getattr(state, "profit", 0),
+        }
+    )
+    vivo = _parse_session_score_from_mapping(data)
+    if local == vivo:
+        return False
+    state.wins, state.losses, state.profit = vivo
+    for campo in ("stop_offset_wins", "stop_offset_losses", "stop_offset_profit"):
+        if campo in data:
+            setattr(state, campo, data[campo])
+    logger.warning(
+        "[SCORE_NEW_DAY_ADOPTED_ON_GATEWAY] user_id=%s dia=%s gateway=%sx%s/%s runtime=%sx%s/%s",
+        normalized,
+        hoje,
+        local[0],
+        local[1],
+        local[2],
+        vivo[0],
+        vivo[1],
+        vivo[2],
+    )
+    return True
+
+
+def _snapshot_is_from_runtime_today(user_id: str, data: dict[str, Any] | None = None) -> bool:
+    """True se o snapshot Redis veio do runtime com placar do dia de hoje."""
+    if data is None:
+        if not getattr(robot_bus, "enabled", False):
+            return False
+        try:
+            remote = robot_bus.get_snapshot(user_id)
+        except Exception:
+            return False
+        data = remote.get("data") if isinstance(remote, dict) else None
+    return isinstance(data, dict) and data.get("score_day") == brasilia_today().isoformat()
+
+
 def reconcile_session_score_on_gateway(user_id: str) -> bool:
     """
     Alinha a memória do gateway ao placar mais completo entre fontes locais.
@@ -8745,6 +8823,8 @@ def reconcile_session_score_on_gateway(user_id: str) -> bool:
         )
         apply_session_score_authority_to_state(normalized)
         return before != authority
+    # Dia novo: o placar de hoje do runtime vale mesmo menor que o de ontem.
+    adotou_dia_novo = adopt_new_day_score_on_gateway(normalized)
     state = auto_trader.get(normalized)
     local = _parse_session_score_from_mapping(
         {
@@ -8764,13 +8844,16 @@ def reconcile_session_score_on_gateway(user_id: str) -> bool:
     redis_score = _load_redis_session_score(normalized)
     if redis_score is not None:
         candidates.append(redis_score)
-    persisted_score = _load_persisted_session_score(normalized)
-    if persisted_score is not None:
-        candidates.append(persisted_score)
+    # Snapshot do runtime carimbado com hoje é a réplica mais nova: o banco só
+    # entra quando ele falta (sem isso o placar de ontem no banco voltava).
+    if not _snapshot_is_from_runtime_today(normalized):
+        persisted_score = _load_persisted_session_score(normalized)
+        if persisted_score is not None:
+            candidates.append(persisted_score)
 
     preferred = _pick_preferred_session_score(*candidates)
     if preferred == local:
-        return False
+        return adotou_dia_novo
 
     state.wins = preferred[0]
     state.losses = preferred[1]
@@ -8849,9 +8932,10 @@ def enrich_robot_snapshot_session_score(
             }
         ),
     ]
-    persisted_score = _load_persisted_session_score(user_id)
-    if persisted_score is not None:
-        candidates.append(persisted_score)
+    if not _snapshot_is_from_runtime_today(user_id, data):
+        persisted_score = _load_persisted_session_score(user_id)
+        if persisted_score is not None:
+            candidates.append(persisted_score)
     preferred = _pick_preferred_session_score(*candidates)
     current = _parse_session_score_from_mapping(data)
     if preferred == current:
@@ -9321,6 +9405,12 @@ def build_robot_payload(state: Any, **extra: Any) -> dict[str, Any]:
                 "[RESULT_WAITING] order_id=%s",
                 (data.get("last_trade") or {}).get("order_id"),
             )
+    # Dia (Brasília) a que o placar pertence, carimbado só pelo dono do placar
+    # (runtime). O gateway usa para não preferir o placar de ONTEM, maior, ao
+    # de hoje depois da meia-noite (ver adopt_new_day_score_on_gateway).
+    if robot_runtime_mode() == "worker":
+        dia = _ultimo_dia_do_placar.get(str(user_id or ""))
+        data["score_day"] = dia.isoformat() if dia is not None else None
     return build_success(data)
 
 
@@ -11063,7 +11153,12 @@ def _protect_session_score_on_persist(
     live_data = remote["data"]
     local = _parse_session_score_from_mapping(payload)
     live = _parse_session_score_from_mapping(live_data)
-    preferred = _pick_preferred_session_score(local, live)
+    if adopt_new_day_score_on_gateway(user_id, live_data):
+        # Dia novo: o placar maior da memória do gateway é o de ONTEM. Grava o
+        # de hoje do runtime, mesmo menor.
+        preferred = live
+    else:
+        preferred = _pick_preferred_session_score(local, live)
     patched_last_trade = last_trade
     if not last_trade and isinstance(live_data.get("last_trade"), dict):
         patched_last_trade = live_data["last_trade"]
@@ -15584,6 +15679,9 @@ async def restore_robot_states() -> None:
                 trades,
                 source=robot_persistence_source(),
             )
+            # Dia a que o placar restaurado pertence: se o robô só ligar amanhã,
+            # o start sabe que esta memória é de ontem (29/09, d353ab80).
+            _ultimo_dia_do_placar[user_id] = brasilia_today()
             robot_state_hydrated_users.add(user_id)
             restored_count += 1
             logger.info(

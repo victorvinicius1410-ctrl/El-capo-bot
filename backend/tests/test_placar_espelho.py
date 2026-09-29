@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from backend import main
 from backend import robot_runtime_main
@@ -220,6 +220,132 @@ class EspelhoProtegidoTests(unittest.TestCase):
                 )
             )
         self.assertTrue(main.auto_trader.get(self.user).last_trade.get("score_removed"))
+
+
+class ViradaDoDiaTests(unittest.TestCase):
+    """29/09: placar de ONTEM ganhava do de hoje por ser maior."""
+
+    def setUp(self) -> None:
+        self.user = "d353ab80-0000-4000-8000-000000000001"
+        for mapa in (
+            main.auto_trader._states,
+            main._ultimo_dia_do_placar,
+            main._gateway_score_day,
+            main._session_score_authority,
+        ):
+            mapa.pop(self.user, None)
+
+    def _persistencia(self, payload: dict, trades: list) -> object:
+        return type(
+            "P",
+            (),
+            {
+                "load_states": staticmethod(lambda: [(self.user, payload)]),
+                "load_trades_for_restore": staticmethod(
+                    lambda _u: RestoreTrades(list(trades), authoritative=True)
+                ),
+            },
+        )()
+
+    def test_iniciar_descarta_placar_da_memoria_de_ontem(self) -> None:
+        """d353ab80: restaurado às 23h com 1x3, iniciou às 09:40 do dia seguinte."""
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 1, 3, -10.8
+        # Restaurado no boot de ontem e nunca ligado desde então.
+        main._ultimo_dia_do_placar[self.user] = main.brasilia_today() - timedelta(days=1)
+        payload = estado.to_dict()
+        hoje = [_ordem("9501", "WIN", 4.2, utc_now() - timedelta(seconds=30))]
+        gateway = type(
+            "G",
+            (),
+            {
+                "robot_persistence": self._persistencia(payload, hoje),
+                "auto_trader": main.auto_trader,
+                "_ultimo_dia_do_placar": main._ultimo_dia_do_placar,
+                "mark_session_score_authority": staticmethod(main.mark_session_score_authority),
+            },
+        )()
+        with patch.object(main.robot_bus, "set_score_authority"):
+            robot_runtime_main._hydrate_user_from_persistence(gateway, self.user, force=True)
+        self.assertEqual(self._placar(), (1, 0, 4.2))
+        self.assertEqual(main._ultimo_dia_do_placar[self.user], main.brasilia_today())
+        self.assertEqual(main.get_session_score_authority(self.user), (1, 0, 4.2))
+
+    def test_iniciar_mantem_placar_vivo_de_hoje(self) -> None:
+        """Memória conferida hoje e à frente do banco continua valendo."""
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 3, 1, 7.6
+        main._ultimo_dia_do_placar[self.user] = main.brasilia_today()
+        gateway = type(
+            "G",
+            (),
+            {
+                "robot_persistence": self._persistencia(estado.to_dict(), []),
+                "auto_trader": main.auto_trader,
+                "_ultimo_dia_do_placar": main._ultimo_dia_do_placar,
+            },
+        )()
+        robot_runtime_main._hydrate_user_from_persistence(gateway, self.user, force=True)
+        self.assertEqual(self._placar(), (3, 1, 7.6))
+
+    def _placar(self) -> tuple:
+        s = main.auto_trader.get(self.user)
+        return (int(s.wins), int(s.losses), round(float(s.profit), 2))
+
+    def _snapshot(self, wins: int, losses: int, profit: float, dia) -> dict:
+        return {
+            "ok": True,
+            "data": {"wins": wins, "losses": losses, "profit": profit, "score_day": dia},
+        }
+
+    def test_gateway_adota_placar_de_hoje_mesmo_menor(self) -> None:
+        """e3b52de7: gateway com 1x1 de ontem, runtime com 0x0 de hoje."""
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 1, 1, -1.3
+        hoje = main.brasilia_today().isoformat()
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
+            patch.object(main.robot_bus, "get_snapshot", return_value=self._snapshot(0, 0, 0.0, hoje)),
+            patch.object(main, "_load_persisted_session_score", return_value=(1, 1, -1.3)),
+            patch.object(main, "get_session_score_authority", return_value=None),
+        ):
+            main.reconcile_session_score_on_gateway(self.user)
+            self.assertEqual(self._placar(), (0, 0, 0.0))
+            # Na leitura seguinte o banco de ontem não promove de volta.
+            main.reconcile_session_score_on_gateway(self.user)
+        self.assertEqual(self._placar(), (0, 0, 0.0))
+
+    def test_snapshot_sem_dia_mantem_nunca_rebaixa(self) -> None:
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 5, 3, 25.0
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
+            patch.object(main.robot_bus, "get_snapshot", return_value=self._snapshot(2, 0, 17.4, None)),
+            patch.object(main, "_load_persisted_session_score", return_value=None),
+            patch.object(main, "get_session_score_authority", return_value=None),
+        ):
+            main.reconcile_session_score_on_gateway(self.user)
+        self.assertEqual(self._placar(), (5, 3, 25.0))
+
+    def test_persist_do_gateway_grava_o_placar_de_hoje(self) -> None:
+        hoje = main.brasilia_today().isoformat()
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(main.robot_bus, "get_snapshot", return_value=self._snapshot(1, 0, 4.2, hoje)),
+            patch.object(main, "get_session_score_authority", return_value=None),
+        ):
+            payload, _ = main._protect_session_score_on_persist(
+                self.user, {"wins": 1, "losses": 3, "profit": -10.8}, None
+            )
+        self.assertEqual((payload["wins"], payload["losses"], payload["profit"]), (1, 0, 4.2))
+
+    def test_runtime_carimba_o_dia_no_snapshot(self) -> None:
+        main._ultimo_dia_do_placar[self.user] = main.brasilia_today()
+        with patch.object(main, "robot_runtime_mode", return_value="worker"):
+            data = main.build_robot_payload(main.auto_trader.get(self.user), user_id=self.user)["data"]
+        self.assertEqual(data["score_day"], main.brasilia_today().isoformat())
 
 
 class OrfaJaFinalTests(unittest.TestCase):

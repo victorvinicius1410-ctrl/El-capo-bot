@@ -19,6 +19,32 @@ Atualizado em **2026-09-07**.
 
 Espelho detalhado: [`Frontend/docs/PLACAR_OVERLAY.md`](../frontend/docs/PLACAR_OVERLAY.md).
 
+## Correção (2026-09-29, tarde) — placar de ONTEM somado ao de hoje
+
+**Achado pela auditoria automática** (3 e-mails no mesmo dia, um problema só):
+`d353ab80` com banco 6x4 e Histórico 5x1. Os 1x3 a mais eram as operações da
+véspera depois do reset. O runtime restaurou o cliente no boot às 23:02 do dia 28;
+ele não estava ligado à meia-noite (a virada do worker não rodou) e iniciou às
+09:40 do dia 29. O restore pelo Histórico deu 0x0, mas `_prefer_live_session_score`
+ficou com o 1x3 da memória por ter total maior.
+
+Segundo sintoma, no painel: `e3b52de7` estava ligado na virada (o runtime zerou
+certo), mas a memória do gateway manteve o 1x1 de ontem, e o "nunca rebaixa"
+serviu esse 1x1 até 01:50.
+
+**Regra nova — todo placar sabe de que dia é:**
+- `_ultimo_dia_do_placar` passa a ser gravado também no boot (`restore_robot_states`)
+  e no hidratar do start. No start, memória de **outro dia** não ganha do recálculo
+  (`[LIVE_SCORE_FROM_OTHER_DAY_DROPPED]`), e a troca marca `score_authority`
+  (a menos que já haja uma baixa intencional vigente).
+- O runtime carimba `score_day` no snapshot (`build_robot_payload`, modo worker).
+- No gateway, `adopt_new_day_score_on_gateway`: na primeira leitura do dia com
+  snapshot carimbado de hoje, adota o placar do runtime mesmo sendo menor
+  (`[SCORE_NEW_DAY_ADOPTED_ON_GATEWAY]`). Com snapshot de hoje, o banco sai da
+  disputa do "maior total" (reconcile, enrich e `_protect_session_score_on_persist`).
+- O alerta passa a usar uma chave por cliente (`placar:{user_id}`): antes cada
+  operação nova mudava a chave e o mesmo problema virava outro e-mail.
+
 ## Correção (2026-09-29) — "Iniciar Operação" mudava a composição do placar (2x3 → 1x4)
 
 **Caso:** 28/09, conta `11e0b3d5`. Três losses apagados no Shift+O (2x2), um LOSS
