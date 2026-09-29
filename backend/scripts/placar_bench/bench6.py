@@ -209,15 +209,17 @@ async def s75_virada_do_dia():
     M.persist_robot(u)
     time.sleep(0.5)
     antes = smem(u)
-    # Finge que o último ciclo deste usuário rodou ontem.
-    M._ultimo_dia_do_placar[u] = (utc_now() - datetime.timedelta(days=1)).date()
+    # Finge que o último ciclo deste usuário rodou ontem — ontem em BRASÍLIA.
+    # Com a data UTC, entre 21h e meia-noite de Brasília "ontem UTC" é o
+    # próprio dia de Brasília e o cenário falhava sem defeito no produto.
+    M._ultimo_dia_do_placar[u] = M.brasilia_today() - datetime.timedelta(days=1)
     virou = M.reset_session_score_on_new_day(u)
     time.sleep(0.5)
     vivo = smem(u)
     # E a reidratação seguinte tem de concordar com a memória viva.
     M.auto_trader._states.pop(u, None)
     M.auto_trader.restore(u, M.robot_persistence.load_state(u) or {},
-                          M.robot_persistence.load_trades(u), source="supabase")
+                          M.robot_persistence.load_trades_for_restore(u), source="supabase")
     ok = virou and vivo == (0, 0, 0.0) and smem(u) == vivo
     check("S75 placar vira o dia e a reidratação concorda",
           "execute_robot_worker_cycle -> reset_session_score_on_new_day",
