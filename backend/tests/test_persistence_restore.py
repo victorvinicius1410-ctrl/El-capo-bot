@@ -1378,7 +1378,8 @@ class RobotPersistenceTests(unittest.IsolatedAsyncioTestCase):
         saved_state = saved_trader.start(user_id)
         persistence = SimpleNamespace(
             load_states=Mock(return_value=[(user_id, saved_state.to_dict())]),
-            load_trades=Mock(return_value=[]),
+            load_user_ids_with_history_today=Mock(return_value=set()),
+            load_trades_for_restore=Mock(return_value=[]),
         )
         old_trader = main.auto_trader
         old_persistence = main.robot_persistence
@@ -1403,7 +1404,8 @@ class RobotPersistenceTests(unittest.IsolatedAsyncioTestCase):
                         await result
 
             persistence.load_states.assert_called_once_with()
-            persistence.load_trades.assert_called_once_with(user_id)
+            # Sem operação hoje: restaura com Histórico vazio, sem consultá-lo.
+            persistence.load_trades_for_restore.assert_called_once_with(user_id, historico=[])
             service_call.assert_not_awaited()
             worker_start.assert_not_called()
             self.assertEqual(main.robot_tasks, {})

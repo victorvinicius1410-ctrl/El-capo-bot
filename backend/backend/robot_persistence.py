@@ -262,6 +262,19 @@ def extract_local_robot_settings(state: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
+class RestoreTrades(list):
+    """Lista de operações do restore que sabe se veio do Histórico.
+
+    ``authoritative=True``: o Histórico foi lido — lista vazia é "nada hoje".
+    ``False``: leitura falhou e caiu no espelho — lista vazia é ambígua e o
+    restore preserva o placar persistido.
+    """
+
+    def __init__(self, items: list[dict[str, Any]], *, authoritative: bool) -> None:
+        super().__init__(items)
+        self.authoritative = authoritative
+
+
 class RobotPersistence(ABC):
     @abstractmethod
     def save_state(self, user_id: str, state: dict[str, Any]) -> None:
@@ -325,6 +338,95 @@ class RobotPersistence(ABC):
     @abstractmethod
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+    def load_user_ids_with_history_today(self) -> set[str] | None:
+        """Clientes com alguma linha no Histórico hoje (dia de Brasília).
+
+        Usado no boot para ler o Histórico só de quem operou: são ~400
+        clientes restaurados e poucas dezenas com operação no dia.
+
+        Returns:
+            Conjunto de ``user_id``, ou ``None`` quando não dá para saber (aí
+            cada restore consulta o próprio Histórico).
+        """
+        return None
+
+    def load_trades_for_restore(
+        self,
+        user_id: str,
+        historico: list[dict[str, Any]] | None = None,
+    ) -> "RestoreTrades":
+        """Operações que o ``restore`` usa para recalcular o placar.
+
+        O placar sai do **Histórico** (``robot_trade_history``), a mesma fonte
+        do stop win/loss. O espelho ``robot_trades`` entra só com o que o
+        Histórico não tem por definição: ordem ainda em voo (``PENDING_RESULT``)
+        e ``TIMEOUT``. Linha final do espelho sem Histórico NÃO entra — ou é
+        operação apagada no Shift+O que ressuscitou, ou perda oculta do LIVE.
+
+        Antes o restore contava pelo espelho, e o espelho mente de dois jeitos:
+        WIN regravado como pendente por uma cópia velha de ``last_trade`` e loss
+        apagado recriado pelo ``persist_robot``. Em 28/09 isso levou o placar de
+        um cliente de 2x3 para 1x4 no "Iniciar Operação".
+        Ver docs/PLACAR_OVERLAY.md §2026-09-29.
+
+        Args:
+            user_id: Dono das operações.
+            historico: Histórico de hoje já lido (boot em lote); ``None`` lê.
+
+        Returns:
+            Operações em ordem cronológica (mais antiga primeiro), com
+            ``authoritative=True`` quando o Histórico foi lido — aí lista vazia
+            quer dizer "nada hoje" e o placar zera, em vez de manter o de ontem.
+        """
+        if historico is None:
+            try:
+                historico = self.load_trade_history(user_id, 1)
+            except Exception:
+                # Sem Histórico não dá para conferir o espelho: cai no
+                # comportamento antigo em vez de zerar o placar do cliente.
+                logger.warning(
+                    "[RESTORE_HISTORY_READ_FAILED] user_id=%s fallback=robot_trades",
+                    user_id,
+                    exc_info=True,
+                )
+                return RestoreTrades(self.load_trades(user_id) or [], authoritative=False)
+        historico = [
+            item
+            for item in historico
+            if str(item.get("result") or "").upper() in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
+        ]
+        conhecidas = {
+            str(item.get("order_id") or "").strip()
+            for item in historico
+            if str(item.get("order_id") or "").strip()
+        }
+        em_aberto: list[dict[str, Any]] = []
+        try:
+            espelho = self.load_trades(user_id) or []
+        except Exception:
+            logger.warning(
+                "[RESTORE_MIRROR_READ_FAILED] user_id=%s", user_id, exc_info=True
+            )
+            espelho = []
+        for trade in espelho:
+            order_id = str(trade.get("order_id") or "").strip()
+            if not order_id or order_id in conhecidas:
+                continue
+            resultado = str(trade.get("result") or "").strip().upper()
+            if resultado in {PENDING_RESULT_LABEL, "TIMEOUT"}:
+                em_aberto.append(trade)
+
+        def _momento(trade: dict[str, Any]) -> str:
+            return str(
+                trade.get("finished_at")
+                or trade.get("sent_at")
+                or trade.get("opened_at")
+                or trade.get("created_at")
+                or ""
+            )
+
+        return RestoreTrades(sorted([*historico, *em_aberto], key=_momento), authoritative=True)
 
     def load_trade_history_for_users(
         self,
@@ -709,6 +811,15 @@ class SQLiteRobotPersistence(RobotPersistence):
                     json.dumps(item["analysis_json"], ensure_ascii=False),
                 ),
             )
+
+    def load_user_ids_with_history_today(self) -> set[str] | None:
+        cutoff = history_cutoff_iso(1)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "select distinct user_id from robot_trade_history where finished_at >= ?",
+                (cutoff,),
+            ).fetchall()
+        return {str(row["user_id"]) for row in rows}
 
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
         cutoff = history_cutoff_iso(days)
@@ -1192,6 +1303,30 @@ class SupabaseRobotPersistence(RobotPersistence):
             {"Prefer": "resolution=merge-duplicates,return=minimal"},
             f"user_id={user_id} order_id={item.get('order_id')} tabela=robot_trade_history",
         )
+
+    def load_user_ids_with_history_today(self) -> set[str] | None:
+        cutoff = history_cutoff_iso(1)
+        encontrados: set[str] = set()
+        inicio = 0
+        try:
+            while True:
+                # Paginação SEM `order` estável repete e pula linhas no PostgREST.
+                pagina = self._request(
+                    "GET",
+                    "/robot_trade_history?select=user_id"
+                    f"&finished_at=gte.{quote(cutoff, safe=':-')}"
+                    "&order=id.asc",
+                    extra_headers={"Range": f"{inicio}-{inicio + 999}"},
+                )
+                encontrados.update(str(row.get("user_id") or "") for row in pagina)
+                if len(pagina) < 1000:
+                    break
+                inicio += 1000
+        except Exception:
+            logger.warning("[HISTORY_ACTIVE_USERS_READ_FAILED]", exc_info=True)
+            return None
+        encontrados.discard("")
+        return encontrados
 
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
         cutoff = history_cutoff_iso(days)

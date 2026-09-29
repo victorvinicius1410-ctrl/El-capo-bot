@@ -1153,6 +1153,9 @@ class AutoTrader:
         self._states[user_id] = state
         self._sources[user_id] = source
 
+        # Veio do Histórico (RestoreTrades.authoritative): lista vazia é "nada
+        # hoje" e o placar zera. Sem a marca, vazio é ambíguo e preserva.
+        authoritative = bool(getattr(trades, "authoritative", False))
         restored_trades = [strip_ai_fields(dict(trade)) for trade in (trades or [])]
         self._histories[user_id] = [
             trade
@@ -1165,13 +1168,50 @@ class AutoTrader:
             for trade in self._histories[user_id]
             if trade.get("order_id") is not None
         }
-        self._recompute_score_from_history(state, self._histories[user_id])
+        self._close_stale_last_trade(state, self._histories[user_id])
+        self._recompute_score_from_history(
+            state, self._histories[user_id], authoritative=authoritative
+        )
         return state
+
+    @staticmethod
+    def _close_stale_last_trade(
+        state: RobotState,
+        trades: list[dict[str, Any]],
+    ) -> None:
+        """Troca um ``last_trade`` pendente pela versão final, se a ordem fechou.
+
+        O ``robot_states`` guarda ``last_trade`` como estava na última gravação.
+        Gravado no meio da vela, ele volta PENDENTE no restore mesmo com o
+        resultado já no Histórico — e todo ``persist_robot`` seguinte regravava
+        esse pendente no espelho por cima do WIN (28/09: 4 clientes da mesma
+        vela). Nada fecha esse ``last_trade`` depois: o monitor de resultado não
+        existe no processo que restaurou.
+
+        Args:
+            state: Estado restaurado, alterado no lugar.
+            trades: Operações finais usadas no restore.
+        """
+        last = state.last_trade
+        if not isinstance(last, dict):
+            return
+        order_id = str(last.get("order_id") or "").strip()
+        if not order_id:
+            return
+        if str(last.get("result") or "").strip().upper() in {"WIN", "LOSS", "DRAW", "TIMEOUT"}:
+            return
+        for trade in reversed(trades):
+            if str(trade.get("order_id") or "").strip() != order_id:
+                continue
+            state.last_trade = {**last, **trade}
+            return
 
     @staticmethod
     def _recompute_score_from_history(
         state: RobotState,
         trades: list[dict[str, Any]],
+        *,
+        authoritative: bool = False,
     ) -> None:
         """
         Recalcula placar e lucro da sessão a partir do histórico.
@@ -1188,8 +1228,10 @@ class AutoTrader:
         Args:
             state: Estado restaurado, alterado no lugar.
             trades: Histórico persistido do usuário.
+            authoritative: A lista veio do Histórico lido com sucesso; vazia
+                significa "nenhuma operação hoje" e zera o placar.
         """
-        if not trades:
+        if not trades and not authoritative:
             # Lista vazia é ambígua: pode ser cliente novo OU falha transitória
             # na leitura da persistência. Zerar aqui apagaria um placar válido,
             # então preserva o que veio da persistência — o próximo restore
@@ -3306,6 +3348,43 @@ class AutoTrader:
             return None
         self._histories[normalized_user] = filtered
         return removed
+
+    def is_order_completed(self, user_id: str, order_id: str) -> bool:
+        """True se a ordem já teve resultado final contabilizado neste processo."""
+        normalized_order = str(order_id or "").strip()
+        if not normalized_order:
+            return False
+        return normalized_order in self._completed_order_ids.get(str(user_id or "").strip(), set())
+
+    def mark_trade_removed(self, user_id: str, order_id: str) -> bool:
+        """Aplica a exclusão do Shift+O na memória deste processo.
+
+        Mantém o id em ``_completed_order_ids`` (resultado atrasado não conta de
+        novo) e, se ela for o ``last_trade``, marca ``score_removed`` para o
+        ``persist_robot`` não regravá-la no espelho ``robot_trades``.
+
+        NÃO tira a ordem do histórico em memória: a exclusão baixa o placar
+        (via ``stop_offset_*``), mas o stop continua vendo o dinheiro real que
+        saiu da conta, e ``management_totals`` soma por esse histórico.
+
+        Args:
+            user_id: Dono da sessão.
+            order_id: Ordem apagada.
+
+        Returns:
+            True se a ordem era o ``last_trade`` da sessão.
+        """
+        normalized_user = str(user_id or "").strip()
+        normalized_order = str(order_id or "").strip()
+        if not normalized_user or not normalized_order:
+            return False
+        self._completed_order_ids.setdefault(normalized_user, set()).add(normalized_order)
+        state = self._states.get(normalized_user)
+        last = getattr(state, "last_trade", None) if state is not None else None
+        if isinstance(last, dict) and str(last.get("order_id") or "").strip() == normalized_order:
+            state.last_trade = {**last, "score_removed": True}
+            return True
+        return False
 
     def replace_history(self, user_id: str, trades: list[dict[str, Any]]) -> None:
         """

@@ -197,7 +197,7 @@ from backend.robot_state_ws import (
     close_robot_websocket,
     robot_ws_receive_loop,
 )
-from backend.robot_bus import RobotBus, robot_runtime_mode
+from backend.robot_bus import DELETED_ORDERS_TTL_SECONDS, RobotBus, robot_runtime_mode
 from backend.registration_service import RegistrationService
 from backend.account_link_service import SupabaseAccountLinkService
 from backend.cakto_service import CaktoConfig, CaktoService
@@ -3546,6 +3546,17 @@ def delete_marketing_robot_history_item(
     normalized_order = str(order_id or "").strip()
     if not normalized_user or not normalized_order:
         return None
+    # Lápide ANTES de apagar o espelho: se a ordem ainda é o `last_trade` de
+    # algum processo, o `persist_robot` seguinte a recriava em robot_trades e o
+    # "Iniciar Operação" contava o loss apagado de novo (28/09, 2x3 → 1x4).
+    try:
+        mark_deleted_orders(normalized_user, [normalized_order])
+    except Exception:
+        logger.exception(
+            "[DELETED_ORDERS_MARK_FAILED] user_id=%s order_id=%s",
+            normalized_user,
+            normalized_order,
+        )
     try:
         deleted = robot_persistence.delete_trade_history_item(
             normalized_user,
@@ -10912,6 +10923,90 @@ def _get_robot_persist_lock(user_id: str) -> threading.Lock:
         return lock
 
 
+# Lápide local das ordens apagadas no Shift+O (user → ordem → expira em
+# monotonic). O Redis (robot_bus) é quem avisa o outro processo; esta cópia
+# cobre o próprio processo e o modo sem Redis (bancada/testes).
+_deleted_orders_memory: dict[str, dict[str, float]] = {}
+
+
+def mark_deleted_orders(user_id: str, order_ids: list[str]) -> None:
+    """Registra ordens apagadas no Shift+O para nunca voltarem ao espelho.
+
+    Args:
+        user_id: Dono das ordens.
+        order_ids: Ids apagados.
+    """
+    normalized = str(user_id or "").strip()
+    ids = [str(item).strip() for item in order_ids if str(item or "").strip()]
+    if not normalized or not ids:
+        return
+    expira = monotonic() + DELETED_ORDERS_TTL_SECONDS
+    lapides = _deleted_orders_memory.setdefault(normalized, {})
+    for order_id in ids:
+        lapides[order_id] = expira
+        auto_trader.mark_trade_removed(normalized, order_id)
+    try:
+        robot_bus.mark_deleted_orders(normalized, ids)
+    except Exception:
+        logger.warning("[DELETED_ORDERS_PUBLISH_FAILED] user_id=%s", normalized, exc_info=True)
+    logger.warning(
+        "[DELETED_ORDERS_MARKED] user_id=%s order_ids=%s", normalized, ",".join(ids)
+    )
+
+
+def is_deleted_order(user_id: str, order_id: str) -> bool:
+    """True se a ordem foi apagada no Shift+O (lápide local ou no Redis)."""
+    normalized = str(user_id or "").strip()
+    normalized_order = str(order_id or "").strip()
+    if not normalized or not normalized_order:
+        return False
+    expira = (_deleted_orders_memory.get(normalized) or {}).get(normalized_order)
+    if expira is not None and expira > monotonic():
+        return True
+    try:
+        return robot_bus.is_deleted_order(normalized, normalized_order)
+    except Exception:
+        return False
+
+
+def _trade_for_mirror(user_id: str, trade: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Decide se o ``last_trade`` pode ir para o espelho ``robot_trades``.
+
+    O espelho mentia de dois jeitos e o "Iniciar Operação" contava por ele
+    (28/09: 2x3 virou 1x4):
+    - o gateway (``external``) regravava uma cópia velha PENDENTE por cima do
+      WIN que o runtime tinha gravado — o dono do espelho é o runtime;
+    - a ordem apagada no Shift+O, ainda ``last_trade``, voltava a cada persist.
+
+    Roda na thread de gravação: a consulta ao Redis não trava o event loop.
+
+    Args:
+        user_id: Dono da sessão.
+        trade: ``last_trade`` que o ``persist_robot`` iria gravar.
+
+    Returns:
+        O trade, ou ``None`` quando não pode ser gravado.
+    """
+    if not isinstance(trade, dict):
+        return None
+    if robot_runtime_mode() == "external":
+        return None
+    order_id = str(trade.get("order_id") or "").strip()
+    if not order_id:
+        return trade
+    if trade.get("score_removed") or is_deleted_order(user_id, order_id):
+        return None
+    resultado = str(trade.get("result") or "").strip().upper()
+    if resultado in {"", "PENDING_RESULT"} and auto_trader.is_order_completed(user_id, order_id):
+        logger.warning(
+            "[TRADE_MIRROR_DOWNGRADE_BLOCKED] user_id=%s order_id=%s",
+            user_id,
+            order_id,
+        )
+        return None
+    return trade
+
+
 def _protect_session_score_on_persist(
     user_id: str,
     payload: dict[str, Any],
@@ -11071,6 +11166,7 @@ def persist_robot(user_id: str) -> Future | None:
                     "[ROBOT_PERSISTENCE_WARNING] user_id=%s step=save_settings", user_id, exc_info=True
                 )
 
+            trade = _trade_for_mirror(user_id, trade)
             if trade:
                 try:
                     robot_persistence.save_trade(user_id, trade)
@@ -11154,17 +11250,9 @@ def get_user_robot_state(user_id: str) -> Any:
             payload["confirm_real"] = True
             if payload.get("active_mode") is None or str(payload.get("active_mode")).strip().upper() == "DEMO":
                 payload["active_mode"] = "REAL"
-            trades = robot_persistence.load_trades(user_id)
-            if not trades:
-                try:
-                    trades = [
-                        item
-                        for item in robot_persistence.load_trade_history(user_id, 30)
-                        if str(item.get("result") or "").upper() in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
-                    ]
-                except Exception:
-                    logger.exception("[ON_DEMAND_HISTORY_HYDRATE_FAILED] user_id=%s", user_id)
-                    trades = []
+            # Placar pelo Histórico, não pelo espelho robot_trades (ver
+            # RobotPersistence.load_trades_for_restore).
+            trades = robot_persistence.load_trades_for_restore(user_id)
             state = auto_trader.restore(
                 user_id,
                 payload,
@@ -15467,6 +15555,9 @@ async def restore_robot_states() -> None:
     logger.warning("[STARTUP_RESTORE_BEGIN] mode=%s", robot_runtime_mode())
     logger.info("[STARTUP_RESTORE_DISABLED] no session restore on startup")
     restored_count = 0
+    # Quem não tem linha no Histórico hoje restaura com Histórico vazio sem
+    # consultar: evita ~400 leituras no boot (o gateway só atende depois dele).
+    ativos_hoje = robot_persistence.load_user_ids_with_history_today()
     try:
         for user_id, payload in robot_persistence.load_states():
             session_restored = False
@@ -15481,22 +15572,12 @@ async def restore_robot_states() -> None:
                 "connection_status_source": "startup_no_session_restore",
             }
             restorable_robot_states[user_id] = deepcopy(payload)
-            trades = robot_persistence.load_trades(user_id)
-            if not trades:
-                # robot_trades pode estar vazio; o histórico canônico fica em
-                # robot_trade_history (fonte do /history e do placar).
-                try:
-                    trades = [
-                        item
-                        for item in robot_persistence.load_trade_history(user_id, 30)
-                        if str(item.get("result") or "").upper() in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
-                    ]
-                except Exception:
-                    logger.exception(
-                        "[STARTUP_HISTORY_HYDRATE_FAILED] user_id=%s",
-                        user_id,
-                    )
-                    trades = []
+            # Placar pelo Histórico, não pelo espelho robot_trades (ver
+            # RobotPersistence.load_trades_for_restore).
+            trades = robot_persistence.load_trades_for_restore(
+                user_id,
+                historico=[] if ativos_hoje is not None and user_id not in ativos_hoje else None,
+            )
             auto_trader.restore(
                 user_id,
                 payload,

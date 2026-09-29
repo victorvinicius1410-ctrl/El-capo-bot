@@ -150,17 +150,9 @@ def _hydrate_user_from_persistence(
         for uid, state_payload in persistence.load_states():
             if str(uid) != user_id:
                 continue
-            trades = persistence.load_trades(user_id) or []
-            if not trades:
-                try:
-                    trades = [
-                        item
-                        for item in persistence.load_trade_history(user_id, 30)
-                        if str(item.get("result") or "").upper()
-                        in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
-                    ]
-                except Exception:
-                    trades = []
+            # Placar pelo Histórico, não pelo espelho robot_trades (ver
+            # RobotPersistence.load_trades_for_restore).
+            trades = persistence.load_trades_for_restore(user_id)
             source = getattr(gateway, "robot_persistence_source", lambda: "runtime")()
             auto_trader.restore(user_id, state_payload, trades, source=source)
             if live_score is not None:
@@ -397,6 +389,20 @@ async def _handle_command(gateway: object, payload: dict) -> None:
                 payload,
             )
             return
+        # Exclusão do Shift+O: se a ordem apagada é o `last_trade` daqui, marca
+        # para o `persist_robot` abaixo não recriá-la no espelho robot_trades.
+        apagada = getattr(gateway, "is_deleted_order", None)
+        ultima = str((getattr(state, "last_trade", None) or {}).get("order_id") or "").strip()
+        if ultima and callable(apagada):
+            try:
+                if apagada(user_id, ultima):
+                    gateway.auto_trader.mark_trade_removed(user_id, ultima)  # type: ignore[attr-defined]
+            except Exception:
+                logger.warning(
+                    "[ROBOT_RUNTIME_DELETED_ORDER_CHECK_FAILED] user_id=%s",
+                    user_id,
+                    exc_info=True,
+                )
         # Marca a baixa também aqui: o `_snapshot_publisher` roda 1x/s e
         # republicaria o placar antigo se um restore/reconcile promovesse a
         # persistência atrasada antes do próximo comando.
@@ -576,9 +582,43 @@ async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
     finalizar = getattr(gateway, "finish_monitored_trade", None)
     if not all(callable(x) for x in (buscar, normalizar, finalizar)):
         return
+    finais_por_usuario: dict[str, dict[str, dict]] = {}
     for user_id, trade in pendentes:
         order_id = str(trade.get("order_id") or "").strip()
         if not order_id or not _is_valid_account_user_id(user_id):
+            continue
+        # Linha pendente com resultado já no Histórico não é órfã: é o espelho
+        # que foi regravado por cima (28/09). Fechar de novo contaria o WIN
+        # duas vezes — só corrige a linha do espelho.
+        if user_id not in finais_por_usuario:
+            try:
+                finais_por_usuario[user_id] = {
+                    str(item.get("order_id") or "").strip(): item
+                    for item in persistence.load_trade_history(user_id, 2)
+                    if str(item.get("result") or "").upper() in {"WIN", "LOSS", "DRAW"}
+                }
+            except Exception:
+                logger.warning(
+                    "[ORPHAN_TRADE_HISTORY_READ_FAILED] user_id=%s", user_id, exc_info=True
+                )
+                finais_por_usuario[user_id] = {}
+        final = finais_por_usuario[user_id].get(order_id)
+        if final is not None:
+            try:
+                persistence.save_trade(user_id, {**trade, **final})
+            except Exception:
+                logger.warning(
+                    "[ORPHAN_TRADE_MIRROR_REPAIR_FAILED] user_id=%s order_id=%s",
+                    user_id,
+                    order_id,
+                    exc_info=True,
+                )
+            logger.warning(
+                "[ORPHAN_TRADE_ALREADY_FINAL] user_id=%s order_id=%s result=%s",
+                user_id,
+                order_id,
+                final.get("result"),
+            )
             continue
         try:
             _, payload = await asyncio.wait_for(buscar(user_id, order_id), timeout=20)

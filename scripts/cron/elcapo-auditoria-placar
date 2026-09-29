@@ -1,0 +1,5 @@
+# Audita o placar (placar x Histórico x espelho robot_trades) a cada 15 min e
+# manda e-mail quando um problema aparece em duas rodadas seguidas.
+# Instalar: cp scripts/cron/elcapo-auditoria-placar /etc/cron.d/
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/15 * * * * root flock -n /run/elcapo-auditoria-placar.lock /opt/elcapo/scripts/auditoria-placar.sh victorvinicius1410@gmail.com >/dev/null 2>&1

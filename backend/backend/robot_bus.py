@@ -25,6 +25,9 @@ SNAPSHOT_TTL_SECONDS = 600
 # gerar placar do Shift+O). TTL curto: só precisa cobrir a janela em que
 # Redis/Supabase ainda têm o placar anterior. Ver docs/PLACAR_OVERLAY.md.
 SCORE_AUTHORITY_TTL_SECONDS = 120
+# Ordens apagadas no Shift+O. Dura mais que o dia: o que importa é nenhum
+# processo regravar a ordem no espelho robot_trades (ver persist_robot).
+DELETED_ORDERS_TTL_SECONDS = 36 * 3600
 CMD_CHANNEL = "robot:cmd"
 STATE_CHANNEL = "robot:state"
 
@@ -211,6 +214,49 @@ class RobotBus:
                 user_id,
                 exc_info=True,
             )
+
+    def mark_deleted_orders(self, user_id: str, order_ids: list[str]) -> None:
+        """Grava a lápide das ordens apagadas no Shift+O.
+
+        Sem ela, a ordem apagada que ainda era o ``last_trade`` de um processo
+        voltava ao espelho ``robot_trades`` no ``persist_robot`` seguinte — e o
+        "Iniciar Operação" contava o loss apagado de novo (28/09, 2x3 → 1x4).
+
+        Args:
+            user_id: Dono das ordens.
+            order_ids: Ids apagados (Bullex ou UUID sintético).
+        """
+        ids = [str(item).strip() for item in order_ids if str(item or "").strip()]
+        if not self.enabled or not ids:
+            return
+        chave = f"robot:deleted_orders:{user_id}"
+        try:
+            cliente = self._get_client()
+            cliente.sadd(chave, *ids)
+            cliente.expire(chave, DELETED_ORDERS_TTL_SECONDS)
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_DELETED_ORDERS_WRITE_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+
+    def is_deleted_order(self, user_id: str, order_id: str) -> bool:
+        """True se a ordem foi apagada no Shift+O (lápide ainda válida)."""
+        normalized = str(order_id or "").strip()
+        if not self.enabled or not normalized:
+            return False
+        try:
+            return bool(
+                self._get_client().sismember(f"robot:deleted_orders:{user_id}", normalized)
+            )
+        except Exception:
+            logger.warning(
+                "[ROBOT_BUS_DELETED_ORDERS_READ_FAILED] user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+            return False
 
     def set_manual_disconnect(self, user_id: str, active: bool) -> None:
         """Grava a decisão de "Desconectar Bullex" de forma durável.

@@ -19,6 +19,55 @@ Atualizado em **2026-09-07**.
 
 Espelho detalhado: [`Frontend/docs/PLACAR_OVERLAY.md`](../frontend/docs/PLACAR_OVERLAY.md).
 
+## Correção (2026-09-29) — "Iniciar Operação" mudava a composição do placar (2x3 → 1x4)
+
+**Caso:** 28/09, conta `11e0b3d5`. Três losses apagados no Shift+O (2x2), um LOSS
+fechou (2x3), parar → M5→M1 → iniciar, e 4s depois o placar era **1x4/−315**. O
+robô tinha contado certo; o erro nascia no restore do start.
+
+**Causa:** o restore (`_hydrate_user_from_persistence`, `get_user_robot_state`,
+`restore_robot_states`) recalculava pelo espelho `robot_trades`, e o espelho
+mentia de dois jeitos:
+
+1. **WIN regravado como `PENDING_RESULT`.** O gateway (`external`) guardava uma
+   cópia velha de `last_trade` e todo `persist_robot` dele fazia `save_trade` por
+   cima do resultado do runtime. 4 clientes na mesma vela de 28/09. Como órfã,
+   o boot ainda contaria esse WIN **duas vezes**.
+2. **Loss apagado ressuscitado.** A exclusão não mexia no `last_trade` do runtime;
+   o `persist_robot` seguinte recriava a linha (created_at = hora da exclusão).
+
+`_prefer_live_session_score` só fica com o vivo quando o total é MAIOR: 2x3 e
+1x4 empatam em 5, e ganhava o recalculado.
+
+**Regra nova — placar e stop leem a mesma fonte:**
+- `RobotPersistence.load_trades_for_restore`: Histórico de hoje + do espelho só
+  `PENDING_RESULT`/`TIMEOUT` que o Histórico não tem. Devolve `RestoreTrades`
+  com `authoritative=True`: lista vazia zera (nada hoje) em vez de manter o
+  placar de ontem. Se o Histórico falhar, cai no espelho (`[RESTORE_HISTORY_READ_FAILED]`).
+- `AutoTrader._close_stale_last_trade`: `last_trade` pendente de ordem já final
+  volta final no restore.
+- **Só o runtime escreve o espelho.** `_trade_for_mirror` no `persist_robot`:
+  gateway `external` nunca grava; PENDENTE de ordem já concluída é barrado
+  (`[TRADE_MIRROR_DOWNGRADE_BLOCKED]`); ordem apagada não volta.
+- **Lápide da exclusão:** `mark_deleted_orders` (memória + Redis
+  `robot:deleted_orders:{uid}`, 36h). A ordem continua no histórico em memória do
+  runtime de propósito: o stop segue vendo o dinheiro real.
+- Recuperação de órfã confere o Histórico antes: já final → só conserta o
+  espelho (`[ORPHAN_TRADE_ALREADY_FINAL]`).
+- No boot, o Histórico só é lido de quem operou hoje
+  (`load_user_ids_with_history_today`), para não dobrar o tempo de subida.
+
+**Vigilância:** `scripts/auditoria_placar.py` (placar × Histórico, espelho
+pendente com resultado final, órfã, operação sem Histórico/ressuscitada;
+`--corrigir` conserta só o espelho) roda a cada 15 min por
+`/etc/cron.d/elcapo-auditoria-placar` e manda e-mail
+(`scripts/alerta_auditoria_placar.py`) quando o problema aparece em duas rodadas
+seguidas. Log em `/root/deploy-elcapo/logs/auditoria-placar.log`.
+
+**Testes:** `tests/test_placar_espelho.py` (o dia do Sergio: pelo espelho dá
+1x4, pelo Histórico 2x3), `tests/test_auditoria_placar.py`, bancada
+`scripts/placar_bench/bench7.py` (S80/S81 — falham no código antigo, passam no novo).
+
 ## Correção (2026-09-07) — a exclusão voltava porque tudo "nunca rebaixa"
 
 ### Por que este defeito sempre voltava
