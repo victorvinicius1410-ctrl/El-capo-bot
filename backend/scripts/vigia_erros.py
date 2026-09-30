@@ -66,6 +66,7 @@ ESTADO_PADRAO = "/root/deploy-elcapo/logs/vigia-erros-estado.json"
 REAVISO_HORAS = 24
 HORA_RESUMO_UTC = 11  # 08h em Brasília
 MAX_ITENS_EMAIL = 30
+MEMORIA_LIVRE_MINIMA_PCT = 20
 FUSO_BRASILIA = datetime.timezone(datetime.timedelta(hours=-3))
 
 # Regex de linhas que NÃO são erro, cada uma com o motivo. Vazio de propósito:
@@ -166,7 +167,9 @@ def ler_docker(container: str, desde: str | None) -> tuple[list[str], str | None
     # Carimbo no formato do docker (9 casas), para comparar como texto.
     agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
     cmd = ["docker", "logs", "-t", "--since", desde or "6m", container]
-    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=120)
+    # 30 s: com o host sem memória o `docker logs` trava; esperar 2 min só
+    # atrasava o aviso (30/09 05:25). Estourar vira evento "não consegui ler".
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=30)
     saida = (proc.stdout or "") + (proc.stderr or "")
     linhas: list[str] = []
     # Sem linha nova, o cursor avança mesmo assim: senão a rodada seguinte
@@ -245,7 +248,65 @@ def checar_saude(estado: dict, eventos: dict, containers: tuple[str, ...]) -> li
     pct = uso.used * 100 // uso.total
     if pct >= 90:
         _novo_evento(eventos, "servidor | DISCO ACIMA DE 90%", "servidor", "saúde", f"Disco em {pct}%.")
+    avisos += checar_memoria(estado, eventos)
+    checar_oom(estado, eventos)
     return avisos
+
+
+def _meminfo() -> dict[str, int]:
+    dados = {}
+    for linha in Path("/proc/meminfo").read_text().splitlines():
+        nome, _, valor = linha.partition(":")
+        dados[nome] = int(valor.split()[0])  # kB
+    return dados
+
+
+def checar_memoria(estado: dict, eventos: dict) -> list[str]:
+    """Memória livre abaixo de 20% avisa uma vez; volta ao normal avisa também.
+
+    Em 30/09 o host chegou a 97% de uso e o kernel matou a corretora (e já tinha
+    matado o robô em 27/09): um vazamento crescendo ~290 MB/h no robot-runtime.
+    Com o aviso aqui, dá tempo de reiniciar com calma em vez de levar o OOM.
+    """
+    incidentes = estado.setdefault("incidentes", {})
+    mem = _meminfo()
+    livre = mem.get("MemAvailable", 0) * 100 // max(mem.get("MemTotal", 1), 1)
+    chave = "memoria:host"
+    if livre < MEMORIA_LIVRE_MINIMA_PCT:
+        if chave not in incidentes:
+            incidentes[chave] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            maiores = subprocess.run(
+                ["docker", "stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}"],
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+            _novo_evento(eventos, "servidor | MEMÓRIA ACABANDO", "servidor", "saúde",
+                         f"Só {livre}% de memória livre (limite {MEMORIA_LIVRE_MINIMA_PCT}%).\n{maiores}")
+        return []
+    if chave in incidentes:
+        return [f"Memória voltou a {livre}% livre (baixa desde {incidentes.pop(chave)[:19]}Z)."]
+    return []
+
+
+def checar_oom(estado: dict, eventos: dict) -> None:
+    """Toda morte por falta de memória do kernel vira erro.
+
+    O ``OOMKilled`` do Docker zera quando o container reinicia, então olhar o
+    container não basta: lê o log do kernel desde a última rodada.
+    """
+    cursor = estado.get("cursores", {}).get("kernel")
+    cmd = ["journalctl", "-k", "-o", "short-iso", "--show-cursor", "--no-pager"]
+    cmd += ["--after-cursor", cursor] if cursor else ["--since", "-6min"]
+    try:
+        saida = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+    except Exception:  # noqa: BLE001
+        return
+    for linha in saida.splitlines():
+        if linha.startswith("-- cursor:"):
+            estado.setdefault("cursores", {})["kernel"] = linha.split(":", 1)[1].strip()
+        elif "Killed process" in linha:  # a linha que diz quem morreu (as outras são contexto)
+            processo = re.search(r"Killed process \d+ \((\S+)\)", linha)
+            _novo_evento(eventos, f"servidor | KERNEL MATOU PROCESSO POR FALTA DE MEMÓRIA "
+                         f"({processo.group(1) if processo else '?'})", "servidor", "saúde", linha)
 
 
 def coletar(estado: dict, incluir_staging: bool) -> tuple[dict, list[str]]:

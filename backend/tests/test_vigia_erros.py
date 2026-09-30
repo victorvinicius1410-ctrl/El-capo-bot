@@ -59,6 +59,41 @@ class AnaliseTests(unittest.TestCase):
         self.assertEqual(self._eventos(texto), [])
 
 
+class SaudeTests(unittest.TestCase):
+    def test_oom_do_kernel_vira_erro(self) -> None:
+        from unittest.mock import patch, MagicMock
+
+        saida = (
+            "2026-09-30T08:30:57+00:00 srv kernel: Out of memory: Killed process 2001810 (uvicorn) "
+            "total-vm:10780784kB, anon-rss:8901192kB\n-- cursor: s=abc;i=1\n"
+        )
+        estado: dict = {"cursores": {}}
+        eventos: dict = {}
+        with patch.object(V.subprocess, "run", return_value=MagicMock(stdout=saida)):
+            V.checar_oom(estado, eventos)
+        (ev,) = eventos.values()
+        self.assertIn("FALTA DE MEMÓRIA (uvicorn)", ev["assinatura"])
+        self.assertEqual(estado["cursores"]["kernel"], "s=abc;i=1")
+
+    def test_memoria_baixa_avisa_uma_vez_e_avisa_a_volta(self) -> None:
+        from unittest.mock import patch, MagicMock
+
+        estado: dict = {}
+        with (
+            patch.object(V, "_meminfo", return_value={"MemTotal": 100, "MemAvailable": 10}),
+            patch.object(V.subprocess, "run", return_value=MagicMock(stdout="robot-runtime 9GiB")),
+        ):
+            eventos: dict = {}
+            V.checar_memoria(estado, eventos)
+            self.assertEqual(len(eventos), 1)
+            eventos2: dict = {}
+            V.checar_memoria(estado, eventos2)
+            self.assertEqual(eventos2, {})  # incidente já aberto
+        with patch.object(V, "_meminfo", return_value={"MemTotal": 100, "MemAvailable": 60}):
+            avisos = V.checar_memoria(estado, {})
+        self.assertEqual(len(avisos), 1)
+
+
 class AvisoTests(unittest.TestCase):
     def test_avisa_uma_vez_e_de_novo_depois_de_24h(self) -> None:
         estado: dict = {}
