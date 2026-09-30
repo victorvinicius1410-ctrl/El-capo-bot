@@ -65,7 +65,9 @@ import { isRobotOperationRunning, type RobotState } from "@/lib/robotState";
 import { TRIAL_DISCOUNT, formatTrialRemaining, remainingMs } from "@/lib/trial";
 import { useAuth, type AuthUser } from "@/lib/useAuth";
 import {
+  applyOptimisticOperation,
   applyRobotMutationToCache,
+  revertOptimisticOperation,
   LiveTradingDataProvider,
   useLiveTradingData,
 } from "@/hooks/useLiveTradingData";
@@ -256,6 +258,9 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
   async function stopOperation(): Promise<void> {
     if (!apiConfig.BASE_URL || stopping || !operationRunning) return;
     setStopping(true);
+    // Instantâneo: o painel mostra "parado" no clique, sem esperar o servidor,
+    // e estado atrasado não desfaz o botão (30/09: "tinha que clicar 3 vezes").
+    const anterior = userId ? applyOptimisticOperation(queryClient, userId, false) : undefined;
     try {
       const response = await robotStop();
       if (!response.ok) throw new ApiError(response.error, response.code);
@@ -266,6 +271,7 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
       void robotState.refetch();
       toast.success("Operações automáticas paradas");
     } catch (error) {
+      if (userId) revertOptimisticOperation(queryClient, userId, anterior);
       const message = error instanceof Error ? error.message : "Não foi possível parar a operação.";
       toast.error(message);
     } finally {

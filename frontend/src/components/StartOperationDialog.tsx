@@ -11,7 +11,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError, apiConfig, robotConfig, robotStart } from "@/lib/api";
-import { ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
+import {
+  ROBOT_STATE_QUERY_KEY,
+  applyOptimisticOperation,
+  revertOptimisticOperation,
+} from "@/hooks/useLiveTradingData";
 import { entryValueBalanceError, formatBullExBalance } from "@/lib/bullexConnection";
 import {
   DEFAULT_ROBOT_SETTINGS,
@@ -245,6 +249,12 @@ export function StartOperationDialog({
     }
     setStarting(true);
     setError(null);
+    // Instantâneo: o painel mostra "em operação" no clique e o diálogo fecha;
+    // salvar a configuração e iniciar correm por trás. Se o servidor recusar
+    // (sem saldo, stop batido), volta ao estado de antes e a mensagem aparece
+    // (30/09: "às vezes tinha que clicar várias vezes para iniciar").
+    const anterior = applyOptimisticOperation(queryClient, userId, true);
+    onOpenChange(false);
     try {
       const safeDraft: OperationConfig = {
         ...draft,
@@ -302,8 +312,8 @@ export function StartOperationDialog({
       toast.success(
         `Operação iniciada em ${timeframeLabel(safeDraft.timeframe)} · ${marketModeLabel(safeDraft.marketMode)}`,
       );
-      onOpenChange(false);
     } catch (caught) {
+      revertOptimisticOperation(queryClient, userId, anterior);
       const message = caught instanceof Error ? caught.message : "Não foi possível iniciar a operação.";
       setError(message);
       toast.error(message);

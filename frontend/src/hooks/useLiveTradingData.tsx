@@ -28,6 +28,11 @@ import {
   markSessionScoreAuthority,
   resolveSessionScoreGate,
 } from "@/lib/sessionScoreAuthority";
+import {
+  applyOperationIntent,
+  clearOperationIntent,
+  registerOperationIntent,
+} from "@/lib/robotOperationIntent";
 
 export type { RobotState, RobotTrade } from "@/lib/robotState";
 export { isRobotOperationRunning } from "@/lib/robotState";
@@ -137,10 +142,45 @@ function commitRobotStateToCache(
         profit: withScore.profit,
       }
     : withScore;
-  applyRobotStateSideEffects(userId, safeState);
+  // Depois de um clique em Iniciar/Parar, estado atrasado não desfaz o botão.
+  const exibido = applyOperationIntent(userId, safeState);
+  applyRobotStateSideEffects(userId, exibido);
   resetRobotStateBackoff(userId);
-  queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], safeState);
-  return safeState;
+  queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], exibido);
+  return exibido;
+}
+
+/**
+ * Mostra na hora o que o usuário pediu (Iniciar/Parar), sem esperar o servidor.
+ *
+ * Registra a intenção (ver ``robotOperationIntent``) e devolve o estado de antes,
+ * para o chamador desfazer com {@link revertOptimisticOperation} se o servidor
+ * recusar.
+ */
+export function applyOptimisticOperation(
+  queryClient: QueryClient,
+  userId: string,
+  enabled: boolean,
+): RobotState | undefined {
+  const key = [...ROBOT_STATE_QUERY_KEY, userId];
+  const previous = queryClient.getQueryData<RobotState>(key);
+  registerOperationIntent(userId, enabled);
+  if (previous) {
+    queryClient.setQueryData(key, applyOperationIntent(userId, previous));
+  }
+  return previous;
+}
+
+/** O servidor recusou o clique: volta ao estado de antes. */
+export function revertOptimisticOperation(
+  queryClient: QueryClient,
+  userId: string,
+  previous: RobotState | undefined,
+): void {
+  clearOperationIntent(userId);
+  if (previous) {
+    queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], previous);
+  }
 }
 
 /**
@@ -265,8 +305,9 @@ function useRobotStateQuery(
             profit: normalized.profit,
           }
         : normalized;
-      applyRobotStateSideEffects(userId, safeState);
-      return safeState;
+      const exibido = applyOperationIntent(userId, safeState);
+      applyRobotStateSideEffects(userId, exibido);
+      return exibido;
     },
     enabled: Boolean(userId),
     refetchInterval: (query) =>

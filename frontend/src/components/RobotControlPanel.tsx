@@ -7,7 +7,12 @@ import {
   OPEN_MARKET_MAINTENANCE_SHORT,
   resolveMarketModeLock,
 } from "@/lib/openMarketMaintenance";
-import { useLiveTradingData, applyRobotMutationToCache } from "@/hooks/useLiveTradingData";
+import {
+  useLiveTradingData,
+  applyOptimisticOperation,
+  applyRobotMutationToCache,
+  revertOptimisticOperation,
+} from "@/hooks/useLiveTradingData";
 import { useRobotSettings } from "@/hooks/useRobotSettings";
 import { robotStart, robotStop } from "@/lib/api";
 import { entryValueBalanceError, formatBullExBalance, isBullExConnected } from "@/lib/bullexConnection";
@@ -113,6 +118,10 @@ export function RobotControlPanel() {
   async function toggle(): Promise<void> {
     setPending("toggle");
     setError(null);
+    // Instantâneo: mostra o que o usuário pediu no clique; desfaz se o servidor
+    // recusar (30/09: "tinha que clicar 3 vezes para parar/iniciar").
+    const anterior = user?.id ? applyOptimisticOperation(queryClient, user.id, !running) : undefined;
+    let confirmado = false;
     try {
       if (!running) {
         // Não bloquear por `connected` do poll — mesmo motivo do overlay:
@@ -142,8 +151,10 @@ export function RobotControlPanel() {
         }
         toast.success("Robô parado.");
       }
+      confirmado = true;
       void robotState.refetch();
     } finally {
+      if (!confirmado && user?.id) revertOptimisticOperation(queryClient, user.id, anterior);
       setPending(null);
     }
   }
