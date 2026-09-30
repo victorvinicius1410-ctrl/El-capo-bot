@@ -5,7 +5,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from backend.brasilia_time import is_brasilia_today
+from backend.placar_janela import conta_no_placar
 from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -321,6 +321,54 @@ def is_synthetic_trade(trade: dict[str, Any]) -> bool:
     if not order_id or order_id.isdigit():
         return False
     return not str(trade.get("broker_order_id") or "").strip().isdigit()
+
+
+# Operações que o AutoTrader guarda em memória por cliente. Com o placar sem
+# virada à meia-noite, a janela do stop passa disso; o dinheiro das que saem
+# fica no acumulado (ver ``AutoTrader._limitar_historico``).
+HISTORY_MEMORY_LIMIT = 100
+
+
+def _stop_zerado() -> dict[str, float]:
+    """Totais do stop em dinheiro, zerados."""
+    return {"gross_profit": 0.0, "gross_loss": 0.0, "net_profit": 0.0}
+
+
+def _somar_ao_stop(
+    totais: dict[str, float],
+    trade: dict[str, Any],
+    stop_reset_at: Any,
+    *,
+    sinal: int = 1,
+) -> bool:
+    """Soma (``sinal=1``) ou tira (``-1``) o dinheiro de uma operação do stop.
+
+    Conta só WIN/LOSS real (não a linha do Shift+O) dentro da janela desde o
+    último "Reiniciar placar".
+
+    Args:
+        totais: ``gross_profit``/``gross_loss``/``net_profit``, alterado no lugar.
+        trade: Operação.
+        stop_reset_at: Último Reiniciar do cliente.
+        sinal: 1 para somar, -1 para tirar.
+
+    Returns:
+        True se a operação conta no stop.
+    """
+    result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
+    if result not in {"WIN", "LOSS"}:
+        return False
+    if is_synthetic_trade(trade):
+        return False
+    if not conta_no_placar(trade.get("finished_at"), stop_reset_at):
+        return False
+    lucro = float(trade.get("profit") or 0)
+    totais["net_profit"] += sinal * lucro
+    if lucro > 0:
+        totais["gross_profit"] += sinal * lucro
+    elif lucro < 0:
+        totais["gross_loss"] += sinal * abs(lucro)
+    return True
 
 
 def should_hide_live_loss(trade: dict[str, Any], state: Any | None = None) -> bool:
@@ -1012,6 +1060,9 @@ class AutoTrader:
     _cycle_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     _histories: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _completed_order_ids: dict[str, set[str]] = field(default_factory=dict)
+    # Dinheiro (e ordens) da janela do stop que já saiu de `_histories`.
+    _stop_acumulado: dict[str, dict[str, float]] = field(default_factory=dict)
+    _ordens_no_acumulado: dict[str, set[str]] = field(default_factory=dict)
     _sources: dict[str, StateSource] = field(default_factory=dict)
 
     def get(self, user_id: str) -> RobotState:
@@ -1158,24 +1209,28 @@ class AutoTrader:
         self._sources[user_id] = source
 
         # Veio do Histórico (RestoreTrades.authoritative): lista vazia é "nada
-        # hoje" e o placar zera. Sem a marca, vazio é ambíguo e preserva.
+        # desde o Reiniciar" e o placar zera. Sem a marca, vazio é ambíguo e
+        # preserva.
         authoritative = bool(getattr(trades, "authoritative", False))
         restored_trades = [strip_ai_fields(dict(trade)) for trade in (trades or [])]
-        self._histories[user_id] = [
+        finalizadas = [
             trade
             for trade in restored_trades
             if trade.get("result") in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
             and not should_hide_live_loss(trade, state)
-        ][-100:]
+        ]
         self._completed_order_ids[user_id] = {
             str(trade.get("order_id"))
-            for trade in self._histories[user_id]
+            for trade in finalizadas
             if trade.get("order_id") is not None
         }
-        self._close_stale_last_trade(state, self._histories[user_id])
-        self._recompute_score_from_history(
-            state, self._histories[user_id], authoritative=authoritative
-        )
+        self._close_stale_last_trade(state, finalizadas)
+        # O placar sai da janela INTEIRA (desde o último Reiniciar, pode ser
+        # mais de um dia); a memória guarda só as 100 últimas e o dinheiro das
+        # que ficaram de fora vai para o acumulado do stop.
+        self._recompute_score_from_history(state, finalizadas, authoritative=authoritative)
+        self._zerar_acumulado_do_stop(user_id)
+        self._histories[user_id] = self._limitar_historico(user_id, finalizadas)
         return state
 
     @staticmethod
@@ -1209,7 +1264,7 @@ class AutoTrader:
                 continue
             state.last_trade = {**last, **trade}
             return
-        # Não achou no Histórico de hoje: se a ordem é antiga, ela fechou há muito
+        # Não achou no Histórico da janela: se a ordem é antiga, ela fechou há muito
         # tempo e o resultado vive no Histórico/espelho, não aqui. Carregá-la como
         # PENDENTE fazia o persist_robot regravar o espelho por cima do WIN
         # (30/09: WIN de 28/09 do cliente 11e0b3d5 voltou a PENDENTE).
@@ -1231,16 +1286,16 @@ class AutoTrader:
         sobrescrito por snapshots atrasados — em 08/08 clientes viram o placar
         cair sozinho (4x0 → 1x0). O histórico é a fonte de verdade.
 
-        Usa a MESMA janela de ``build_management_summary`` (operações do dia
-        civil de Brasília, posteriores ao último reset), para placar e stop
-        win/loss não divergirem. Não altera a decisão de parada: ela já vinha
-        do histórico.
+        Usa a MESMA janela de ``build_management_summary`` e de
+        ``management_totals`` (desde o último "Reiniciar placar", sem virada à
+        meia-noite — ver ``backend.placar_janela``), para placar e stop
+        win/loss não divergirem.
 
         Args:
             state: Estado restaurado, alterado no lugar.
-            trades: Histórico persistido do usuário.
+            trades: Histórico persistido do usuário, a janela inteira.
             authoritative: A lista veio do Histórico lido com sucesso; vazia
-                significa "nenhuma operação hoje" e zera o placar.
+                significa "nenhuma operação desde o Reiniciar" e zera o placar.
         """
         if not trades and not authoritative:
             # Lista vazia é ambígua: pode ser cliente novo OU falha transitória
@@ -1249,7 +1304,7 @@ class AutoTrader:
             # corrige. "Tem histórico, mas nada na janela" cai no cálculo normal
             # abaixo e zera corretamente.
             return
-        reset_at = state.stop_reset_at if isinstance(state.stop_reset_at, datetime) else None
+        reset_at = state.stop_reset_at
         wins = 0
         losses = 0
         profit = 0.0
@@ -1294,9 +1349,7 @@ class AutoTrader:
                     continue
             if not isinstance(finished_at, datetime):
                 continue
-            if not is_brasilia_today(finished_at):
-                continue
-            if reset_at is not None and finished_at < reset_at:
+            if not conta_no_placar(finished_at, reset_at):
                 continue
             if result == "WIN":
                 wins += 1
@@ -1316,27 +1369,6 @@ class AutoTrader:
         state.stop_offset_wins = synthetic_wins
         state.stop_offset_losses = synthetic_losses
         state.stop_offset_profit = round(synthetic_profit, 2)
-
-    def recompute_session_score_for_today(self, user_id: str) -> tuple[int, int, float]:
-        """Recalcula o placar da sessão pelo histórico do dia civil de Brasília.
-
-        Usado na virada do dia: nada zerava o placar em memória à meia-noite,
-        mas o ``restore`` só conta o dia corrente — então o placar acumulava
-        dois dias e despencava sozinho no primeiro restart depois da virada
-        (medido em 15/09: cliente com 9x5 e só 8 operações no dia).
-        Recalcular em vez de zerar cego preserva o resultado que chega logo
-        DEPOIS da meia-noite, de uma ordem aberta antes dela.
-        Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F2.
-
-        Args:
-            user_id: Dono da sessão.
-
-        Returns:
-            ``(wins, losses, profit)`` já aplicados no estado.
-        """
-        state = self.get(user_id)
-        self._recompute_score_from_history(state, self._histories.setdefault(user_id, []))
-        return (int(state.wins or 0), int(state.losses or 0), round(float(state.profit or 0), 2))
 
     def recover_sync_timeout(self, user_id: str) -> tuple[bool, RobotState]:
         state = self.get(user_id)
@@ -2381,6 +2413,7 @@ class AutoTrader:
             state.profit = 0.0
             state.stop_reset_at = now
             clear_stop_offsets(state, profit_only=True)
+            self._zerar_acumulado_do_stop(user_id)
 
         self._sources[user_id] = "memory"
         return state
@@ -2406,6 +2439,7 @@ class AutoTrader:
         state.result_client_seen_at = None
         state.result_voice = None
         self._histories[user_id] = []
+        self._zerar_acumulado_do_stop(user_id)
 
         last_trade_result = str((state.last_trade or {}).get("result") or "").strip().upper()
         if not state.operation_in_progress and last_trade_result in {"WIN", "LOSS", "TIMEOUT"}:
@@ -2464,37 +2498,32 @@ class AutoTrader:
         *,
         include_trade: dict[str, Any] | None = None,
     ) -> dict[str, float]:
+        """Dinheiro da janela do stop (desde o último Reiniciar placar).
+
+        Soma o acumulado das operações que já saíram da memória (ela guarda só
+        as 100 últimas; sem reset à meia-noite a janela passa disso) com as que
+        estão nela.
+
+        Args:
+            user_id: Dono da sessão.
+            include_trade: Operação ainda não registrada, para projetar o stop.
+
+        Returns:
+            ``gross_profit``, ``gross_loss`` e ``net_profit``.
+        """
         state = self.get(user_id)
-        reset_at = parse_datetime(state.stop_reset_at)
         trades = list(self._histories.get(user_id, []))
         if include_trade is not None:
             trades.append(dict(include_trade))
 
-        gross_profit = 0.0
-        gross_loss = 0.0
-        net_profit = 0.0
+        totais = dict(self._stop_acumulado.get(user_id) or _stop_zerado())
         for trade in trades:
-            result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
-            if result not in {"WIN", "LOSS"}:
-                continue
-            finished_at = parse_datetime(trade.get("finished_at"))
-            if finished_at is None or not is_brasilia_today(finished_at):
-                continue
-            if reset_at is not None and finished_at < reset_at:
-                continue
-            if is_synthetic_trade(trade):
-                continue
-            trade_profit = float(trade.get("profit") or 0)
-            net_profit += trade_profit
-            if trade_profit > 0:
-                gross_profit += trade_profit
-            elif trade_profit < 0:
-                gross_loss += abs(trade_profit)
+            _somar_ao_stop(totais, trade, state.stop_reset_at)
 
         return {
-            "gross_profit": round(gross_profit, 2),
-            "gross_loss": round(gross_loss, 2),
-            "net_profit": round(net_profit, 2),
+            "gross_profit": round(totais["gross_profit"], 2),
+            "gross_loss": round(totais["gross_loss"], 2),
+            "net_profit": round(totais["net_profit"], 2),
         }
 
     def expire_pending_signal(
@@ -2918,7 +2947,7 @@ class AutoTrader:
         if not should_hide_live_loss(parent_trade, state):
             history = self._histories.setdefault(user_id, [])
             history.append(dict(parent_trade))
-            del history[:-100]
+            self._limitar_historico(user_id, history)
         return True, state
 
     def count_late_result(
@@ -2986,7 +3015,7 @@ class AutoTrader:
         if not should_hide_live_loss(fechado, state):
             historico = self._histories.setdefault(user_id, [])
             historico.append(dict(fechado))
-            del historico[:-100]
+            self._limitar_historico(user_id, historico)
         logger.warning(
             "[LATE_RESULT_COUNTED] user_id=%s order_id=%s result=%s profit=%s "
             "wins=%s losses=%s",
@@ -3277,7 +3306,7 @@ class AutoTrader:
         if not should_hide_live_loss(trade, state):
             history = self._histories.setdefault(user_id, [])
             history.append(dict(trade))
-            del history[:-100]
+            self._limitar_historico(user_id, history)
         if state.enabled and normalized_result in {"WIN", "LOSS"}:
             management_totals = self.management_totals(user_id)
             stop_reason = resolve_robot_stop_reason(
@@ -3323,7 +3352,7 @@ class AutoTrader:
         self._schedule_next_cycle(state, finished_at)
         history = self._histories.setdefault(user_id, [])
         history.append(dict(trade))
-        del history[:-100]
+        self._limitar_historico(user_id, history)
         return True, state
 
     def remove_history_trade(self, user_id: str, order_id: str) -> dict[str, Any] | None:
@@ -3367,7 +3396,51 @@ class AutoTrader:
             return False
         return normalized_order in self._completed_order_ids.get(str(user_id or "").strip(), set())
 
-    def mark_trade_removed(self, user_id: str, order_id: str) -> dict[str, Any] | None:
+    def _zerar_acumulado_do_stop(self, user_id: str) -> None:
+        """Esquece o acumulado do stop (Reiniciar placar ou restore)."""
+        self._stop_acumulado.pop(user_id, None)
+        self._ordens_no_acumulado.pop(user_id, None)
+
+    def _limitar_historico(
+        self,
+        user_id: str,
+        historico: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Corta ``historico`` nas :data:`HISTORY_MEMORY_LIMIT` últimas, no lugar.
+
+        O dinheiro das operações que saem vai para o acumulado do stop: sem
+        virada à meia-noite, a janela desde o último Reiniciar passa de 100
+        operações (medido em 30/09: cliente com ~300 operações em 6 dias sem
+        reiniciar) e o stop em dinheiro não pode esquecê-las.
+
+        Args:
+            user_id: Dono do histórico.
+            historico: Lista da mais antiga para a mais recente.
+
+        Returns:
+            A mesma lista, já cortada.
+        """
+        excedente = len(historico) - HISTORY_MEMORY_LIMIT
+        if excedente <= 0:
+            return historico
+        state = self._states.get(user_id)
+        reset_at = getattr(state, "stop_reset_at", None)
+        acumulado = self._stop_acumulado.setdefault(user_id, _stop_zerado())
+        ordens = self._ordens_no_acumulado.setdefault(user_id, set())
+        for trade in historico[:excedente]:
+            if _somar_ao_stop(acumulado, trade, reset_at):
+                ordem = str(trade.get("order_id") or "").strip()
+                if ordem:
+                    ordens.add(ordem)
+        del historico[:excedente]
+        return historico
+
+    def mark_trade_removed(
+        self,
+        user_id: str,
+        order_id: str,
+        apagada: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Apaga da memória deste processo a operação excluída no Shift+O.
 
         Operação apagada some de TUDO (decisão do dono, 30/09): placar, stop e
@@ -3379,6 +3452,9 @@ class AutoTrader:
         Args:
             user_id: Dono da sessão.
             order_id: Ordem apagada.
+            apagada: O que o gateway sabe da operação (``result``, ``profit``,
+                ``finished_at``). Usado quando ela já saiu da memória (não está
+                entre as 100 últimas): o dinheiro dela sai do acumulado do stop.
 
         Returns:
             A operação que estava no histórico em memória (para desfazer a
@@ -3389,6 +3465,16 @@ class AutoTrader:
         if not normalized_user or not normalized_order:
             return None
         removida = self.remove_history_trade(normalized_user, normalized_order)
+        no_acumulado = self._ordens_no_acumulado.get(normalized_user, set())
+        if removida is None and normalized_order in no_acumulado and isinstance(apagada, dict):
+            no_acumulado.discard(normalized_order)
+            state_atual = self._states.get(normalized_user)
+            _somar_ao_stop(
+                self._stop_acumulado.setdefault(normalized_user, _stop_zerado()),
+                {**apagada, "order_id": normalized_order},
+                getattr(state_atual, "stop_reset_at", None),
+                sinal=-1,
+            )
         self._completed_order_ids.setdefault(normalized_user, set()).add(normalized_order)
         state = self._states.get(normalized_user)
         last = getattr(state, "last_trade", None) if state is not None else None
@@ -3422,8 +3508,8 @@ class AutoTrader:
             if str(trade.get("result") or "").strip().upper()
             in {"WIN", "LOSS", "TIMEOUT", "DRAW"}
             and not should_hide_live_loss(trade)
-        ][-100:]
-        self._histories[normalized_user] = finished
+        ]
+        self._histories[normalized_user] = self._limitar_historico(normalized_user, finished)
         # Ordens concluídas nunca são esquecidas: o set evita reprocessar um
         # resultado que chegue atrasado da corretora.
         completed = self._completed_order_ids.setdefault(normalized_user, set())

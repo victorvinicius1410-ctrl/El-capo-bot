@@ -36,7 +36,14 @@ from backend.auto_trader import (
     strip_ai_fields,
     utc_now,
 )
-from backend.brasilia_time import brasilia_today, history_cutoff, is_brasilia_today
+from backend.brasilia_time import history_cutoff
+from backend.placar_janela import (
+    MARCA_PLACAR_CONTINUO,
+    PLACAR_CONTINUO_DESDE,
+    conta_no_placar,
+    inicio_do_placar,
+    placar_da_regra_atual,
+)
 from backend.status import (
     STATUS_ACCOUNT_DISCONNECTED,
     STATUS_ACTIVE_COOLDOWN,
@@ -3473,6 +3480,9 @@ def publish_marketing_score_to_overlay(
                 "broker_order_id": removed_trade.get("broker_order_id"),
                 "result": removed_trade.get("result"),
                 "profit": removed_trade.get("profit"),
+                # Fora das 100 últimas em memória, é por ele que o runtime sabe
+                # se a operação está na janela do stop.
+                "finished_at": removed_trade.get("finished_at"),
                 "is_gale": bool(removed_trade.get("is_gale")),
                 # Reserva: se o runtime não tiver mais a operação em memória, é
                 # com esta chave que ele desfaz a memória de padrões.
@@ -7407,14 +7417,14 @@ _DAILY_HISTORY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="
 
 
 def invalidate_daily_history_cache(user_id: str) -> None:
-    """Descarta o histórico do dia em cache (chamar ao gravar operação)."""
+    """Descarta o histórico da janela do placar em cache (chamar ao gravar operação)."""
     key = str(user_id)
     _daily_history_generation[key] = _daily_history_generation.get(key, 0) + 1
     _daily_history_cache.pop(key, None)
 
 
 def _refresh_daily_history_in_background(user_id: str) -> None:
-    """Relê o histórico do dia numa thread, uma releitura por vez por usuário."""
+    """Relê o histórico da janela do placar numa thread, uma por vez por usuário."""
     key = str(user_id)
     if key in _daily_history_refreshing:
         return
@@ -7423,7 +7433,7 @@ def _refresh_daily_history_in_background(user_id: str) -> None:
 
     def _reload() -> None:
         try:
-            items = load_robot_history_items(user_id, 1)
+            items = load_score_window_history_items(user_id)
             if _daily_history_generation.get(key, 0) == generation:
                 _daily_history_cache[key] = (monotonic(), items)
         except Exception:
@@ -7439,13 +7449,16 @@ def _refresh_daily_history_in_background(user_id: str) -> None:
 
 def load_daily_history_cached(user_id: str) -> list[dict[str, Any]]:
     """
-    Histórico do dia com TTL curto, para não bloquear o event loop a cada poll.
+    Histórico da janela do placar com TTL curto, para não bloquear o event loop a cada poll.
+
+    O nome ficou de quando a janela era o dia; hoje ela vai do último
+    "Reiniciar placar" até agora (ver ``backend.placar_janela``).
 
     Args:
         user_id: Cliente dono do histórico.
 
     Returns:
-        Mesma lista que ``load_robot_history_items(user_id, 1)`` retornaria.
+        Mesma lista que ``load_score_window_history_items(user_id)`` retornaria.
     """
     now = monotonic()
     key = str(user_id)
@@ -7457,12 +7470,21 @@ def load_daily_history_cached(user_id: str) -> list[dict[str, Any]]:
         if age < DAILY_HISTORY_MAX_STALE_SECONDS:
             _refresh_daily_history_in_background(user_id)
             return cached[1]
-    items = load_robot_history_items(user_id, 1)
+    items = load_score_window_history_items(user_id)
     _daily_history_cache[key] = (now, items)
     return items
 
 
 def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
+    """Dinheiro e stop da janela do placar (desde o último Reiniciar placar).
+
+    Args:
+        user_id: Cliente.
+        state: Estado do robô no gateway.
+
+    Returns:
+        Totais, limites, motivo de stop e o início da janela (``window_start``).
+    """
     reset_at = parse_datetime(getattr(state, "stop_reset_at", None))
     gross_profit = 0.0
     gross_loss = 0.0
@@ -7478,10 +7500,7 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
         result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
         if result not in {"WIN", "LOSS"}:
             continue
-        finished_at = parse_datetime(trade.get("finished_at"))
-        if finished_at is None or not is_brasilia_today(finished_at):
-            continue
-        if reset_at is not None and finished_at < reset_at:
+        if not conta_no_placar(trade.get("finished_at"), reset_at):
             continue
         # Linha do Shift+O (UUID) não é dinheiro na corretora: não conta para
         # o stop. `wins`/`losses` abaixo já descontam `stop_offset_*`.
@@ -7517,6 +7536,7 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
         "stop_loss_operations": int(getattr(state, "stop_loss_operations", 0) or 0),
         "stop_reason": stop_reason,
         "reset_at": reset_at.isoformat() if reset_at is not None else None,
+        "window_start": inicio_do_placar(reset_at).isoformat(),
     }
 
 
@@ -8917,19 +8937,22 @@ def _load_persisted_session_score(user_id: str) -> tuple[int, int, float] | None
     return None
 
 
-# Dia (Brasília) do placar que está na memória do gateway. O "nunca rebaixa"
-# não sabe de que dia é cada réplica: depois da meia-noite o 1x1 de ONTEM na
-# memória do gateway ganhava do 0x0 de hoje do runtime e o painel mostrava o
-# placar de ontem por horas (29/09, cliente e3b52de7, 00:00→01:50).
+# Clientes cuja memória do gateway já foi alinhada ao placar da regra contínua
+# do runtime (valor: ``MARCA_PLACAR_CONTINUO``). O "nunca rebaixa" não sabe de
+# que regra é cada réplica: quando havia virada do dia, o 1x1 de ONTEM na
+# memória do gateway ganhava do 0x0 de hoje do runtime (29/09, e3b52de7). Sem
+# virada, o alinhamento acontece uma vez por processo do gateway e cobre a
+# troca de regra no deploy.
 _gateway_score_day: dict[str, Any] = {}
 
 
 def adopt_new_day_score_on_gateway(user_id: str, data: dict[str, Any] | None = None) -> bool:
-    """Na primeira leitura de um dia novo, adota o placar do runtime como está.
+    """Na primeira leitura, adota o placar do runtime como está.
 
-    Só age quando o snapshot do runtime está carimbado com o dia de hoje
-    (``score_day``) e a memória do gateway ainda não foi alinhada hoje — aí o
-    placar do runtime vale mesmo sendo MENOR, porque o maior é o de ontem.
+    Só age quando o snapshot do runtime está carimbado com a regra contínua
+    (``score_day``, ver ``backend.placar_janela``) e a memória do gateway
+    ainda não foi alinhada neste processo — aí o placar do runtime (o dono)
+    vale mesmo sendo MENOR, porque o maior é de antes da regra.
 
     Args:
         user_id: Dono da sessão.
@@ -8941,8 +8964,7 @@ def adopt_new_day_score_on_gateway(user_id: str, data: dict[str, Any] | None = N
     normalized = str(user_id or "").strip()
     if not normalized or robot_runtime_mode() != "external":
         return False
-    hoje = brasilia_today()
-    if _gateway_score_day.get(normalized) == hoje:
+    if _gateway_score_day.get(normalized) == MARCA_PLACAR_CONTINUO:
         return False
     if data is None:
         try:
@@ -8950,9 +8972,9 @@ def adopt_new_day_score_on_gateway(user_id: str, data: dict[str, Any] | None = N
         except Exception:
             return False
         data = remote.get("data") if isinstance(remote, dict) else None
-    if not isinstance(data, dict) or data.get("score_day") != hoje.isoformat():
+    if not isinstance(data, dict) or not placar_da_regra_atual(data.get("score_day")):
         return False
-    _gateway_score_day[normalized] = hoje
+    _gateway_score_day[normalized] = MARCA_PLACAR_CONTINUO
     state = auto_trader.get(normalized)
     local = _parse_session_score_from_mapping(
         {
@@ -8971,7 +8993,7 @@ def adopt_new_day_score_on_gateway(user_id: str, data: dict[str, Any] | None = N
     logger.warning(
         "[SCORE_NEW_DAY_ADOPTED_ON_GATEWAY] user_id=%s dia=%s gateway=%sx%s/%s runtime=%sx%s/%s",
         normalized,
-        hoje,
+        MARCA_PLACAR_CONTINUO,
         local[0],
         local[1],
         local[2],
@@ -8983,7 +9005,7 @@ def adopt_new_day_score_on_gateway(user_id: str, data: dict[str, Any] | None = N
 
 
 def _snapshot_is_from_runtime_today(user_id: str, data: dict[str, Any] | None = None) -> bool:
-    """True se o snapshot Redis veio do runtime com placar do dia de hoje."""
+    """True se o snapshot Redis veio do runtime com placar da regra contínua."""
     if data is None:
         if not getattr(robot_bus, "enabled", False):
             return False
@@ -8992,7 +9014,7 @@ def _snapshot_is_from_runtime_today(user_id: str, data: dict[str, Any] | None = 
         except Exception:
             return False
         data = remote.get("data") if isinstance(remote, dict) else None
-    return isinstance(data, dict) and data.get("score_day") == brasilia_today().isoformat()
+    return isinstance(data, dict) and placar_da_regra_atual(data.get("score_day"))
 
 
 def reconcile_session_score_on_gateway(user_id: str) -> bool:
@@ -9027,7 +9049,7 @@ def reconcile_session_score_on_gateway(user_id: str) -> bool:
         )
         apply_session_score_authority_to_state(normalized)
         return before != authority
-    # Dia novo: o placar de hoje do runtime vale mesmo menor que o de ontem.
+    # Primeira leitura no processo: o placar do runtime vale mesmo menor.
     adotou_dia_novo = adopt_new_day_score_on_gateway(normalized)
     state = auto_trader.get(normalized)
     local = _parse_session_score_from_mapping(
@@ -9048,8 +9070,8 @@ def reconcile_session_score_on_gateway(user_id: str) -> bool:
     redis_score = _load_redis_session_score(normalized)
     if redis_score is not None:
         candidates.append(redis_score)
-    # Snapshot do runtime carimbado com hoje é a réplica mais nova: o banco só
-    # entra quando ele falta (sem isso o placar de ontem no banco voltava).
+    # Snapshot do runtime carimbado com a regra contínua é a réplica mais
+    # nova: o banco só entra quando ele falta.
     if not _snapshot_is_from_runtime_today(normalized):
         persisted_score = _load_persisted_session_score(normalized)
         if persisted_score is not None:
@@ -9609,12 +9631,11 @@ def build_robot_payload(state: Any, **extra: Any) -> dict[str, Any]:
                 "[RESULT_WAITING] order_id=%s",
                 (data.get("last_trade") or {}).get("order_id"),
             )
-    # Dia (Brasília) a que o placar pertence, carimbado só pelo dono do placar
-    # (runtime). O gateway usa para não preferir o placar de ONTEM, maior, ao
-    # de hoje depois da meia-noite (ver adopt_new_day_score_on_gateway).
+    # Carimbo da regra do placar, só pelo dono dele (runtime). O gateway usa
+    # para não preferir um placar de antes da regra contínua, maior, ao atual
+    # (ver adopt_new_day_score_on_gateway e backend.placar_janela).
     if robot_runtime_mode() == "worker":
-        dia = _ultimo_dia_do_placar.get(str(user_id or ""))
-        data["score_day"] = dia.isoformat() if dia is not None else None
+        data["score_day"] = MARCA_PLACAR_CONTINUO
     return build_success(data)
 
 
@@ -10045,9 +10066,9 @@ def rehydrate_score_from_persistence_if_blank(user_id: str) -> bool:
     if not isinstance(payload, dict):
         return False
     dia_salvo = payload.get("score_day")
-    if dia_salvo and dia_salvo != brasilia_today().isoformat():
-        # Placar salvo é de outro dia (o runtime não gravou nada hoje): exibir
-        # isso como placar de hoje foi o 2x0 de 28/09 no painel de 29/09.
+    if dia_salvo and not placar_da_regra_atual(dia_salvo):
+        # Placar salvo antes da regra contínua (carimbado com um dia antigo):
+        # exibi-lo foi o 2x0 de 28/09 no painel de 29/09.
         return False
     persisted_wins = int(payload.get("wins") or 0)
     persisted_losses = int(payload.get("losses") or 0)
@@ -11529,9 +11550,8 @@ def persist_robot(user_id: str) -> Future | None:
         )
         last_trade = state.last_trade
         if robot_runtime_mode() == "worker":
-            # Dia a que o placar gravado pertence (lido pela reidratação do gateway).
-            dia = _ultimo_dia_do_placar.get(user_id)
-            state_payload["score_day"] = dia.isoformat() if dia is not None else None
+            # Regra do placar gravado (lida pela reidratação do gateway).
+            state_payload["score_day"] = MARCA_PLACAR_CONTINUO
         # Em modo external o placar não é do gateway: nunca gravar o atraso
         # dele por cima do placar vivo (ver docs/PLACAR_DIAGNOSTICO_2026-09-15).
         state_payload, last_trade = _protect_session_score_on_persist(
@@ -11662,7 +11682,9 @@ def get_user_robot_state(user_id: str) -> Any:
                 payload["active_mode"] = "REAL"
             # Placar pelo Histórico, não pelo espelho robot_trades (ver
             # RobotPersistence.load_trades_for_restore).
-            trades = robot_persistence.load_trades_for_restore(user_id)
+            trades = robot_persistence.load_trades_for_restore(
+                user_id, stop_reset_at=payload.get("stop_reset_at")
+            )
             state = auto_trader.restore(
                 user_id,
                 payload,
@@ -13383,68 +13405,6 @@ def _timeout_reconcile_record_failure(user_id: str, order_id: str) -> None:
 
 def _timeout_reconcile_clear(user_id: str, order_id: str) -> None:
     _timeout_reconcile_backoff.pop((user_id, order_id), None)
-
-
-# Último dia civil de Brasília em que cada usuário foi visto operando. Só
-# memória: no boot o `restore` já recalcula o placar pelo dia corrente.
-_ultimo_dia_do_placar: dict[str, Any] = {}
-
-
-def reset_session_score_on_new_day(user_id: str) -> bool:
-    """Acerta o placar da sessão quando o dia de Brasília vira.
-
-    Nada zerava o placar em memória à meia-noite, mas o recálculo do
-    ``restore`` só conta o dia corrente: com o robô rodando madrugada adentro o
-    placar somava dois dias e caía sozinho no primeiro restart. Roda no
-    ``robot-runtime``, que é o dono do placar.
-    Ver docs/PLACAR_DIAGNOSTICO_2026-09-15.md §F2.
-
-    Args:
-        user_id: Dono da sessão.
-
-    Returns:
-        True se o dia virou e o placar foi recalculado.
-    """
-    hoje = brasilia_today()
-    anterior = _ultimo_dia_do_placar.get(user_id)
-    _ultimo_dia_do_placar[user_id] = hoje
-    if anterior is None or anterior == hoje:
-        return False
-    state = auto_trader.get(user_id)
-    antes = (
-        int(state.wins or 0),
-        int(state.losses or 0),
-        round(float(state.profit or 0), 2),
-    )
-    depois = auto_trader.recompute_session_score_for_today(user_id)
-    # Virar o dia é baixa INTENCIONAL: sem a marca, qualquer reconcile
-    # promoveria de volta o placar de ontem que ainda está na DB/Redis.
-    mark_session_score_authority(user_id, depois[0], depois[1], depois[2])
-    logger.warning(
-        "[SCORE_NEW_DAY_RECOMPUTED] user_id=%s dia_anterior=%s dia=%s "
-        "antes=%sx%s/%s depois=%sx%s/%s",
-        user_id,
-        anterior,
-        hoje,
-        antes[0],
-        antes[1],
-        antes[2],
-        depois[0],
-        depois[1],
-        depois[2],
-    )
-    if antes != depois:
-        persist_robot(user_id)
-        try:
-            if robot_runtime_mode() == "worker":
-                robot_bus.publish_snapshot(
-                    user_id, build_robot_state_snapshot_payload(user_id)
-                )
-        except Exception:
-            logger.warning(
-                "[SCORE_NEW_DAY_PUBLISH_FAILED] user_id=%s", user_id, exc_info=True
-            )
-    return True
 
 
 def close_abandoned_gale_cycle(user_id: str) -> bool:
@@ -15597,11 +15557,6 @@ async def execute_robot_worker_cycle(user_id: str) -> None:
     Raises:
         asyncio.CancelledError: Propagado quando o worker é interrompido externamente.
     """
-    # Virada do dia de Brasília: o placar da sessão passa a contar só o dia novo.
-    try:
-        reset_session_score_on_new_day(user_id)
-    except Exception:
-        logger.warning("[SCORE_NEW_DAY_FAILED] user_id=%s", user_id, exc_info=True)
     # TIMEOUT falso é reconciliado AQUI, no processo dono do placar. Em
     # `ROBOT_RUNTIME_MODE=external` o gateway lê um `last_trade` que não é o
     # vivo, então a reconciliação dele quase nunca tinha o que corrigir
@@ -16022,9 +15977,10 @@ async def restore_robot_states() -> None:
     logger.warning("[STARTUP_RESTORE_BEGIN] mode=%s", robot_runtime_mode())
     logger.info("[STARTUP_RESTORE_DISABLED] no session restore on startup")
     restored_count = 0
-    # Quem não tem linha no Histórico hoje restaura com Histórico vazio sem
-    # consultar: evita ~400 leituras no boot (o gateway só atende depois dele).
-    ativos_hoje = robot_persistence.load_user_ids_with_history_today()
+    # Quem não tem linha no Histórico desde a entrada da regra contínua
+    # restaura com Histórico vazio sem consultar: evita ~400 leituras no boot
+    # (o gateway só atende depois dele).
+    ativos_hoje = robot_persistence.load_user_ids_with_history_since(PLACAR_CONTINUO_DESDE)
     try:
         for user_id, payload in robot_persistence.load_states():
             session_restored = False
@@ -16044,6 +16000,7 @@ async def restore_robot_states() -> None:
             trades = robot_persistence.load_trades_for_restore(
                 user_id,
                 historico=[] if ativos_hoje is not None and user_id not in ativos_hoje else None,
+                stop_reset_at=payload.get("stop_reset_at"),
             )
             auto_trader.restore(
                 user_id,
@@ -16051,9 +16008,6 @@ async def restore_robot_states() -> None:
                 trades,
                 source=robot_persistence_source(),
             )
-            # Dia a que o placar restaurado pertence: se o robô só ligar amanhã,
-            # o start sabe que esta memória é de ontem (29/09, d353ab80).
-            _ultimo_dia_do_placar[user_id] = brasilia_today()
             robot_state_hydrated_users.add(user_id)
             restored_count += 1
             logger.info(
@@ -16715,6 +16669,20 @@ def load_robot_history_items(user_id: str, days: int) -> list[dict[str, Any]]:
     return _merge_robot_history_with_memory(user_id, days, persisted_items)
 
 
+def load_score_window_history_items(user_id: str) -> list[dict[str, Any]]:
+    """Histórico desde o último "Reiniciar placar" (janela do placar e do stop).
+
+    Args:
+        user_id: Cliente.
+
+    Returns:
+        Operações persistidas unidas às só em memória, da mais nova à mais antiga.
+    """
+    desde = inicio_do_placar(getattr(auto_trader.get(user_id), "stop_reset_at", None))
+    persisted_items = robot_persistence.load_trade_history_since(user_id, desde)
+    return _merge_robot_history_with_memory(user_id, 1, persisted_items, cutoff=desde)
+
+
 def load_robot_history_items_for_users(
     user_ids: list[str],
     days: int,
@@ -16744,11 +16712,17 @@ def _merge_robot_history_with_memory(
     user_id: str,
     days: int,
     persisted_items: list[dict[str, Any]],
+    *,
+    cutoff: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Une histórico persistido com trades ainda só em memória."""
+    """Une histórico persistido com trades ainda só em memória.
+
+    ``cutoff`` (quando dado) substitui a janela de ``days`` dias.
+    """
     items_by_order_id: dict[str, dict[str, Any]] = {}
     ordered_items: list[dict[str, Any]] = []
-    cutoff = history_cutoff(days)
+    if cutoff is None:
+        cutoff = history_cutoff(days)
 
     for item in persisted_items:
         order_id = str(item.get("order_id") or "").strip()

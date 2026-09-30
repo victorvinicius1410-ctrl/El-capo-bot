@@ -152,7 +152,7 @@ class DailyHistoryCacheTests(unittest.TestCase):
         loads = Mock(side_effect=[["v1"], ["v2"]])
         agora = [100.0]
         with (
-            patch.object(main, "load_robot_history_items", loads),
+            patch.object(main, "load_score_window_history_items", loads),
             patch.object(main, "monotonic", side_effect=lambda: agora[0]),
         ):
             self.assertEqual(main.load_daily_history_cached(USER), ["v1"])
@@ -165,7 +165,7 @@ class DailyHistoryCacheTests(unittest.TestCase):
 
     def test_invalidation_forces_fresh_read(self) -> None:
         loads = Mock(side_effect=[["antes"], ["depois"]])
-        with patch.object(main, "load_robot_history_items", loads):
+        with patch.object(main, "load_score_window_history_items", loads):
             self.assertEqual(main.load_daily_history_cached(USER), ["antes"])
             main.invalidate_daily_history_cache(USER)
             # Logo depois de gravar operação: leitura síncrona, stop win/loss
@@ -182,7 +182,7 @@ class DailyHistoryCacheTests(unittest.TestCase):
         agora = [100.0]
         main._daily_history_cache[USER] = (agora[0], ["inicial"])
         with (
-            patch.object(main, "load_robot_history_items", side_effect=lento),
+            patch.object(main, "load_score_window_history_items", side_effect=lento),
             patch.object(main, "monotonic", side_effect=lambda: agora[0]),
         ):
             agora[0] += main.DAILY_HISTORY_CACHE_TTL_SECONDS + 1
@@ -197,7 +197,7 @@ class DailyHistoryCacheTests(unittest.TestCase):
         agora = [100.0]
         main._daily_history_cache[USER] = (agora[0], ["antigo"])
         with (
-            patch.object(main, "load_robot_history_items", loads),
+            patch.object(main, "load_score_window_history_items", loads),
             patch.object(main, "monotonic", side_effect=lambda: agora[0]),
         ):
             agora[0] += main.DAILY_HISTORY_MAX_STALE_SECONDS + 1

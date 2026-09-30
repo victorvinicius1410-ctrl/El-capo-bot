@@ -86,6 +86,25 @@ class AuditoriaTests(unittest.TestCase):
             [(d["banco"], d["historico"]) for d in achados["divergentes"]], [((1, 4), (2, 3))]
         )
 
+    def test_placar_de_varios_dias_desde_o_reiniciar(self) -> None:
+        """Sem virada à meia-noite: ontem conta; antes do Reiniciar, não."""
+        reset = (AGORA - datetime.timedelta(days=2)).isoformat()
+        estados = [{"user_id": U1, "state_json": {"wins": 2, "losses": 1, "stop_reset_at": reset}}]
+        historico = [
+            {"user_id": U1, "order_id": "20", "result": "WIN", "cycle_result": "WIN", "finished_at": _t(60 * 72)},
+            {"user_id": U1, "order_id": "21", "result": "WIN", "cycle_result": "WIN", "finished_at": _t(60 * 30)},
+            {"user_id": U1, "order_id": "22", "result": "LOSS", "cycle_result": "LOSS", "finished_at": _t(60 * 26)},
+            {"user_id": U1, "order_id": "23", "result": "WIN", "cycle_result": "WIN", "finished_at": _t(30)},
+        ]
+        with patch.object(auditoria_placar, "_listar", _tabelas(estados, historico, [])):
+            achados = auditoria_placar.auditar("b", "k", agora=AGORA)
+        self.assertEqual(achados["divergentes"], [])
+        # Controle: o placar "só de hoje" (regra antiga) agora é divergência.
+        estados[0]["state_json"] = {"wins": 1, "losses": 0, "stop_reset_at": reset}
+        with patch.object(auditoria_placar, "_listar", _tabelas(estados, historico, [])):
+            achados = auditoria_placar.auditar("b", "k", agora=AGORA)
+        self.assertEqual([d["historico"] for d in achados["divergentes"]], [(2, 1)])
+
     def test_corrigir_so_mexe_no_espelho(self) -> None:
         with patch.object(auditoria_placar, "_listar", _tabelas(*self._dia())):
             achados = auditoria_placar.auditar("b", "k", agora=AGORA)

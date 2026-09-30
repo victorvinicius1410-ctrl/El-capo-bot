@@ -7,10 +7,12 @@ voltem em silêncio — todos eles eram invisíveis no log
 dois jeitos em que o espelho ``robot_trades`` mentia e levou um placar de 2x3
 para 1x4 no "Iniciar Operação" (docs/PLACAR_OVERLAY.md §2026-09-29).
 
-Confere quatro coisas, no dia civil de Brasília:
+Confere quatro coisas:
 
 1. **Placar × Histórico** — ``robot_states.wins/losses`` tem de bater com os
-   ciclos fechados do dia, posteriores ao "Reiniciar placar".
+   ciclos fechados desde o último "Reiniciar placar" (placar contínuo, sem
+   virada à meia-noite desde 01/10/2026 — ``backend/placar_janela.py``). Só
+   entra quem operou nos últimos 2 dias: placar parado não diverge sozinho.
 2. **Espelho pendente com resultado final** — linha ``PENDING_RESULT`` em
    ``robot_trades`` cuja ordem já está WIN/LOSS/DRAW no Histórico: alguém
    regravou uma cópia velha por cima do resultado.
@@ -46,8 +48,13 @@ import datetime
 import json
 import os
 import urllib.parse
+import pathlib
+import sys
 import urllib.request
 import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from backend.placar_janela import conta_no_placar, inicio_do_placar  # noqa: E402
 
 FUSO_BRASILIA = datetime.timezone(datetime.timedelta(hours=-3))
 # Operação recém-fechada: `persist_robot` grava em background.
@@ -55,6 +62,8 @@ CARENCIA_SEGUNDOS = 300
 # Espelho criado tanto tempo depois do fim da operação não é o runtime gravando
 # o resultado: é o `persist_robot` recriando uma ordem apagada.
 RESSURREICAO_SEGUNDOS = 60
+# Quem operou neste intervalo tem o placar auditado.
+DIAS_ATIVO = 2
 
 
 def _requisitar(base: str, chave: str, metodo: str, caminho: str, corpo=None) -> list[dict]:
@@ -145,11 +154,6 @@ def auditar(
             "select": "user_id,state_json", "order": "user_id.asc",
         })
     }
-    historico = _listar(base, chave, "robot_trade_history", {
-        "select": "user_id,order_id,parent_order_id,result,cycle_result,final_result,profit,finished_at",
-        "finished_at": f"gte.{corte}",
-        "order": "id.asc",
-    })
     espelhos = _listar(base, chave, "robot_trades", {
         "select": "user_id,order_id,result,executed_at,created_at,trade_json",
         "executed_at": f"gte.{corte}",
@@ -167,6 +171,29 @@ def auditar(
     })
     antigas = [l for l in antigas if (l["user_id"], str(l["order_id"])) not in ids_de_hoje]
     espelhos += antigas
+
+    # Histórico da janela do placar de cada cliente que operou há pouco (ou
+    # tem espelho a conferir). Nunca começa depois do início de hoje: as
+    # checagens do espelho comparam com o Histórico do dia.
+    recentes = _listar(base, chave, "robot_trade_history", {
+        "select": "user_id",
+        "finished_at": f"gte.{(agora - datetime.timedelta(days=DIAS_ATIVO)).isoformat()}",
+        "order": "id.asc",
+    })
+    ativos = sorted({str(l["user_id"]) for l in [*recentes, *espelhos] if l.get("user_id")})
+    historico: list[dict] = []
+    for inicio in range(0, len(ativos), 50):
+        lote = ativos[inicio:inicio + 50]
+        desde = min(
+            min(inicio_do_placar((estados.get(u) or {}).get("stop_reset_at")) for u in lote),
+            inicio_do_dia,
+        )
+        historico += _listar(base, chave, "robot_trade_history", {
+            "select": "user_id,order_id,parent_order_id,result,cycle_result,final_result,profit,finished_at",
+            "user_id": f"in.({','.join(lote)})",
+            "finished_at": f"gte.{desde.isoformat()}",
+            "order": "id.asc",
+        })
     # Pendente antiga pode ter o resultado no Histórico de OUTRO dia: busca por id.
     historico_antigo: list[dict] = []
     ids_antigos = sorted({str(l["order_id"]) for l in antigas})
@@ -187,9 +214,7 @@ def auditar(
     por_cliente: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
     for linha in historico:
         estado = estados.get(linha["user_id"]) or {}
-        reset = _instante(estado.get("stop_reset_at"))
-        fim = _instante(linha.get("finished_at"))
-        if reset is not None and fim is not None and fim < reset:
+        if not conta_no_placar(linha.get("finished_at"), estado.get("stop_reset_at")):
             continue
         # Perna de gale superada: a ordem que perdeu e passou o ciclo adiante
         # aparece como `parent_order_id` da etapa seguinte. Sem esta regra um
@@ -289,7 +314,7 @@ def descrever(achados: dict, *, detalhe: bool, horas_orfa: int) -> list[str]:
     """Relatório em texto (usado no terminal e no e-mail)."""
     linhas = [
         f"Auditoria do placar — dia de Brasília iniciado em {achados['corte'][:19]}Z",
-        f"  clientes que operaram hoje        : {achados['clientes']}",
+        f"  clientes com placar auditado      : {achados['clientes']}",
         f"  placar x Histórico                : {len(achados['divergentes'])} divergente(s)",
         f"  espelho pendente c/ resultado final: {len(achados['pendentes_com_final'])}",
         f"  ordens órfãs (> {horas_orfa}h)              : {len(achados['orfas'])}",

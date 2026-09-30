@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from backend import main
 from backend.auto_trader import AutoTrader, utc_now
+from backend.robot_persistence import RestoreTrades
 
 
 def operacao(
@@ -161,41 +162,50 @@ class ResultadoAtrasadoTests(unittest.TestCase):
         self.assertEqual((estado.wins, estado.losses), (1, 0))
 
 
-class ViradaDoDiaTests(unittest.TestCase):
-    """§F2 — nada zerava o placar à meia-noite de Brasília."""
+class SemViradaDoDiaTests(unittest.TestCase):
+    """§F2 revisto em 01/10: o placar só zera no "Reiniciar placar".
 
-    def test_operacao_de_ontem_sai_do_placar_do_dia(self) -> None:
+    Antes a meia-noite de Brasília zerava o placar (e o stop). Regra do dono
+    (30/09/2026): só o botão zera — a operação de ontem continua valendo.
+    """
+
+    def _win(self, order_id: str, fim) -> dict:
+        return {
+            **operacao(order_id, result="WIN"),
+            "profit": 8.7,
+            "finished_at": fim.isoformat(),
+            "cycle_result": "WIN",
+            "final_result": "WIN",
+        }
+
+    def test_operacao_de_ontem_continua_no_placar(self) -> None:
         trader = AutoTrader()
         user = "u-virada"
-        ontem = utc_now() - timedelta(days=1)
-        trader._histories[user] = [
-            {
-                **operacao("4001", result="WIN"),
-                "profit": 8.7,
-                "finished_at": ontem.isoformat(),
-                "cycle_result": "WIN",
-                "final_result": "WIN",
-            }
-        ]
-        estado = trader.get(user)
-        estado.wins, estado.losses, estado.profit = 1, 0, 8.7
+        payload = trader.get(user).to_dict()
+        payload["stop_reset_at"] = (utc_now() - timedelta(days=2)).isoformat()
+        trades = RestoreTrades(
+            [
+                self._win("4001", utc_now() - timedelta(days=1)),
+                self._win("4002", utc_now() - timedelta(minutes=5)),
+            ],
+            authoritative=True,
+        )
+        estado = AutoTrader().restore(user, payload, trades)
+        self.assertEqual((estado.wins, estado.losses, round(estado.profit, 2)), (2, 0, 17.4))
 
-        self.assertEqual(trader.recompute_session_score_for_today(user), (0, 0, 0.0))
-        self.assertEqual((estado.wins, estado.losses), (0, 0))
-
-    def test_resultado_de_hoje_permanece(self) -> None:
-        trader = AutoTrader()
+    def test_operacao_de_antes_do_reiniciar_nao_conta(self) -> None:
         user = "u-virada-2"
-        trader._histories[user] = [
-            {
-                **operacao("4002", result="WIN"),
-                "profit": 8.7,
-                "finished_at": utc_now().isoformat(),
-                "cycle_result": "WIN",
-                "final_result": "WIN",
-            }
-        ]
-        self.assertEqual(trader.recompute_session_score_for_today(user), (1, 0, 8.7))
+        payload = AutoTrader().get(user).to_dict()
+        payload["stop_reset_at"] = (utc_now() - timedelta(hours=1)).isoformat()
+        trades = RestoreTrades(
+            [
+                self._win("4003", utc_now() - timedelta(hours=3)),
+                self._win("4004", utc_now() - timedelta(minutes=5)),
+            ],
+            authoritative=True,
+        )
+        estado = AutoTrader().restore(user, payload, trades)
+        self.assertEqual((estado.wins, estado.losses), (1, 0))
 
 
 class PersistNaoRebaixaTests(unittest.TestCase):

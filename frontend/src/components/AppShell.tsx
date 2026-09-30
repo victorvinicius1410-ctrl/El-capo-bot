@@ -310,7 +310,7 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
     }
   }
 
-  /** Clique no "Reiniciar placar": pergunta antes quando há placar do dia. */
+  /** Clique no "Reiniciar placar": pergunta antes quando há placar (ele só zera aqui). */
   function requestResetScore(): void {
     if (!apiConfig.BASE_URL || resetting || adminModelMode) return;
     if (!shouldConfirmResetScore(displayState)) {

@@ -23,7 +23,6 @@ import os
 import signal
 import uuid
 
-from backend.brasilia_time import brasilia_today
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("robot-runtime")
@@ -108,60 +107,6 @@ def _prefer_live_session_score(
         state.stop_offset_profit = float(live.get("stop_offset_profit") or 0)
 
 
-def _descartar_placar_de_outro_dia(
-    gateway: object,
-    auto_trader: object,
-    user_id: str,
-    antigo: dict[str, object] | None,
-) -> None:
-    """Registra a troca do placar de outro dia pelo recálculo de hoje.
-
-    A baixa é intencional (como a virada do dia no worker): marca a autoridade
-    para nenhuma réplica atrasada (memória do gateway, banco) promover de volta
-    o placar maior da véspera.
-
-    Args:
-        gateway: Módulo ``backend.main``.
-        auto_trader: AutoTrader do runtime.
-        user_id: Cliente.
-        antigo: Placar da memória descartado, ou ``None``.
-    """
-    if not antigo:
-        return
-    state = auto_trader.get(user_id)  # type: ignore[attr-defined]
-    novo = (int(state.wins or 0), int(state.losses or 0), round(float(state.profit or 0), 2))
-    velho = (
-        int(antigo.get("wins") or 0),
-        int(antigo.get("losses") or 0),
-        round(float(antigo.get("profit") or 0), 2),
-    )
-    if novo == velho:
-        return
-    logger.warning(
-        "[LIVE_SCORE_FROM_OTHER_DAY_DROPPED] user_id=%s memoria=%sx%s/%s hoje=%sx%s/%s",
-        user_id,
-        velho[0],
-        velho[1],
-        velho[2],
-        novo[0],
-        novo[1],
-        novo[2],
-    )
-    vigente = getattr(gateway, "get_session_score_authority", None)
-    if callable(vigente) and vigente(user_id) is not None:
-        return  # baixa intencional recente (exclusão/reset) já manda
-    marcar = getattr(gateway, "mark_session_score_authority", None)
-    if callable(marcar):
-        try:
-            marcar(user_id, novo[0], novo[1], novo[2])
-        except Exception:
-            logger.warning(
-                "[LIVE_SCORE_FROM_OTHER_DAY_AUTHORITY_FAILED] user_id=%s",
-                user_id,
-                exc_info=True,
-            )
-
-
 def _hydrate_user_from_persistence(
     gateway: object,
     user_id: str,
@@ -196,39 +141,28 @@ def _hydrate_user_from_persistence(
     # `stop` NÃO usa force: a memória viva do runtime pode estar à frente da
     # DB (último WIN ainda em persistência async). Re-hidratar no stop
     # recalculava o placar pelo histórico atrasado (ex.: 10x12 → 9x12).
+    # Sem virada à meia-noite (placar contínuo até o Reiniciar, ver
+    # backend.placar_janela), a memória nunca é "de outro dia": a regra de
+    # descartar o placar da véspera (29/09, d353ab80) saiu com ela.
     live_score = None
-    # Dia (Brasília) em que o placar da memória foi conferido pelo worker. Se
-    # não é hoje, a memória é de ONTEM (ex.: restaurada no boot às 23h e o
-    # robô só ligado de manhã) e não pode ganhar do recálculo de hoje — em
-    # 29/09 o cliente d353ab80 iniciou às 09:40 com o 1x3 da véspera e o
-    # placar do dia saiu 6x4 em vez de 5x1.
-    hoje = brasilia_today()
-    marcador = getattr(gateway, "_ultimo_dia_do_placar", None)
-    placar_de_outro_dia = None
     has_state = getattr(auto_trader, "has_state", None)
     if callable(has_state) and has_state(user_id):
         if not force:
             return
         live_score = _capture_live_session_score(auto_trader, user_id)
-        dia_da_memoria = marcador.get(user_id) if isinstance(marcador, dict) else None
-        if dia_da_memoria is not None and dia_da_memoria != hoje:
-            placar_de_outro_dia = live_score
-            live_score = None
     try:
         for uid, state_payload in persistence.load_states():
             if str(uid) != user_id:
                 continue
             # Placar pelo Histórico, não pelo espelho robot_trades (ver
             # RobotPersistence.load_trades_for_restore).
-            trades = persistence.load_trades_for_restore(user_id)
+            trades = persistence.load_trades_for_restore(
+                user_id, stop_reset_at=(state_payload or {}).get("stop_reset_at")
+            )
             source = getattr(gateway, "robot_persistence_source", lambda: "runtime")()
             auto_trader.restore(user_id, state_payload, trades, source=source)
             if live_score is not None:
                 _prefer_live_session_score(auto_trader, user_id, live_score)
-            if isinstance(marcador, dict):
-                # O restore conta só o dia de hoje: a memória agora é de hoje.
-                marcador[user_id] = hoje
-            _descartar_placar_de_outro_dia(gateway, auto_trader, user_id, placar_de_outro_dia)
             # `restore` recalcula o placar pelo histórico e
             # `_prefer_live_session_score` mantém o MAIOR total: os dois
             # desfaziam uma exclusão recente. A baixa intencional vigente
@@ -260,7 +194,7 @@ def apagar_operacao_do_runtime(gateway: object, user_id: str, removida: dict) ->
     (restart), a chave calculada pelo gateway a partir da linha apagada.
     """
     order_id = str(removida.get("order_id") or "").strip()
-    na_memoria = gateway.auto_trader.mark_trade_removed(user_id, order_id)  # type: ignore[attr-defined]
+    na_memoria = gateway.auto_trader.mark_trade_removed(user_id, order_id, removida)  # type: ignore[attr-defined]
     padroes = getattr(gateway, "pattern_memory", None)
     esquecer = getattr(padroes, "forget_outcome", None)
     if not callable(esquecer):

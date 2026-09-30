@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from backend.brasilia_time import history_cutoff_iso
+from backend.brasilia_time import history_cutoff, history_cutoff_iso
+from backend.placar_janela import inicio_do_placar
 
 import httpx
 
@@ -275,6 +276,22 @@ class RestoreTrades(list):
         self.authoritative = authoritative
 
 
+def _parse_iso(valor: Any) -> datetime | None:
+    """ISO/datetime → datetime UTC; ``None`` se ilegível."""
+    if isinstance(valor, datetime):
+        instante = valor
+    elif isinstance(valor, str) and valor.strip():
+        try:
+            instante = datetime.fromisoformat(valor.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if instante.tzinfo is None:
+        instante = instante.replace(tzinfo=timezone.utc)
+    return instante.astimezone(timezone.utc)
+
+
 class RobotPersistence(ABC):
     @abstractmethod
     def save_state(self, user_id: str, state: dict[str, Any]) -> None:
@@ -339,11 +356,36 @@ class RobotPersistence(ABC):
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    def load_user_ids_with_history_today(self) -> set[str] | None:
-        """Clientes com alguma linha no Histórico hoje (dia de Brasília).
+    def load_trade_history_since(self, user_id: str, desde: datetime) -> list[dict[str, Any]]:
+        """Histórico do cliente com ``finished_at >= desde``, sem limite de linhas.
+
+        A janela do placar vai do último "Reiniciar placar" até agora e pode ter
+        vários dias (ver ``backend.placar_janela``).
+
+        Args:
+            user_id: Cliente.
+            desde: Início da janela (com fuso).
+
+        Returns:
+            Operações da mais nova para a mais antiga.
+        """
+        dias = max(1, (datetime.now(timezone.utc) - desde).days + 2)
+        corte = desde.astimezone(timezone.utc)
+        itens = []
+        for item in self.load_trade_history(user_id, dias):
+            fim = _parse_iso(item.get("finished_at"))
+            if fim is not None and fim >= corte:
+                itens.append(item)
+        return itens
+
+    def load_user_ids_with_history_since(self, desde: datetime) -> set[str] | None:
+        """Clientes com alguma linha no Histórico desde ``desde``.
 
         Usado no boot para ler o Histórico só de quem operou: são ~400
-        clientes restaurados e poucas dezenas com operação no dia.
+        clientes restaurados e poucas dezenas com operação.
+
+        Args:
+            desde: Início da janela (com fuso).
 
         Returns:
             Conjunto de ``user_id``, ou ``None`` quando não dá para saber (aí
@@ -355,6 +397,8 @@ class RobotPersistence(ABC):
         self,
         user_id: str,
         historico: list[dict[str, Any]] | None = None,
+        *,
+        stop_reset_at: Any = None,
     ) -> "RestoreTrades":
         """Operações que o ``restore`` usa para recalcular o placar.
 
@@ -370,18 +414,25 @@ class RobotPersistence(ABC):
         um cliente de 2x3 para 1x4 no "Iniciar Operação".
         Ver docs/PLACAR_OVERLAY.md §2026-09-29.
 
+        A janela lida vai do último "Reiniciar placar" até agora (placar sem
+        virada à meia-noite, ver ``backend.placar_janela``), e nunca começa
+        depois do início de hoje: o histórico em memória segue tendo as
+        operações do dia, como antes.
+
         Args:
             user_id: Dono das operações.
-            historico: Histórico de hoje já lido (boot em lote); ``None`` lê.
+            historico: Histórico já lido (boot em lote); ``None`` lê.
+            stop_reset_at: Último "Reiniciar placar" do cliente (do estado salvo).
 
         Returns:
             Operações em ordem cronológica (mais antiga primeiro), com
             ``authoritative=True`` quando o Histórico foi lido — aí lista vazia
-            quer dizer "nada hoje" e o placar zera, em vez de manter o de ontem.
+            quer dizer "nada desde o Reiniciar" e o placar zera.
         """
         if historico is None:
             try:
-                historico = self.load_trade_history(user_id, 1)
+                desde = min(inicio_do_placar(stop_reset_at), history_cutoff(1))
+                historico = self.load_trade_history_since(user_id, desde)
             except Exception:
                 # Sem Histórico não dá para conferir o espelho: cai no
                 # comportamento antigo em vez de zerar o placar do cliente.
@@ -812,8 +863,8 @@ class SQLiteRobotPersistence(RobotPersistence):
                 ),
             )
 
-    def load_user_ids_with_history_today(self) -> set[str] | None:
-        cutoff = history_cutoff_iso(1)
+    def load_user_ids_with_history_since(self, desde: datetime) -> set[str] | None:
+        cutoff = desde.astimezone(timezone.utc).isoformat()
         with self._connect() as connection:
             rows = connection.execute(
                 "select distinct user_id from robot_trade_history where finished_at >= ?",
@@ -1304,29 +1355,53 @@ class SupabaseRobotPersistence(RobotPersistence):
             f"user_id={user_id} order_id={item.get('order_id')} tabela=robot_trade_history",
         )
 
-    def load_user_ids_with_history_today(self) -> set[str] | None:
-        cutoff = history_cutoff_iso(1)
+    def load_user_ids_with_history_since(self, desde: datetime) -> set[str] | None:
+        cutoff = desde.astimezone(timezone.utc).isoformat()
         encontrados: set[str] = set()
-        inicio = 0
+        ultimo = ""
         try:
             while True:
-                # Paginação SEM `order` estável repete e pula linhas no PostgREST.
+                # Ordenado por cliente, cada página recomeça DEPOIS do último
+                # cliente visto: as linhas dele que ficaram de fora já não
+                # importam. O custo fica limitado ao número de clientes, não ao
+                # de operações (a janela cresce sem a virada à meia-noite).
+                depois = f"&user_id=gt.{quote(ultimo, safe='')}" if ultimo else ""
                 pagina = self._request(
                     "GET",
                     "/robot_trade_history?select=user_id"
                     f"&finished_at=gte.{quote(cutoff, safe=':-')}"
-                    "&order=id.asc",
-                    extra_headers={"Range": f"{inicio}-{inicio + 999}"},
+                    f"{depois}&order=user_id.asc",
+                    extra_headers={"Range": "0-999"},
                 )
-                encontrados.update(str(row.get("user_id") or "") for row in pagina)
-                if len(pagina) < 1000:
+                ids = [str(row.get("user_id") or "") for row in pagina]
+                encontrados.update(ids)
+                if len(pagina) < 1000 or not ids[-1]:
                     break
-                inicio += 1000
+                ultimo = ids[-1]
         except Exception:
             logger.warning("[HISTORY_ACTIVE_USERS_READ_FAILED]", exc_info=True)
             return None
         encontrados.discard("")
         return encontrados
+
+    def load_trade_history_since(self, user_id: str, desde: datetime) -> list[dict[str, Any]]:
+        cutoff = desde.astimezone(timezone.utc).isoformat()
+        linhas: list[dict[str, Any]] = []
+        inicio = 0
+        while True:
+            # Paginação SEM `order` estável repete e pula linhas no PostgREST.
+            pagina = self._request(
+                "GET",
+                f"/robot_trade_history?user_id=eq.{quote(user_id, safe='')}"
+                f"&finished_at=gte.{quote(cutoff, safe=':-')}"
+                "&select=*&order=finished_at.desc,id.desc",
+                extra_headers={"Range": f"{inicio}-{inicio + 999}"},
+            )
+            linhas.extend(pagina)
+            if len(pagina) < 1000:
+                break
+            inicio += 1000
+        return [expand_trade_history_analysis(dict(row)) for row in linhas]
 
     def load_trade_history(self, user_id: str, days: int) -> list[dict[str, Any]]:
         cutoff = history_cutoff_iso(days)

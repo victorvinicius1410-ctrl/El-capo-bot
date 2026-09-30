@@ -52,15 +52,16 @@ export function ResetScoreDialog({
         <DialogHeader>
           <DialogTitle>Reiniciar o placar?</DialogTitle>
           <DialogDescription>
-            O contador da sessão volta para 0 × 0 e o resultado financeiro do placar zera.
-            Isso não cancela operação nenhuma e não apaga o seu Histórico — as operações do
-            dia continuam lá, com os mesmos valores.
+            O contador volta para 0 × 0, o resultado financeiro do placar zera e o Stop Win/Loss
+            recomeça a contar daqui. O placar só zera neste botão — não zera sozinho à
+            meia-noite. Isso não cancela operação nenhuma e não apaga o seu Histórico — as
+            operações continuam lá, com os mesmos valores.
           </DialogDescription>
         </DialogHeader>
         {highlight ? (
           <div className="rounded-lg border border-border/60 bg-card/60 px-3 py-2 text-sm">
             <p className="font-semibold text-foreground">Vai sumir do placar: {highlight}</p>
-            <p className="text-xs text-muted-foreground">Resultado do placar hoje: {profitLabel}</p>
+            <p className="text-xs text-muted-foreground">Resultado do placar: {profitLabel}</p>
           </div>
         ) : null}
         <DialogFooter className="gap-2 sm:justify-between">

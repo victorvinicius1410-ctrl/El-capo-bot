@@ -5,9 +5,10 @@
 > **nunca rebaixa** o placar persistido: `_protect_session_score_on_persist`
 > barra a gravação e loga `[SCORE_PERSIST_DOWNGRADE_BLOCKED]`. A única baixa
 > legítima carrega marca de baixa intencional (`score_authority`) — "Reiniciar
-> placar", "Reiniciar ciclo", exclusão no Shift+O e a virada do dia. O runtime,
-> por sua vez, **nunca reidrata** o placar do banco: a memória viva dele já foi
-> recalculada pelo histórico do dia. Ver `PLACAR_DIAGNOSTICO_2026-09-15.md`.
+> placar", "Reiniciar ciclo" e exclusão no Shift+O (a virada do dia saiu em
+> 01/10/2026: ver a seção abaixo). O runtime, por sua vez, **nunca reidrata** o
+> placar do banco: a memória viva dele já foi recalculada pelo Histórico da
+> janela. Ver `PLACAR_DIAGNOSTICO_2026-09-15.md`.
 
 Como o frontend mostra o placar da sessão no robô flutuante, e por que ele
 às vezes **piscava zerado**, **não zerava no Reiniciar placar**, **caía
@@ -18,6 +19,45 @@ histórico.
 Atualizado em **2026-09-07**.
 
 Espelho detalhado: [`Frontend/docs/PLACAR_OVERLAY.md`](../frontend/docs/PLACAR_OVERLAY.md).
+
+## Regra (2026-10-01) — placar e stop só zeram no "Reiniciar placar"
+
+Decisão do dono em 30/09: o placar **e o stop** (operações e dinheiro) só voltam
+a zero quando o cliente clica em **Reiniciar placar**. Não existe mais virada à
+meia-noite.
+
+- **Janela** (`backend/placar_janela.py`): do último Reiniciar (`stop_reset_at`)
+  até agora, podendo ter vários dias. Quem nunca reiniciou, ou reiniciou antes
+  da regra, conta desde `PLACAR_CONTINUO_DESDE` (início do dia do deploy): no
+  deploy o placar de todo mundo é exatamente o do dia, e ninguém herda dias
+  antigos. O script de deploy confere que a constante é o dia de hoje.
+- **Mesma janela em todo lugar**: recálculo do restore
+  (`_recompute_score_from_history`), stop do runtime (`management_totals`),
+  gestão do gateway e trava do Iniciar (`build_management_summary`), leitura do
+  Histórico no restore (`load_trades_for_restore(..., stop_reset_at=)`) e a
+  auditoria (`scripts/auditoria_placar.py`).
+- **Stop acima de 100 operações**: o robô guarda só as 100 últimas em memória.
+  O dinheiro das que saem vai para `AutoTrader._stop_acumulado`
+  (`_limitar_historico`); o restore recalcula tudo pela janela inteira. Excluir
+  no Shift+O uma operação que já saiu da memória tira o dinheiro dela do
+  acumulado (o gateway manda `finished_at` no `removed_trade`), uma vez só.
+- **Saiu**: `reset_session_score_on_new_day`, `recompute_session_score_for_today`,
+  `_ultimo_dia_do_placar` e o descarte de "placar de outro dia" no start do
+  runtime. O campo `score_day` ficou por compatibilidade e agora vale
+  `"continuo"`: placar carimbado com um dia antigo é de antes da regra e não
+  ganha do atual (`placar_da_regra_atual`). `adopt_new_day_score_on_gateway`
+  alinha o gateway ao runtime uma vez por processo — é o que cobre a troca de
+  regra no deploy.
+- **Boot**: `load_user_ids_with_history_since` pagina pulando de cliente em
+  cliente (`user_id=gt.`), então o custo cresce com o número de clientes, não
+  com o de operações da janela.
+- **Stop batido continua batido no dia seguinte** até o Reiniciar (antes a
+  meia-noite destravava). O 409 do Iniciar já explica as duas saídas: aumentar o
+  limite ou Reiniciar placar.
+
+Testes: `tests/test_placar_continuo.py`; os antigos da virada do dia foram
+reescritos para a regra nova (`test_placar_espelho.PlacarContinuoTests`,
+`test_placar_integridade.SemViradaDoDiaTests`).
 
 ## Correção (2026-09-29, tarde) — placar de ONTEM somado ao de hoje
 

@@ -144,9 +144,14 @@ class RestorePeloHistoricoTests(_Base):
         self.assertEqual(estado.last_trade["result"], "WIN")
         self.assertEqual(estado.last_trade["finished_at"], ops["win_preso"]["finished_at"])
 
-    def test_quem_operou_hoje(self) -> None:
+    def test_quem_operou_desde(self) -> None:
         self._dia_do_sergio()
-        self.assertEqual(self.persist.load_user_ids_with_history_today(), {USER})
+        self.assertEqual(
+            self.persist.load_user_ids_with_history_since(utc_now() - timedelta(hours=1)), {USER}
+        )
+        self.assertEqual(
+            self.persist.load_user_ids_with_history_since(utc_now() + timedelta(hours=1)), set()
+        )
 
 
 class EspelhoProtegidoTests(unittest.TestCase):
@@ -223,14 +228,19 @@ class EspelhoProtegidoTests(unittest.TestCase):
         self.assertTrue(main.auto_trader.get(self.user).last_trade.get("score_removed"))
 
 
-class ViradaDoDiaTests(unittest.TestCase):
-    """29/09: placar de ONTEM ganhava do de hoje por ser maior."""
+class PlacarContinuoTests(unittest.TestCase):
+    """Placar sem virada à meia-noite (regra do dono, 30/09/2026).
+
+    Em 29/09 o placar de ONTEM ganhava do de hoje por ser maior (d353ab80,
+    e3b52de7); a correção da época era um carimbo de dia. Sem virada, o
+    carimbo passou a dizer "placar da regra contínua" e só a troca de regra
+    (deploy) ou o Reiniciar mudam a janela.
+    """
 
     def setUp(self) -> None:
         self.user = "d353ab80-0000-4000-8000-000000000001"
         for mapa in (
             main.auto_trader._states,
-            main._ultimo_dia_do_placar,
             main._gateway_score_day,
             main._session_score_authority,
         ):
@@ -243,47 +253,47 @@ class ViradaDoDiaTests(unittest.TestCase):
             {
                 "load_states": staticmethod(lambda: [(self.user, payload)]),
                 "load_trades_for_restore": staticmethod(
-                    lambda _u: RestoreTrades(list(trades), authoritative=True)
+                    lambda _u, **_k: RestoreTrades(list(trades), authoritative=True)
                 ),
             },
         )()
 
-    def test_iniciar_descarta_placar_da_memoria_de_ontem(self) -> None:
-        """d353ab80: restaurado às 23h com 1x3, iniciou às 09:40 do dia seguinte."""
+    def test_iniciar_no_dia_seguinte_mantem_o_placar_de_ontem(self) -> None:
+        """d353ab80 com a regra nova: 1x3 ontem + 1 WIN hoje = 2x3, sem zerar."""
         estado = main.auto_trader.get(self.user)
         estado.wins, estado.losses, estado.profit = 1, 3, -10.8
-        # Restaurado no boot de ontem e nunca ligado desde então.
-        main._ultimo_dia_do_placar[self.user] = main.brasilia_today() - timedelta(days=1)
-        payload = estado.to_dict()
-        hoje = [_ordem("9501", "WIN", 4.2, utc_now() - timedelta(seconds=30))]
+        estado.stop_reset_at = utc_now() - timedelta(days=2)
+        ontem = utc_now() - timedelta(days=1)
+        passo = timedelta(minutes=5)
+        historico = [
+            _ordem("9401", "WIN", 4.2, ontem),
+            _ordem("9402", "LOSS", -5.0, ontem + passo),
+            _ordem("9403", "LOSS", -5.0, ontem + 2 * passo),
+            _ordem("9404", "LOSS", -5.0, ontem + 3 * passo),
+            _ordem("9501", "WIN", 4.2, utc_now() - timedelta(seconds=30)),
+        ]
         gateway = type(
             "G",
             (),
             {
-                "robot_persistence": self._persistencia(payload, hoje),
+                "robot_persistence": self._persistencia(estado.to_dict(), historico),
                 "auto_trader": main.auto_trader,
-                "_ultimo_dia_do_placar": main._ultimo_dia_do_placar,
-                "mark_session_score_authority": staticmethod(main.mark_session_score_authority),
             },
         )()
-        with patch.object(main.robot_bus, "set_score_authority"):
-            robot_runtime_main._hydrate_user_from_persistence(gateway, self.user, force=True)
-        self.assertEqual(self._placar(), (1, 0, 4.2))
-        self.assertEqual(main._ultimo_dia_do_placar[self.user], main.brasilia_today())
-        self.assertEqual(main.get_session_score_authority(self.user), (1, 0, 4.2))
+        robot_runtime_main._hydrate_user_from_persistence(gateway, self.user, force=True)
+        self.assertEqual(self._placar(), (2, 3, -6.6))
+        self.assertIsNone(main.get_session_score_authority(self.user))
 
-    def test_iniciar_mantem_placar_vivo_de_hoje(self) -> None:
-        """Memória conferida hoje e à frente do banco continua valendo."""
+    def test_iniciar_mantem_placar_vivo(self) -> None:
+        """Memória à frente do banco continua valendo."""
         estado = main.auto_trader.get(self.user)
         estado.wins, estado.losses, estado.profit = 3, 1, 7.6
-        main._ultimo_dia_do_placar[self.user] = main.brasilia_today()
         gateway = type(
             "G",
             (),
             {
                 "robot_persistence": self._persistencia(estado.to_dict(), []),
                 "auto_trader": main.auto_trader,
-                "_ultimo_dia_do_placar": main._ultimo_dia_do_placar,
             },
         )()
         robot_runtime_main._hydrate_user_from_persistence(gateway, self.user, force=True)
@@ -299,25 +309,46 @@ class ViradaDoDiaTests(unittest.TestCase):
             "data": {"wins": wins, "losses": losses, "profit": profit, "score_day": dia},
         }
 
-    def test_gateway_adota_placar_de_hoje_mesmo_menor(self) -> None:
-        """e3b52de7: gateway com 1x1 de ontem, runtime com 0x0 de hoje."""
+    def test_gateway_adota_placar_do_runtime_na_troca_de_regra(self) -> None:
+        """Gateway com placar de antes da regra (maior), runtime com o da regra."""
         estado = main.auto_trader.get(self.user)
         estado.wins, estado.losses, estado.profit = 1, 1, -1.3
-        hoje = main.brasilia_today().isoformat()
         with (
             patch.object(main, "robot_runtime_mode", return_value="external"),
             patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
-            patch.object(main.robot_bus, "get_snapshot", return_value=self._snapshot(0, 0, 0.0, hoje)),
+            patch.object(
+                main.robot_bus,
+                "get_snapshot",
+                return_value=self._snapshot(0, 0, 0.0, main.MARCA_PLACAR_CONTINUO),
+            ),
             patch.object(main, "_load_persisted_session_score", return_value=(1, 1, -1.3)),
             patch.object(main, "get_session_score_authority", return_value=None),
         ):
             main.reconcile_session_score_on_gateway(self.user)
             self.assertEqual(self._placar(), (0, 0, 0.0))
-            # Na leitura seguinte o banco de ontem não promove de volta.
+            # Na leitura seguinte o banco antigo não promove de volta.
             main.reconcile_session_score_on_gateway(self.user)
         self.assertEqual(self._placar(), (0, 0, 0.0))
 
-    def test_snapshot_sem_dia_mantem_nunca_rebaixa(self) -> None:
+    def test_depois_de_alinhado_volta_a_nunca_rebaixar(self) -> None:
+        """A adoção é uma vez por processo; depois vale o "nunca rebaixa"."""
+        main._gateway_score_day[self.user] = main.MARCA_PLACAR_CONTINUO
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 5, 3, 25.0
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(type(main.robot_bus), "enabled", new_callable=PropertyMock, return_value=True),
+            patch.object(
+                main.robot_bus,
+                "get_snapshot",
+                return_value=self._snapshot(2, 0, 17.4, main.MARCA_PLACAR_CONTINUO),
+            ),
+            patch.object(main, "get_session_score_authority", return_value=None),
+        ):
+            main.reconcile_session_score_on_gateway(self.user)
+        self.assertEqual(self._placar(), (5, 3, 25.0))
+
+    def test_snapshot_sem_carimbo_mantem_nunca_rebaixa(self) -> None:
         estado = main.auto_trader.get(self.user)
         estado.wins, estado.losses, estado.profit = 5, 3, 25.0
         with (
@@ -330,23 +361,26 @@ class ViradaDoDiaTests(unittest.TestCase):
             main.reconcile_session_score_on_gateway(self.user)
         self.assertEqual(self._placar(), (5, 3, 25.0))
 
-    def test_persist_do_gateway_grava_o_placar_de_hoje(self) -> None:
-        hoje = main.brasilia_today().isoformat()
+    def test_persist_do_gateway_grava_o_placar_do_runtime(self) -> None:
         with (
             patch.object(main, "robot_runtime_mode", return_value="external"),
-            patch.object(main.robot_bus, "get_snapshot", return_value=self._snapshot(1, 0, 4.2, hoje)),
+            patch.object(
+                main.robot_bus,
+                "get_snapshot",
+                return_value=self._snapshot(1, 0, 4.2, main.MARCA_PLACAR_CONTINUO),
+            ),
             patch.object(main, "get_session_score_authority", return_value=None),
         ):
             payload, _ = main._protect_session_score_on_persist(
                 self.user, {"wins": 1, "losses": 3, "profit": -10.8}, None
             )
         self.assertEqual((payload["wins"], payload["losses"], payload["profit"]), (1, 0, 4.2))
+        self.assertEqual(payload["score_day"], main.MARCA_PLACAR_CONTINUO)
 
-    def test_runtime_carimba_o_dia_no_snapshot(self) -> None:
-        main._ultimo_dia_do_placar[self.user] = main.brasilia_today()
+    def test_runtime_carimba_a_regra_no_snapshot(self) -> None:
         with patch.object(main, "robot_runtime_mode", return_value="worker"):
             data = main.build_robot_payload(main.auto_trader.get(self.user), user_id=self.user)["data"]
-        self.assertEqual(data["score_day"], main.brasilia_today().isoformat())
+        self.assertEqual(data["score_day"], main.MARCA_PLACAR_CONTINUO)
 
 
 class ExclusaoSomeDeTudoTests(unittest.TestCase):
@@ -520,10 +554,10 @@ class GatewaySemSnapshotTests(unittest.TestCase):
             payload, _ = main._protect_session_score_on_persist(self.user, {"wins": 0, "losses": 0, "profit": 0.0}, None)
         self.assertNotIn(main.PRESERVAR_PLACAR_DO_BANCO, payload)
 
-    def test_reidratacao_ignora_placar_salvo_de_outro_dia(self) -> None:
+    def test_reidratacao_ignora_placar_salvo_antes_da_regra(self) -> None:
         estado = main.auto_trader.get(self.user)
         estado.wins, estado.losses, estado.profit = 0, 0, 0.0
-        ontem = {"wins": 2, "losses": 0, "profit": 170.0, "score_day": "2020-01-01"}
+        ontem = {"wins": 2, "losses": 0, "profit": 170.0, "score_day": "2019-12-31"}
         with (
             patch.object(main, "robot_runtime_mode", return_value="external"),
             patch.object(main.robot_bus, "get_snapshot", return_value=None),
@@ -531,8 +565,8 @@ class GatewaySemSnapshotTests(unittest.TestCase):
         ):
             main.rehydrate_score_from_persistence_if_blank(self.user)
         self.assertEqual((estado.wins, estado.losses), (0, 0))
-        # Controle: o mesmo placar salvo HOJE é reidratado.
-        hoje = {**ontem, "score_day": main.brasilia_today().isoformat()}
+        # Controle: o mesmo placar salvo pela regra contínua é reidratado.
+        hoje = {**ontem, "score_day": main.MARCA_PLACAR_CONTINUO}
         with (
             patch.object(main, "robot_runtime_mode", return_value="external"),
             patch.object(main.robot_bus, "get_snapshot", return_value=None),
