@@ -191,9 +191,9 @@ class StrategyFilterTests(unittest.TestCase):
         for index in range(2):
             trader.record_trade(
                 user_id,
-                {"order_id": f"daily-loss-{index}", "active": "EURUSD-OTC", "amount": 2},
+                {"order_id": f"9100{index}", "active": "EURUSD-OTC", "amount": 2},
             )
-            trader.finish_trade(user_id, f"daily-loss-{index}", "LOSS", -2)
+            trader.finish_trade(user_id, f"9100{index}", "LOSS", -2)
 
         self.assertEqual(main.daily_stop_reason(user_id, state), "STOP_LOSS_HIT")
 
@@ -201,17 +201,19 @@ class StrategyFilterTests(unittest.TestCase):
         user_id = "user-daily-win"
         trader = main.auto_trader
         state = trader.start(user_id)
-        state.stop_win = 3
+        # Stop Win pelo resultado LÍQUIDO (regra de 21/09): -2 + 3 = +1.
+        # Ids numéricos: id com letra conta como Shift+O e o stop ignora.
+        state.stop_win = 1
         trader.record_trade(
             user_id,
-            {"order_id": "daily-win-loss-1", "active": "EURUSD-OTC", "amount": 2},
+            {"order_id": "91101", "active": "EURUSD-OTC", "amount": 2},
         )
-        trader.finish_trade(user_id, "daily-win-loss-1", "LOSS", -2)
+        trader.finish_trade(user_id, "91101", "LOSS", -2)
         trader.record_trade(
             user_id,
-            {"order_id": "daily-win-1", "active": "EURUSD-OTC", "amount": 2},
+            {"order_id": "91102", "active": "EURUSD-OTC", "amount": 2},
         )
-        trader.finish_trade(user_id, "daily-win-1", "WIN", 3)
+        trader.finish_trade(user_id, "91102", "WIN", 3)
 
         self.assertEqual(main.daily_stop_reason(user_id, state), "STOP_WIN_HIT")
 
@@ -223,14 +225,14 @@ class StrategyFilterTests(unittest.TestCase):
         state.stop_loss = 3
         trader.record_trade(
             user_id,
-            {"order_id": "daily-management-loss", "active": "EURUSD-OTC", "amount": 3},
+            {"order_id": "91201", "active": "EURUSD-OTC", "amount": 3},
         )
-        trader.finish_trade(user_id, "daily-management-loss", "LOSS", -3)
+        trader.finish_trade(user_id, "91201", "LOSS", -3)
         trader.record_trade(
             user_id,
-            {"order_id": "daily-management-win", "active": "EURUSD-OTC", "amount": 4},
+            {"order_id": "91202", "active": "EURUSD-OTC", "amount": 4},
         )
-        trader.finish_trade(user_id, "daily-management-win", "WIN", 4)
+        trader.finish_trade(user_id, "91202", "WIN", 4)
 
         summary = main.build_management_summary(user_id, state)
 
