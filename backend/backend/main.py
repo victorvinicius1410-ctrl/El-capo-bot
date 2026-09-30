@@ -30,6 +30,7 @@ from backend.auto_trader import (
     parse_datetime,
     is_synthetic_trade,
     resolve_robot_stop_reason,
+    STALE_PENDING_LAST_TRADE_SECONDS,
     record_removed_trade,
     removed_trades_in_window,
     set_display_score,
@@ -760,10 +761,14 @@ UNAVAILABLE_ASSET_COOLDOWN_SECONDS = 60
 # A escada abaixo tira o par teimoso da roda em 2-3 tentativas em vez de 89,
 # sem punir o par que recusou uma vez por acaso: o 1º degrau continua sendo a
 # mesma vela M1 de antes.
-UNAVAILABLE_ASSET_COOLDOWN_LADDER_SECONDS = (60, 300, 900, 3600)
+UNAVAILABLE_ASSET_COOLDOWN_LADDER_SECONDS = (60, 300, 900, 3600, 10800, 21600)
 # Sem NOVA recusa por este tempo, o par recomeça do primeiro degrau. Evita que
-# uma recusa isolada de manhã pese numa recusa isolada à tarde.
-UNAVAILABLE_ASSET_STRIKE_DECAY_SECONDS = 1800
+# uma recusa isolada de manhã pese numa recusa isolada à tarde. Precisa ser
+# maior que o último degrau: com 30 min, o par morto (EURJPY-OTC, 0 aceitas em
+# 143 tentativas em 29–30/09) voltava ao degrau de 60 s 14 vezes por dia.
+UNAVAILABLE_ASSET_STRIKE_DECAY_SECONDS = 25200
+# A partir desta recusa seguida (em qualquer conta) o par sai para TODAS.
+UNAVAILABLE_ASSET_GLOBAL_BLOCK_STRIKES = 2
 PAYOUT_COOLDOWN_SECONDS = 15
 # Revalidação do canal turbo/binary na hora da compra. O sinal fica travado a
 # vela inteira antes de entrar (M1: ~40-55s), então o cache de payout já pode
@@ -1668,6 +1673,73 @@ def store_shared_market_cache(
         cache_key,
         ttl_seconds,
     )
+    prune_market_caches()
+
+
+# A chave de velas leva o `endtime` da vela: cada minuto cria chaves novas por
+# ativo, e entrada vencida nunca era apagada — nem aqui nem nas duas cópias
+# (`responses` e `last_successful_responses`) de CADA usuário. Era o vazamento
+# de ~290 MB/h do robot-runtime que levou o host a matar processos por falta
+# de memória (27/09 e 30/09). Payout (chave fixa por ativo) fica: é a reserva
+# do MARKET_DATA_STALE_FALLBACK e não cresce.
+MARKET_CACHE_PRUNE_INTERVAL_SECONDS = 60.0
+MARKET_CACHE_KEEP_EXPIRED_SECONDS = 600
+_market_cache_last_prune = 0.0
+
+
+def _chave_de_vela(cache_key: str) -> bool:
+    return "endtime=" in cache_key
+
+
+def prune_market_caches(*, force: bool = False) -> int:
+    """Apaga do cache de mercado as velas vencidas há mais de 10 minutos.
+
+    Roda no máximo uma vez por minuto (a gravação no cache é o gatilho).
+
+    Args:
+        force: Ignora o intervalo mínimo (relatório de memória e testes).
+
+    Returns:
+        Quantas entradas foram removidas.
+    """
+    global _market_cache_last_prune
+    agora_mono = monotonic()
+    if not force and agora_mono - _market_cache_last_prune < MARKET_CACHE_PRUNE_INTERVAL_SECONDS:
+        return 0
+    _market_cache_last_prune = agora_mono
+    limite = utc_now() - timedelta(seconds=MARKET_CACHE_KEEP_EXPIRED_SECONDS)
+    removidas = 0
+    for chave in [c for c, e in _shared_market_cache.items() if _chave_de_vela(c) and e.expires_at < limite]:
+        del _shared_market_cache[chave]
+        removidas += 1
+    for chave in [
+        c
+        for c, trava in _shared_market_locks.items()
+        if _chave_de_vela(c) and c not in _shared_market_cache and not trava.locked()
+    ]:
+        del _shared_market_locks[chave]
+    for cache in list(session_response_cache.values()):
+        for mapa in (cache.responses, cache.last_successful_responses):
+            for chave in [c for c, e in mapa.items() if _chave_de_vela(c) and e.expires_at < limite]:
+                del mapa[chave]
+                removidas += 1
+        for chave in [c for c, t in cache.last_request_at.items() if _chave_de_vela(c) and t < limite]:
+            del cache.last_request_at[chave]
+    if removidas:
+        logger.info("[MARKET_CACHE_PRUNED] removidas=%s", removidas)
+    return removidas
+
+
+def market_cache_sizes() -> dict[str, int]:
+    """Tamanho dos caches que cresciam sem limite (relatório de memória)."""
+    return {
+        "shared": len(_shared_market_cache),
+        "locks": len(_shared_market_locks),
+        "por_usuario": sum(
+            len(c.responses) + len(c.last_successful_responses) for c in session_response_cache.values()
+        ),
+        "usuarios": len(session_response_cache),
+    }
 
 
 def seed_user_cache_from_shared(
@@ -2487,7 +2559,81 @@ def register_unavailable_asset_strike(symbol: str) -> int:
     else:
         strikes = 1
     _unavailable_asset_strikes[normalized] = (strikes, now)
+    if strikes >= UNAVAILABLE_ASSET_GLOBAL_BLOCK_STRIKES:
+        logger.warning(
+            "[ASSET_BLOCKED_ALL_ACCOUNTS] symbol=%s recusas=%s segundos=%s",
+            normalized,
+            strikes,
+            unavailable_asset_cooldown_seconds(strikes),
+        )
     return strikes
+
+
+# Ativo cuja corretora devolve velas velhas: fora para todas as contas.
+CANDLES_STALE_BLOCK_SECONDS = 1800
+_ativos_com_velas_velhas: dict[str, datetime] = {}
+
+
+def candles_stale_age(candles: Any, interval: int, endtime: int | None = None) -> float | None:
+    """Idade (s) da última vela, se ela é velha demais para analisar; senão None.
+
+    Em 29–30/09 a corretora devolvia para o EURJPY-OTC (ativo morto) velas de
+    JUNHO DE 2025. O robô analisava a série congelada e tirava CALL com
+    confiança 100 em 137 de 137 sinais — e ia comprar um par que a corretora
+    recusa sempre.
+    """
+    if not isinstance(candles, list) or not candles:
+        return None
+    ultima = candles[-1]
+    try:
+        inicio = float(ultima.get("from") or ultima.get("at") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if inicio <= 0:
+        return None
+    if inicio > 1e12:  # milissegundos/nanossegundos
+        inicio = inicio / 1000 if inicio < 1e15 else inicio / 1e9
+    referencia = float(endtime) if endtime else utc_now().timestamp()
+    idade = referencia - inicio
+    return idade if idade > max(3 * int(interval), 300) else None
+
+
+def marcar_ativo_com_velas_velhas(symbol: str, idade: float) -> None:
+    normalized = normalize_binary_active(symbol)
+    if not normalized:
+        return
+    ja_marcado = _ativos_com_velas_velhas.get(normalized)
+    _ativos_com_velas_velhas[normalized] = utc_now() + timedelta(seconds=CANDLES_STALE_BLOCK_SECONDS)
+    if ja_marcado is None or ja_marcado <= utc_now():
+        logger.warning(
+            "[ASSET_CANDLES_STALE] symbol=%s idade_horas=%.1f — fora para todas as contas por %s min",
+            normalized,
+            idade / 3600,
+            CANDLES_STALE_BLOCK_SECONDS // 60,
+        )
+
+
+def global_asset_block_remaining(symbol: str) -> float | None:
+    """Segundos em que o par fica fora para todas as contas, ou ``None``.
+
+    A corretora recusa o par morto para todo mundo (29–30/09: EURJPY-OTC, 0
+    aceitas em 143 tentativas de 21 contas). Com o cooldown só por conta, cada
+    uma perdia uma vela por hora aprendendo sozinha. A partir da 2ª recusa
+    seguida, o degrau da escada vale para todas; quando ele acaba, a primeira
+    conta que tentar é a sonda — recusa sobe o degrau, ordem aceita zera
+    (``clear_unavailable_asset_strikes``).
+    """
+    velhas_ate = _ativos_com_velas_velhas.get(normalize_binary_active(symbol))
+    if velhas_ate is not None and velhas_ate > utc_now():
+        return (velhas_ate - utc_now()).total_seconds()
+    registro = _unavailable_asset_strikes.get(normalize_binary_active(symbol))
+    if registro is None:
+        return None
+    strikes, quando = registro
+    if strikes < UNAVAILABLE_ASSET_GLOBAL_BLOCK_STRIKES:
+        return None
+    restante = unavailable_asset_cooldown_seconds(strikes) - (utc_now() - quando).total_seconds()
+    return restante if restante > 0 else None
 
 
 def clear_unavailable_asset_strikes(symbol: str) -> None:
@@ -2794,8 +2940,10 @@ def log_ignored_disconnect(user_id: str, path: str, payload: dict[str, Any]) -> 
     payload = normalize_service_payload(payload)
     if not is_session_disconnected(payload):
         return
+    # O nome antigo ([DISCONNECT_IGNORED_NON_SESSION_ERROR]) dizia o contrário
+    # do que acontece: esta linha sai justamente quando a sessão NÃO existe.
     logger.warning(
-        "[DISCONNECT_IGNORED_NON_SESSION_ERROR] user_id=%s path=%s error=%s",
+        "[BULLEX_SESSION_MISSING] user_id=%s path=%s error=%s",
         user_id,
         path,
         payload.get("error"),
@@ -2875,7 +3023,13 @@ def set_named_cooldown(
 
 
 def active_cooldown_remaining(user_id: str, symbol: str) -> float | None:
-    return get_named_cooldown(active_cooldowns, user_id, normalize_binary_active(symbol))
+    por_conta = get_named_cooldown(active_cooldowns, user_id, normalize_binary_active(symbol))
+    global_ = global_asset_block_remaining(symbol)
+    if por_conta is None:
+        return global_
+    if global_ is None:
+        return por_conta
+    return max(por_conta, global_)
 
 
 def payout_cooldown_remaining(user_id: str, symbol: str) -> float | None:
@@ -4593,6 +4747,13 @@ def is_bullex_order_path(method: str, path: str) -> bool:
     return method == "POST" and path in {"/orders/buy-real", "/orders/buy-demo"}
 
 
+
+# Conexão ociosa é largada ANTES dos 5 s do uvicorn do bullex-service: com o
+# mesmo prazo nos dois lados, o runtime reaproveitava a conexão no instante em
+# que o servidor a fechava (RemoteProtocolError; 30/09, 8 leituras perdidas —
+# e numa ordem POST isso não se repete sozinho).
+BULLEX_HTTP_KEEPALIVE_EXPIRY_SECONDS = 3.0
+
 def get_bullex_http_client() -> httpx.AsyncClient:
     """
     Retorna o client HTTP keep-alive para o bullex-service.
@@ -4611,6 +4772,7 @@ def get_bullex_http_client() -> httpx.AsyncClient:
             limits=httpx.Limits(
                 max_connections=BULLEX_HTTP_MAX_CONNECTIONS,
                 max_keepalive_connections=BULLEX_HTTP_MAX_CONNECTIONS,
+                keepalive_expiry=BULLEX_HTTP_KEEPALIVE_EXPIRY_SECONDS,
             ),
         )
     return _bullex_http_client
@@ -4641,6 +4803,7 @@ def get_bullex_order_http_client() -> httpx.AsyncClient:
         limits=httpx.Limits(
             max_connections=BULLEX_ORDER_HTTP_MAX_CONNECTIONS,
             max_keepalive_connections=BULLEX_ORDER_HTTP_MAX_CONNECTIONS,
+            keepalive_expiry=BULLEX_HTTP_KEEPALIVE_EXPIRY_SECONDS,
         ),
     )
     return _bullex_order_http_client
@@ -9868,6 +10031,11 @@ def rehydrate_score_from_persistence_if_blank(user_id: str) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
+    dia_salvo = payload.get("score_day")
+    if dia_salvo and dia_salvo != brasilia_today().isoformat():
+        # Placar salvo é de outro dia (o runtime não gravou nada hoje): exibir
+        # isso como placar de hoje foi o 2x0 de 28/09 no painel de 29/09.
+        return False
     persisted_wins = int(payload.get("wins") or 0)
     persisted_losses = int(payload.get("losses") or 0)
     try:
@@ -10278,12 +10446,14 @@ async def confirm_rsi_before_entry(
             timeout=timeout_seconds,
         )
         candles = extract_candles(payload) if status_code < 400 and payload.get("ok") else []
-    except Exception:
+    except Exception as erro:
+        # Falha fechada e esperada (sessão ocupada, timeout de 1,2 s): não opera
+        # e segue. Sem traceback — era ruído no alerta de erros.
         logger.warning(
-            "[RSI_ENTRY_CONFIRM_ERRO] user_id=%s symbol=%s acao=NAO_OPERA",
+            "[RSI_ENTRY_CONFIRM_ERRO] user_id=%s symbol=%s acao=NAO_OPERA tipo=%s",
             user_id,
             symbol,
-            exc_info=True,
+            type(erro).__name__,
         )
         return "RSI_CONFIRMACAO_SEM_DADOS"
     closes = closes_of_closed_candles(
@@ -10841,6 +11011,44 @@ async def submit_bullex_order(
     )
 
 
+ORDER_TIME_OVER_MARKER = "time for purchasing options is over"
+
+
+def expected_order_failure(reason: Any) -> str | None:
+    """Motivo curto se a recusa é condição esperada da corretora; senão None.
+
+    Recusa esperada já é tratada (cooldown, parar por saldo, reconectar) e não
+    precisa de ninguém olhando: sai em WARNING, sem traceback. Em 29–30/09 elas
+    eram ~300 ERRORs por dia e escondiam o erro de verdade no alerta.
+    """
+    texto = str(reason or "")
+    if is_order_availability_error(texto):
+        return "ativo_indisponivel"
+    if is_insufficient_funds_error(texto):
+        return "saldo_insuficiente"
+    if ORDER_TIME_OVER_MARKER in texto.lower():
+        return "tempo_de_compra_esgotado"
+    if texto.strip().upper() in {"SESSION_DISCONNECTED", "SESSION_NOT_FOUND"}:
+        return "sessao_caiu"
+    return None
+
+
+def log_order_send_failure(user_id: str, symbol: str, reason: Any, *, exc_info: bool = False) -> None:
+    motivo = expected_order_failure(reason)
+    if motivo is not None:
+        logger.warning(
+            "[ORDER_SEND_REFUSED] user_id=%s active=%s motivo=%s error=%s", user_id, symbol, motivo, reason
+        )
+        return
+    logger.error("[ORDER_SEND_FAILED] user_id=%s active=%s error=%s", user_id, symbol, reason, exc_info=exc_info)
+
+
+def log_order_rejected(user_id: str, reason: Any, last_order_error: Any) -> None:
+    nivel = logger.warning if expected_order_failure(reason) is not None else logger.error
+    nivel("[ORDER_REJECTED] user_id=%s reason=%s last_order_error=%s", user_id, reason, last_order_error)
+ORDER_TIME_OVER_RETRY_DELAY_SECONDS = 0.4
+
+
 async def submit_order_with_digital_fallback(
     user_id: str,
     endpoint: str,
@@ -10874,6 +11082,16 @@ async def submit_order_with_digital_fallback(
     if payload.get("ok"):
         return status, payload
     motivo = str(payload.get("error") or "")
+    if ORDER_TIME_OVER_MARKER in motivo.lower():
+        # Corrida na virada da vela: a biblioteca escolhe a expiração com o
+        # relógio local e a corretora já fechou aquela. A ordem NÃO foi criada,
+        # então repetir uma vez é seguro — e ainda cai na janela de entrada.
+        logger.warning("[ORDER_TIME_OVER_RETRY] user_id=%s active=%s", user_id, symbol)
+        await asyncio.sleep(ORDER_TIME_OVER_RETRY_DELAY_SECONDS)
+        status, payload = await submit_bullex_order(user_id, endpoint, body)
+        if payload.get("ok"):
+            return status, payload
+        motivo = str(payload.get("error") or "")
     if not DIGITAL_FALLBACK_ENABLED or str(symbol).upper().endswith("-OTC"):
         return status, payload
     if not is_order_availability_error(motivo):
@@ -11115,6 +11333,13 @@ def _trade_for_mirror(user_id: str, trade: dict[str, Any] | None) -> dict[str, A
     if trade.get("score_removed") or is_deleted_order(user_id, order_id):
         return None
     resultado = str(trade.get("result") or "").strip().upper()
+    if resultado in {"", "PENDING_RESULT"}:
+        enviada = parse_datetime(trade.get("sent_at") or trade.get("opened_at"))
+        if enviada is not None and (utc_now() - enviada).total_seconds() > STALE_PENDING_LAST_TRADE_SECONDS:
+            logger.warning(
+                "[TRADE_MIRROR_STALE_PENDING_BLOCKED] user_id=%s order_id=%s", user_id, order_id
+            )
+            return None
     if resultado in {"", "PENDING_RESULT"} and auto_trader.is_order_completed(user_id, order_id):
         logger.warning(
             "[TRADE_MIRROR_DOWNGRADE_BLOCKED] user_id=%s order_id=%s",
@@ -11123,6 +11348,44 @@ def _trade_for_mirror(user_id: str, trade: dict[str, Any] | None) -> dict[str, A
         )
         return None
     return trade
+
+
+PRESERVAR_PLACAR_DO_BANCO = "_preservar_placar_do_banco"
+CAMPOS_DO_PLACAR = (
+    "wins",
+    "losses",
+    "profit",
+    "stop_offset_wins",
+    "stop_offset_losses",
+    "stop_offset_profit",
+    "removed_trades",
+    "score_day",
+)
+
+
+def _com_placar_do_banco(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Troca os campos de placar do payload pelos do banco (roda na thread de gravação)."""
+    try:
+        no_banco = robot_persistence.load_state(user_id)
+    except Exception:
+        logger.warning("[SCORE_PRESERVE_READ_FAILED] user_id=%s", user_id, exc_info=True)
+        return payload
+    if not isinstance(no_banco, dict):
+        return payload
+    preservado = dict(payload)
+    for campo in CAMPOS_DO_PLACAR:
+        if campo in no_banco:
+            preservado[campo] = no_banco[campo]
+    if _parse_session_score_from_mapping(preservado) != _parse_session_score_from_mapping(payload):
+        logger.warning(
+            "[SCORE_PERSIST_KEPT_DB] user_id=%s gateway=%sx%s banco=%sx%s",
+            user_id,
+            payload.get("wins"),
+            payload.get("losses"),
+            preservado.get("wins"),
+            preservado.get("losses"),
+        )
+    return preservado
 
 
 def _protect_session_score_on_persist(
@@ -11177,8 +11440,14 @@ def _protect_session_score_on_persist(
         )
         return payload, last_trade
     if not isinstance(remote, dict) or not isinstance(remote.get("data"), dict):
-        return payload, last_trade
+        # Sem snapshot do runtime o gateway não sabe o placar atual: a memória
+        # dele pode ser do boot (29/09, 9f6af6f2: gravou 4x2 do boot por cima
+        # do 5x3 real). Quem muda placar é o runtime (ou baixa intencional, que
+        # retornou acima): a gravação preserva o placar que está no banco.
+        return {**payload, PRESERVAR_PLACAR_DO_BANCO: True}, last_trade
     live_data = remote["data"]
+    if live_data.get("score_day"):
+        payload = {**payload, "score_day": live_data["score_day"]}
     local = _parse_session_score_from_mapping(payload)
     live = _parse_session_score_from_mapping(live_data)
     if adopt_new_day_score_on_gateway(user_id, live_data):
@@ -11247,6 +11516,10 @@ def persist_robot(user_id: str) -> Future | None:
             }
         )
         last_trade = state.last_trade
+        if robot_runtime_mode() == "worker":
+            # Dia a que o placar gravado pertence (lido pela reidratação do gateway).
+            dia = _ultimo_dia_do_placar.get(user_id)
+            state_payload["score_day"] = dia.isoformat() if dia is not None else None
         # Em modo external o placar não é do gateway: nunca gravar o atraso
         # dele por cima do placar vivo (ver docs/PLACAR_DIAGNOSTICO_2026-09-15).
         state_payload, last_trade = _protect_session_score_on_persist(
@@ -11273,6 +11546,8 @@ def persist_robot(user_id: str) -> Future | None:
 
     def _write_to_supabase(payload: dict[str, Any], trade: dict[str, Any] | None) -> None:
         with _get_robot_persist_lock(user_id):
+            if payload.pop(PRESERVAR_PLACAR_DO_BANCO, False):
+                payload = _com_placar_do_banco(user_id, payload)
             try:
                 robot_persistence.save_state(user_id, payload)
             except Exception:
@@ -11434,10 +11709,12 @@ async def load_candles_for_active(
         cached_candles = exact_cached_candles_for_active(user_id, symbol, timeframe, endtime=endtime)
     else:
         cached_candles = cached_candles_for_active(user_id, symbol, timeframe)
+    interval = TIMEFRAME_SECONDS[timeframe]
     if cached_candles:
+        if candles_stale_age(cached_candles, interval, endtime) is not None:
+            return None, True, "CANDLES_STALE"
         return cached_candles, True, None
 
-    interval = TIMEFRAME_SECONDS[timeframe]
     candle_params: dict[str, Any] = {
         "active": symbol,
         "interval": interval,
@@ -11471,6 +11748,10 @@ async def load_candles_for_active(
     log_ignored_disconnect(user_id, "/candles", payload)
     if payload.get("ok"):
         candles = extract_candles(payload)
+        idade = candles_stale_age(candles, interval, endtime)
+        if idade is not None:
+            marcar_ativo_com_velas_velhas(symbol, idade)
+            return None, False, "CANDLES_STALE"
         return candles, False, None
 
     if is_session_disconnected(payload):
@@ -12036,6 +12317,16 @@ async def scan_local_signals(
         results.append(result)
         advance_analysis_asset_cursor(user_id, market_mode=resolved_mode)
         robot_worker_last_tick_at[user_id] = utc_now()
+        if result[1] == 409 and is_session_disconnected(result[2]):
+            # Sem sessão na corretora todo ativo seguinte devolve o mesmo 409:
+            # continuar só gastava 10-32 chamadas por ciclo (30/09, 174 linhas).
+            logger.warning(
+                "[ANALYSIS_STOPPED_SESSION_LOST] user_id=%s symbol=%s restantes=%s",
+                user_id,
+                symbol,
+                len(analysis_assets) - index - 1,
+            )
+            break
         if (
             ANALYSIS_EARLY_STOP_ENABLED
             and not timeframe_scans_full_market(timeframe)
@@ -13237,7 +13528,45 @@ def result_display_expired(state: Any) -> bool:
     return utc_now() >= state.result_display_until
 
 
-def waiting_result_stale(state: Any) -> bool:
+def marcar_timeout_no_espelho(user_id: str, order_id: Any) -> bool:
+    """Fecha como TIMEOUT, no espelho, uma ordem que já não é o ``last_trade``.
+
+    ``timeout_trade`` só mexe no ``last_trade``; se o robô já tinha aberto outra
+    ordem, ele devolvia False calado e a linha ficava PENDENTE para sempre — fora
+    do Histórico, do placar e do stop, e invisível para a recuperação de órfãs
+    depois da virada do dia (29/09, ordem 14307723702, R$15). Aqui a linha é
+    fechada como TIMEOUT e o caso vai para o log em ERROR: o dinheiro da ordem
+    é real e alguém precisa conferir o resultado na corretora.
+
+    Returns:
+        True se a linha do espelho foi fechada.
+    """
+    alvo = str(order_id or "").strip()
+    try:
+        linhas = robot_persistence.load_trades(user_id) or []
+    except Exception:
+        logger.warning("[TIMEOUT_MIRROR_READ_FAILED] user_id=%s order_id=%s", user_id, alvo, exc_info=True)
+        return False
+    for linha in linhas:
+        if str(linha.get("order_id") or "").strip() != alvo:
+            continue
+        if str(linha.get("result") or "").upper() != "PENDING_RESULT":
+            return False
+        fechada = {**linha, "result": "TIMEOUT", "finished_at": utc_now().isoformat()}
+        robot_persistence.save_trade(user_id, fechada)
+        logger.error(
+            "[ORDER_RESULT_UNKNOWN] user_id=%s order_id=%s ativo=%s valor=%s "
+            "— resultado não chegou da corretora; conferir e lançar no Histórico",
+            user_id,
+            alvo,
+            linha.get("active"),
+            linha.get("amount"),
+        )
+        return True
+    return False
+
+
+def waiting_result_stale(state: Any, user_id: str | None = None) -> bool:
     """Detecta 'Operação aberta' fantasma que trava o ciclo do robô.
 
     Antes, ``operation_in_progress=True`` fazia esta função retornar sempre
@@ -13274,7 +13603,19 @@ def waiting_result_stale(state: Any) -> bool:
     if base is None:
         order_id = str(trade.get("order_id") or "").strip()
         return sticky and operation_open and not order_id
-    return (utc_now() - base).total_seconds() > max_wait_seconds
+    esperando = (utc_now() - base).total_seconds()
+    if esperando <= max_wait_seconds:
+        return False
+    # O monitor daquela ordem ainda está vivo (resultado atrasado, ou a corretora
+    # sendo consultada depois de uma queda do websocket): reciclar agora abria
+    # outra ordem e o resultado da primeira se perdia (29/09, ordem 14307723702).
+    # Teto para nunca travar o robô se o monitor emperrar.
+    order_id = str(trade.get("order_id") or "").strip()
+    user_id = str(user_id or "").strip()
+    teto = max(600, cycle_minutes * 60 + 300)
+    if order_id and user_id and esperando <= teto and trade_result_monitor.is_monitoring(user_id, order_id):
+        return False
+    return True
 
 
 async def reconcile_timeout_last_trade(user_id: str) -> bool:
@@ -13645,6 +13986,8 @@ async def timeout_monitored_trade(user_id: str, order_id: str) -> None:
 
     async with auto_trader.lock(user_id):
         timed_out, state = auto_trader.timeout_trade(user_id, order_id)
+        if not timed_out:
+            marcar_timeout_no_espelho(user_id, order_id)
         if timed_out and state.last_trade:
             # TIMEOUT fica FORA do Histórico de propósito: o resultado é
             # desconhecido (build_trade_history_item recusa). Tentar gravar só
@@ -13673,7 +14016,7 @@ async def execute_robot_cycle(
 ) -> tuple[int, dict[str, Any]]:
     async with auto_trader.cycle_lock(user_id):
         state = recover_sync_timeout_if_needed(user_id)
-        if result_display_expired(state) or waiting_result_stale(state):
+        if result_display_expired(state) or waiting_result_stale(state, user_id):
             state = reset_cycle_after_result(user_id)
         initial_stop_reason = daily_stop_reason(user_id, state) or robot_stop_reason(state)
         if initial_stop_reason in {STATUS_STOP_WIN_HIT, STATUS_STOP_LOSS_HIT}:
@@ -14769,8 +15112,11 @@ async def execute_robot_cycle(
                     is_gale_order,
                 )
                 try:
+                    # Registrado ANTES do envio: não é ordem aceita (essa é o
+                    # [ORDER_SEND_SUCCESS]). O nome antigo, [ORDER_SENT], enganava
+                    # quem contava ordens pelo log.
                     logger.info(
-                        "[ORDER_SENT] user_id=%s asset=%s direction=%s amount=%s",
+                        "[ORDER_SUBMITTING] user_id=%s asset=%s direction=%s amount=%s",
                         user_id,
                         symbol,
                         direction,
@@ -14789,7 +15135,7 @@ async def execute_robot_cycle(
                     last_order_status = 502
                     last_order_reason = reason
                     last_friendly_error = friendly_error
-                    logger.exception("[ORDER_SEND_FAILED] user_id=%s active=%s error=%s", user_id, symbol, reason)
+                    log_order_send_failure(user_id, symbol, reason, exc_info=True)
                     if is_insufficient_funds_error(reason):
                         state = await stop_real_robot_for_insufficient_balance(
                             user_id,
@@ -14797,7 +15143,7 @@ async def execute_robot_cycle(
                             entry_value=float(order_amount) if order_amount is not None else None,
                             message=friendly_error,
                         )
-                        logger.error(
+                        logger.warning(
                             "[ORDER_REJECTED_INSUFFICIENT_FUNDS] user_id=%s reason=%s",
                             user_id,
                             reason,
@@ -14822,12 +15168,7 @@ async def execute_robot_cycle(
                         reason,
                         last_order_error=friendly_error,
                     )
-                    logger.error(
-                        "[ORDER_REJECTED] user_id=%s reason=%s last_order_error=%s",
-                        user_id,
-                        reason,
-                        friendly_error,
-                    )
+                    log_order_rejected(user_id, reason, friendly_error)
                     logger.info(
                         "[NEXT_CYCLE_SCHEDULED] user_id=%s next_cycle_at=%s",
                         user_id,
@@ -14845,7 +15186,7 @@ async def execute_robot_cycle(
                     last_order_status = order_status
                     last_order_reason = reason
                     last_friendly_error = friendly_error
-                    logger.error("[ORDER_SEND_FAILED] user_id=%s active=%s error=%s", user_id, symbol, reason)
+                    log_order_send_failure(user_id, symbol, reason)
                     if is_insufficient_funds_error(reason):
                         state = await stop_real_robot_for_insufficient_balance(
                             user_id,
@@ -14853,7 +15194,7 @@ async def execute_robot_cycle(
                             entry_value=float(order_amount) if order_amount is not None else None,
                             message=friendly_error,
                         )
-                        logger.error(
+                        logger.warning(
                             "[ORDER_REJECTED_INSUFFICIENT_FUNDS] user_id=%s reason=%s",
                             user_id,
                             reason,
@@ -14878,12 +15219,7 @@ async def execute_robot_cycle(
                         reason,
                         last_order_error=friendly_error,
                     )
-                    logger.error(
-                        "[ORDER_REJECTED] user_id=%s reason=%s last_order_error=%s",
-                        user_id,
-                        reason,
-                        friendly_error,
-                    )
+                    log_order_rejected(user_id, reason, friendly_error)
                     logger.info(
                         "[NEXT_CYCLE_SCHEDULED] user_id=%s next_cycle_at=%s",
                         user_id,
@@ -15198,12 +15534,7 @@ async def execute_robot_cycle(
                 last_order_reason,
                 last_order_error=final_error,
             )
-            logger.error(
-                "[ORDER_REJECTED] user_id=%s reason=%s last_order_error=%s",
-                user_id,
-                last_order_reason,
-                final_error,
-            )
+            log_order_rejected(user_id, last_order_reason, final_error)
             logger.info(
                 "[NEXT_CYCLE_SCHEDULED] user_id=%s next_cycle_at=%s",
                 user_id,
@@ -15314,7 +15645,7 @@ async def robot_worker(user_id: str) -> None:
             logger.info("[WORKER_HEARTBEAT] user_id=%s", user_id)
             logger.info("[ROBOT_RUNNING] user_id=%s", user_id)
             state = auto_trader.get(user_id)
-            if result_display_expired(state) or waiting_result_stale(state):
+            if result_display_expired(state) or waiting_result_stale(state, user_id):
                 state = reset_cycle_after_result(user_id)
             result_waiting = bool(
                 state.operation_in_progress

@@ -22,6 +22,27 @@ from typing import Any
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+_DESCONEXAO_DO_CLIENTE = {"ClientDisconnected", "ConnectionClosed", "ConnectionClosedOK", "ConnectionClosedError"}
+
+
+def cliente_desconectou(exc: BaseException) -> bool:
+    """True se a exceção só diz que o painel já fechou a conexão.
+
+    A cadeia real (30/09) foi websockets ``ConnectionClosedOK`` → uvicorn
+    ``ClientDisconnected`` → starlette ``WebSocketDisconnect``; o starlette
+    também levanta ``RuntimeError`` ao enviar depois do close.
+    """
+    atual: BaseException | None = exc
+    while atual is not None:
+        if isinstance(atual, WebSocketDisconnect):
+            return True
+        if _DESCONEXAO_DO_CLIENTE & {classe.__name__ for classe in type(atual).__mro__}:
+            return True
+        if isinstance(atual, RuntimeError) and "close message has been sent" in str(atual):
+            return True
+        atual = atual.__cause__ or atual.__context__
+    return False
+
 logger = logging.getLogger("backend-gateway")
 
 WS_TICKET_TTL_SECONDS = 60.0
@@ -146,12 +167,17 @@ class RobotStateWsHub:
         for client in clients:
             try:
                 await client.websocket.send_json(payload)
-            except Exception:
-                logger.warning(
-                    "[ROBOT_WS_SEND_FAILED] user_id=%s",
-                    user_id,
-                    exc_info=True,
-                )
+            except Exception as exc:
+                if cliente_desconectou(exc):
+                    # Painel fechado no meio do envio (código 1000): corrida
+                    # normal, não erro. Só tira a conexão morta da lista.
+                    logger.info("[ROBOT_WS_CLIENT_GONE] user_id=%s tipo=%s", user_id, type(exc).__name__)
+                else:
+                    logger.warning(
+                        "[ROBOT_WS_SEND_FAILED] user_id=%s",
+                        user_id,
+                        exc_info=True,
+                    )
                 dead.append(client.websocket)
         for websocket in dead:
             await self.unregister(user_id, websocket)

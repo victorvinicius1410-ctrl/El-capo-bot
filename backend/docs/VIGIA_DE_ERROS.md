@@ -22,11 +22,28 @@ O staging (`*-staging`, `elcapo2`) fica fora; `--staging` inclui.
 
 ## O padrão para código novo
 
-Para um erro aparecer no e-mail **não precisa configurar nada**: basta
-`logger.error(...)`, uma exceção com `exc_info=True`, ou uma marca terminada em
-`_FAILED` (`logger.warning("[PAGAMENTO_FAILED] ...")`). O gateway roda em nível
-WARNING — `logger.info` nunca chega ao log dele (ver memória "logs INFO invisíveis").
+Para um erro aparecer **não precisa configurar nada**:
+`logger.error(...)` ou uma exceção sem tratamento vira **e-mail na hora**; uma marca
+terminada em `_FAILED` em WARNING (`logger.warning("[PAGAMENTO_FAILED] ...")`) é
+falha já tratada e entra no **resumo diário** (e no alerta de volume). O gateway roda
+em nível WARNING — `logger.info` nunca chega ao log dele (ver memória "logs INFO invisíveis").
 Nunca engolir exceção num `except` mudo: isso é erro que o vigia não vê.
+
+## Dois níveis (30/09/2026)
+
+Em 26 h o vigia mandou ~30 e-mails, 2/3 de condição esperada. Agora:
+
+- **E-mail na hora** (nível `imediato`): exceção inesperada (pilha sem WARNING na linha de cima), linha
+  ERROR/CRITICAL, 5xx, saúde (container, API, memória < 20%, morte por falta de memória do kernel,
+  disco), vigia sem conseguir ler log.
+- **Só no resumo diário** (nível `resumo`): marca de falha tratada em WARNING (`*_FAILED`, `*_REFUSED`,
+  `*_STALE`, `ALL_ACCOUNTS`), pilha pendurada num WARNING, e a lista `ESPERADO` do script (queda de
+  websocket da corretora etc., cada padrão com o motivo).
+- **Alerta de volume**: qualquer assinatura, mesmo esperada, com ≥ 60 ocorrências na hora vira e-mail
+  (1x a cada 24 h) — esperado demais também é problema.
+
+Regra para quem escreve código: **ERROR é para o que precisa de alguém olhar**. Condição da corretora já
+tratada (cooldown, reconexão, parar por saldo) é WARNING com marca própria e sem traceback.
 
 ## Como avisa
 

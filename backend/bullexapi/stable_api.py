@@ -646,16 +646,19 @@ class Bullex:
                 self.api.getcandles(
                     OP_code.ACTIVES[ACTIVES], interval, count, endtime)
                 wait_started_at = time.time()
-                while self.check_connect and self.api.candles.candles_data == None:
+                while self.check_connect() and self.api.candles.candles_data == None:
                     if time.time() - wait_started_at > 5:
                         break
                     time.sleep(0.05)
                 if self.api.candles.candles_data != None:
                     break
-            except:
-                logging.error('**error** get_candles need reconnect')
-                self.connect()
-                time.sleep(0.2)
+            except Exception:
+                # Quem reconecta é o gerenciador de sessão do bullex-service
+                # (por SSID). O self.connect() daqui fazia login por SENHA, que
+                # sessão restaurada por token não tem — falhava calado e a
+                # leitura seguia no socket morto.
+                logging.error('**error** get_candles falhou; sessao sera reconectada pelo gerenciador')
+                raise
 
         return self.api.candles.candles_data
 
@@ -1686,7 +1689,7 @@ class Bullex:
 
         start = time.time()
         while self.api.digital_payout is None:
-            if seconds and int(time.time() - start) > seconds:
+            if seconds and time.time() - start >= seconds:
                 break
             time.sleep(0.05)
 

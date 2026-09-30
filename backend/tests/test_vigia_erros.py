@@ -120,3 +120,67 @@ class AvisoTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+PILHA_WS_30_09 = """[ROBOT_WS_SEND_FAILED] user_id=fd184155-0000-4000-8000-000000000000
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/websockets/legacy/protocol.py", line 930, in ensure_open
+    raise self.connection_closed_exc()
+websockets.exceptions.ConnectionClosedOK: received 1000 (OK); then sent 1000 (OK)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/websockets/websockets_impl.py", line 345, in asgi_send
+    raise ClientDisconnected from exc
+uvicorn.protocols.utils.ClientDisconnected
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/backend/robot_state_ws.py", line 148, in send_to_user
+    await client.websocket.send_json(payload)
+  File "/usr/local/lib/python3.11/site-packages/starlette/websockets.py", line 89, in send
+    raise WebSocketDisconnect(code=1006)
+starlette.websockets.WebSocketDisconnect
+INFO:     172.18.0.1:5 - "GET /robot/state HTTP/1.1" 200 OK"""
+
+
+class NivelTests(unittest.TestCase):
+    def _eventos(self, texto: str, origem: str = "robot-runtime") -> list[dict]:
+        eventos: dict = {}
+        V.analisar_linhas(origem, texto.splitlines(), eventos)
+        return list(eventos.values())
+
+    def test_pilha_encadeada_vira_um_evento_com_tipo_e_onde(self) -> None:
+        (ev,) = self._eventos(PILHA_WS_30_09, "backend-gateway")
+        self.assertIn("WebSocketDisconnect em robot_state_ws.py:send_to_user", ev["assinatura"])
+        self.assertIn("ROBOT_WS_SEND_FAILED", ev["assinatura"])
+
+    def test_pilha_de_warning_vai_para_o_resumo(self) -> None:
+        texto = TRACEBACK.replace("WARNING [RSI", "WARNING [RSI")
+        (ev,) = self._eventos(texto)
+        self.assertEqual(ev["nivel"], "resumo")
+        (ev,) = self._eventos(texto.replace(" WARNING ", " ERROR "))
+        self.assertEqual(ev["nivel"], "imediato")
+
+    def test_erro_esperado_da_corretora_vai_para_o_resumo(self) -> None:
+        (ev,) = self._eventos("ERROR:bullexapi.ws.client:Connection to remote host was lost.", "bullex-service")
+        self.assertEqual(ev["nivel"], "resumo")
+        (ev,) = self._eventos("2026-09-30 10:00:00,1 ERROR [ORDER_SEND_FAILED] user_id=x error=ORDER_ID_MISSING")
+        self.assertEqual(ev["nivel"], "imediato")
+
+    def test_recusa_esperada_entra_so_no_resumo(self) -> None:
+        (ev,) = self._eventos("2026-09-30 10:00:00,1 WARNING [ORDER_SEND_REFUSED] user_id=x motivo=ativo_indisponivel")
+        self.assertEqual(ev["nivel"], "resumo")
+
+    def test_resumo_nao_manda_email_na_hora_mas_volume_manda(self) -> None:
+        estado: dict = {}
+        agora = datetime.datetime(2026, 9, 30, 12, tzinfo=datetime.timezone.utc)
+        esperado = {"k": {"chave": "k", "assinatura": "a", "origem": "o", "tipo": "t", "amostra": "x",
+                          "vezes": 10, "nivel": "resumo"}}
+        self.assertEqual(V.registrar(estado, dict(esperado), agora), [])
+        esperado["k"]["vezes"] = 60
+        (alerta,) = V.registrar(estado, dict(esperado), agora)
+        self.assertTrue(alerta["volume"])
+        self.assertIn("70 vezes nesta hora", alerta["assinatura"])
+

@@ -100,6 +100,11 @@ class TradeResultMonitor:
         logger.info("[ORDER_RESULT_MONITOR_STARTED] user_id=%s order_id=%s", user_id, normalized_order_id)
         return True
 
+    def is_monitoring(self, user_id: str, order_id: Any) -> bool:
+        """True se esta ordem ainda tem um monitor de resultado vivo."""
+        task = self._tasks.get(self._task_key(user_id, str(order_id or "")))
+        return task is not None and not task.done()
+
     async def shutdown(self) -> None:
         tasks = list(self._tasks.values())
         self._tasks.clear()

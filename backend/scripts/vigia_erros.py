@@ -73,10 +73,26 @@ FUSO_BRASILIA = datetime.timezone(datetime.timedelta(hours=-3))
 # o dono pediu todo erro. Só entra aqui o que for comprovadamente ruído.
 IGNORAR: list[tuple[str, str]] = []
 
+# Erro ESPERADO: é contado e aparece no resumo diário (e no alerta de volume),
+# mas não gera e-mail na hora. Cada padrão com o motivo.
+ESPERADO: list[tuple[str, str]] = [
+    (r"Connection to remote host was lost", "queda do websocket da corretora; a sessão reconecta sozinha"),
+    (r"ping/pong timed out", "queda do websocket da corretora; a sessão reconecta sozinha"),
+    (r"get_all_init_v2 late", "corretora lenta no catálogo; o cache anterior segue valendo"),
+    (r"get_candles falhou; sessao sera reconectada", "queda da sessão; o gerenciador reconecta"),
+    (r"\[BALANCES_FETCH_FAILED\]", "saldo não lido na queda da sessão; tenta de novo no próximo ciclo"),
+]
+# Acima disto por hora, a mesma assinatura vira alerta de volume (mesmo esperada).
+VOLUME_ALERTA_POR_HORA = 60
+
 RE_NIVEL = re.compile(r"(^|[\s:])(ERROR|CRITICAL|FATAL)([\s:]|$)|level=(error|fatal|critical)", re.I)
-RE_MARCA = re.compile(r"\[([A-Z0-9_]*(?:FAILED|ERROR|EXCEPTION|CRASH)[A-Z0-9_]*)\]")
+RE_WARNING = re.compile(r"(^|[\s:])WARNING([\s:]|$)")
+RE_MARCA = re.compile(r"\[([A-Z0-9_]*(?:FAILED|ERROR|EXCEPTION|CRASH|REFUSED|STALE|ALL_ACCOUNTS)[A-Z0-9_]*)\]")
 RE_HTTP_5XX = re.compile(r'"(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD) (\S+) HTTP/[\d.]+" (5\d\d)')
-RE_FIM_EXC = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Timeout|Cancelled\w*))(?::\s?(.*))?$")
+# Última linha de uma pilha: "Nome.Da.Excecao: mensagem" ou só o nome. Só vale
+# logo depois de uma linha indentada — senão "INFO: ..." viraria exceção.
+RE_FIM_EXC = re.compile(r"^([A-Za-z_][\w.]*)(?::\s?(.*))?$")
+NIVEIS_DE_LOG = {"INFO", "WARNING", "ERROR", "DEBUG", "CRITICAL"}
 RE_FRAME = re.compile(r'File "(/app/[^"]+|/w/[^"]+)", line \d+, in (\S+)')
 
 
@@ -97,14 +113,30 @@ def _ignorado(texto: str) -> bool:
     return any(re.search(padrao, texto) for padrao, _motivo in IGNORAR)
 
 
-def _novo_evento(eventos: dict, assinatura: str, origem: str, tipo: str, amostra: str) -> None:
+def _esperado(texto: str) -> bool:
+    return any(re.search(padrao, texto) for padrao, _motivo in ESPERADO)
+
+
+def _novo_evento(
+    eventos: dict, assinatura: str, origem: str, tipo: str, amostra: str, nivel: str = "imediato"
+) -> None:
     chave = hashlib.sha1(assinatura.encode()).hexdigest()[:16]
     item = eventos.setdefault(
         chave,
         {"chave": chave, "assinatura": assinatura, "origem": origem, "tipo": tipo,
-         "amostra": amostra[:3000], "vezes": 0},
+         "amostra": amostra[:3000], "vezes": 0, "nivel": nivel},
     )
     item["vezes"] += 1
+
+
+def _fim_de_excecao(linha: str, anterior: str) -> str | None:
+    """Nome da exceção se ``linha`` é o fim de uma pilha; senão None."""
+    if not anterior.startswith((" ", "\t")) or linha.startswith((" ", "\t")):
+        return None
+    achou = RE_FIM_EXC.match(linha.strip())
+    if not achou or achou.group(1).upper() in NIVEIS_DE_LOG:
+        return None
+    return achou.group(1)
 
 
 def analisar_linhas(origem: str, linhas: list[str], eventos: dict) -> None:
@@ -123,7 +155,6 @@ def analisar_linhas(origem: str, linhas: list[str], eventos: dict) -> None:
             j = i + 1
             while j < len(linhas):
                 prox = linhas[j]
-                exc = RE_FIM_EXC.match(prox)
                 if prox.startswith((" ", "\t")) or prox.strip() == "" or prox.startswith(
                     ("Traceback", "During handling", "The above exception")
                 ):
@@ -133,8 +164,9 @@ def analisar_linhas(origem: str, linhas: list[str], eventos: dict) -> None:
                     bloco.append(prox)
                     j += 1
                     continue
-                if exc:
-                    fim = exc.group(1)
+                nome = _fim_de_excecao(prox, linhas[j - 1])
+                if nome:
+                    fim = nome.rsplit(".", 1)[-1]
                     bloco.append(prox)
                     j += 1
                     continue
@@ -143,20 +175,28 @@ def analisar_linhas(origem: str, linhas: list[str], eventos: dict) -> None:
             assinatura = f"{origem} | exceção {fim or '?'} em {frame or '?'}"
             if marca:
                 assinatura += f" | {marca.group(1)}"
-            _novo_evento(eventos, assinatura, origem, "exceção", "\n".join(([contexto] if contexto else []) + bloco[-40:]))
+            # Pilha pendurada num WARNING é falha já tratada (logger.warning com
+            # exc_info): vai para o resumo. Sem nível ou em ERROR: e-mail na hora.
+            nivel = "resumo" if RE_WARNING.search(contexto[:60]) or _esperado(contexto) else "imediato"
+            _novo_evento(eventos, assinatura, origem, "exceção",
+                         "\n".join(([contexto] if contexto else []) + bloco[-40:]), nivel)
             i = j
             continue
+        cabecalho_de_pilha = i + 1 < len(linhas) and linhas[i + 1].startswith("Traceback (most recent call last)")
         http = RE_HTTP_5XX.search(linha)
-        if http:
+        if cabecalho_de_pilha:
+            pass  # a própria pilha vira o evento, com esta linha como contexto
+        elif http:
             caminho = normalizar(http.group(2).split("?")[0])
             _novo_evento(eventos, f"{origem} | HTTP {http.group(3)} {http.group(1)} {caminho}", origem, "http 5xx", linha)
         elif RE_NIVEL.search(linha) and "INFO" not in linha[:40]:
-            _novo_evento(eventos, f"{origem} | {normalizar(linha)}", origem, "erro no log", linha)
+            nivel = "resumo" if _esperado(linha) else "imediato"
+            _novo_evento(eventos, f"{origem} | {normalizar(linha)}", origem, "erro no log", linha, nivel)
         else:
             marca = RE_MARCA.search(linha)
             if marca:
                 resto = normalizar(linha[marca.end():])[:90]
-                _novo_evento(eventos, f"{origem} | [{marca.group(1)}] {resto}", origem, "falha registrada", linha)
+                _novo_evento(eventos, f"{origem} | [{marca.group(1)}] {resto}", origem, "falha registrada", linha, "resumo")
         if linha.strip():
             contexto = linha
         i += 1
@@ -345,6 +385,10 @@ def coletar(estado: dict, incluir_staging: bool) -> tuple[dict, list[str]]:
     return eventos, avisos
 
 
+def _pode_avisar(ultimo: str | None, agora: datetime.datetime) -> bool:
+    return not ultimo or agora - datetime.datetime.fromisoformat(ultimo) >= datetime.timedelta(hours=REAVISO_HORAS)
+
+
 def registrar(estado: dict, eventos: dict, agora: datetime.datetime) -> list[dict]:
     """Soma contagens por hora e devolve os eventos que merecem e-mail agora."""
     assinaturas = estado.setdefault("assinaturas", {})
@@ -358,10 +402,16 @@ def registrar(estado: dict, eventos: dict, agora: datetime.datetime) -> list[dic
         )
         reg["ultima"] = agora.isoformat()
         reg["amostra"] = item["amostra"]
+        reg["nivel"] = item.get("nivel", "imediato")
         reg["horas"][hora] = reg["horas"].get(hora, 0) + item["vezes"]
-        avisado = reg.get("avisado")
-        if not avisado or agora - datetime.datetime.fromisoformat(avisado) >= datetime.timedelta(hours=REAVISO_HORAS):
+        if reg["nivel"] == "imediato" and _pode_avisar(reg.get("avisado"), agora):
             novos.append(item)
+        # Volume anormal vale para qualquer nível: esperado demais também é problema
+        # (ex.: 300 recusas de um par por hora é par morto, não acaso).
+        na_hora = reg["horas"][hora]
+        if na_hora >= VOLUME_ALERTA_POR_HORA and _pode_avisar(reg.get("volume_avisado"), agora):
+            novos.append({**item, "volume": True, "tipo": "volume",
+                          "assinatura": f"{na_hora} vezes nesta hora: {item['assinatura']}"})
     for reg in assinaturas.values():
         reg["horas"] = {h: n for h, n in reg["horas"].items() if h >= corte}
     for chave in [c for c, r in assinaturas.items() if not r["horas"]]:
@@ -404,8 +454,17 @@ def email_resumo(estado: dict, agora: datetime.datetime) -> tuple[str, str] | No
     corpo = [f"Resumo de erros das últimas 24h — {brt}", ""]
     if not linhas:
         corpo.append("Nenhum erro registrado. 👍")
-    for vezes, reg in linhas[:80]:
-        corpo.append(f"{vezes:>6}x  [{reg['tipo']}] {reg['assinatura']}")
+    grupos = (
+        ("imediato", "Precisam de atenção (já avisados na hora):"),
+        ("resumo", "Esperados e já tratados (só para acompanhar o volume):"),
+    )
+    for nivel, titulo in grupos:
+        do_grupo = [(v, r) for v, r in linhas if r.get("nivel", "imediato") == nivel]
+        if not do_grupo:
+            continue
+        corpo += ["", titulo]
+        for vezes, reg in do_grupo[:60]:
+            corpo.append(f"{vezes:>6}x  [{reg['tipo']}] {reg['assinatura']}")
     return f"[El Capo] resumo diário: {total} erro(s) em {len(linhas)} tipo(s)", "\n".join(corpo)
 
 
@@ -455,7 +514,8 @@ def main() -> int:
                 estado["resumo_enviado"] = hoje
             else:
                 for item in novos:
-                    estado["assinaturas"][item["chave"]]["avisado"] = agora.isoformat()
+                    campo = "volume_avisado" if item.get("volume") else "avisado"
+                    estado["assinaturas"][item["chave"]][campo] = agora.isoformat()
         except Exception as erro:  # noqa: BLE001
             # Não marca como avisado: a próxima rodada tenta de novo.
             print(f"[VIGIA] falha no e-mail: {erro!r}")

@@ -155,6 +155,28 @@ def auditar(
         "executed_at": f"gte.{corte}",
         "order": "executed_at.asc",
     })
+    # Órfã não some na virada do dia: em 29/09 uma ordem de R$15 ficou PENDENTE
+    # e saiu do relatório à meia-noite sem ninguém resolver. Pendentes de até 3
+    # dias entram na conta.
+    ids_de_hoje = {(l["user_id"], str(l["order_id"])) for l in espelhos}
+    antigas = _listar(base, chave, "robot_trades", {
+        "select": "user_id,order_id,result,executed_at,created_at,trade_json",
+        "result": "eq.PENDING_RESULT",
+        "executed_at": f"gte.{(inicio_do_dia - datetime.timedelta(days=3)).isoformat()}",
+        "order": "executed_at.asc",
+    })
+    antigas = [l for l in antigas if (l["user_id"], str(l["order_id"])) not in ids_de_hoje]
+    espelhos += antigas
+    # Pendente antiga pode ter o resultado no Histórico de OUTRO dia: busca por id.
+    historico_antigo: list[dict] = []
+    ids_antigos = sorted({str(l["order_id"]) for l in antigas})
+    for inicio in range(0, len(ids_antigos), 50):
+        lote = ",".join(ids_antigos[inicio:inicio + 50])
+        historico_antigo += _listar(base, chave, "robot_trade_history", {
+            "select": "user_id,order_id,parent_order_id,result,cycle_result,final_result,profit,finished_at",
+            "order_id": f"in.({lote})",
+            "order": "id.asc",
+        })
 
     pernas_superadas = {
         str(linha.get("parent_order_id") or "").strip()
@@ -187,7 +209,7 @@ def auditar(
 
     finais = {
         (l["user_id"], str(l["order_id"])): l
-        for l in historico
+        for l in historico + historico_antigo
         if str(l.get("result") or "").upper() in {"WIN", "LOSS", "DRAW"}
     }
     ultima_no_historico: dict[str, float] = {}

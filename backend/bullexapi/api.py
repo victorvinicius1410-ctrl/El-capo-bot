@@ -390,9 +390,15 @@ class BullexAPI(object):  # pylint: disable=too-many-instance-attributes
                 raise TimeoutError("websocket_send_lock_timeout")
             time.sleep(0.01)
         global_value.ssl_Mutual_exclusion_write = True
-        self.websocket.send(data)
-        logger.debug(data)
-        global_value.ssl_Mutual_exclusion_write = False
+        try:
+            self.websocket.send(data)
+            logger.debug(data)
+        finally:
+            # Sem o finally, um send com o socket já caído deixava a trava presa
+            # e todo envio seguinte da sessão esperava 5 s e falhava com
+            # websocket_send_lock_timeout (30/09: /account e /sessions/status em
+            # timeout e 503 no sync-connection até a sessão ser recriada).
+            global_value.ssl_Mutual_exclusion_write = False
 
     @property
     def logout(self):

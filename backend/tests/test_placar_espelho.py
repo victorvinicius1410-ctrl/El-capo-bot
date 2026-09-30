@@ -471,3 +471,60 @@ class OrfaJaFinalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class GatewaySemSnapshotTests(unittest.TestCase):
+    """29/09: sem snapshot do runtime, o gateway gravou o 4x2 do boot por cima do 5x3."""
+
+    def setUp(self) -> None:
+        self.user = "9f6af6f2-0000-4000-8000-000000000001"
+        main.auto_trader._states.pop(self.user, None)
+
+    def test_sem_snapshot_a_gravacao_preserva_o_placar_do_banco(self) -> None:
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 4, 2, 6.9
+        banco = {"wins": 5, "losses": 3, "profit": 6.1, "stop_offset_wins": 0, "score_day": "2026-09-29"}
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(main.robot_bus, "get_snapshot", return_value=None),
+            patch.object(main, "get_session_score_authority", return_value=None),
+            patch.object(main.robot_persistence, "load_state", return_value=banco),
+            patch.object(main.robot_persistence, "save_state") as gravar,
+            patch.object(main.robot_persistence, "save_settings"),
+        ):
+            futuro = main.persist_robot(self.user)
+            if futuro is not None:
+                futuro.result(timeout=5)
+        gravado = gravar.call_args.args[1]
+        self.assertEqual((gravado["wins"], gravado["losses"], gravado["profit"]), (5, 3, 6.1))
+        self.assertNotIn(main.PRESERVAR_PLACAR_DO_BANCO, gravado)
+
+    def test_baixa_intencional_sem_snapshot_grava_o_valor_baixo(self) -> None:
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(main.robot_bus, "get_snapshot", return_value=None),
+            patch.object(main, "get_session_score_authority", return_value=(0, 0, 0.0)),
+        ):
+            payload, _ = main._protect_session_score_on_persist(self.user, {"wins": 0, "losses": 0, "profit": 0.0}, None)
+        self.assertNotIn(main.PRESERVAR_PLACAR_DO_BANCO, payload)
+
+    def test_reidratacao_ignora_placar_salvo_de_outro_dia(self) -> None:
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 0, 0, 0.0
+        ontem = {"wins": 2, "losses": 0, "profit": 170.0, "score_day": "2020-01-01"}
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(main.robot_bus, "get_snapshot", return_value=None),
+            patch.object(main.robot_persistence, "load_state", return_value=ontem),
+        ):
+            main.rehydrate_score_from_persistence_if_blank(self.user)
+        self.assertEqual((estado.wins, estado.losses), (0, 0))
+        # Controle: o mesmo placar salvo HOJE é reidratado.
+        hoje = {**ontem, "score_day": main.brasilia_today().isoformat()}
+        with (
+            patch.object(main, "robot_runtime_mode", return_value="external"),
+            patch.object(main.robot_bus, "get_snapshot", return_value=None),
+            patch.object(main.robot_persistence, "load_state", return_value=hoje),
+        ):
+            main.rehydrate_score_from_persistence_if_blank(self.user)
+        self.assertEqual((estado.wins, estado.losses), (2, 0))
+

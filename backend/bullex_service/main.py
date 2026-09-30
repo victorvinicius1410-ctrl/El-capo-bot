@@ -113,7 +113,11 @@ BINARY_ALLOWED_ASSETS = [
 ]
 BINARY_ALLOWED_ASSET_SET = set(BINARY_ALLOWED_ASSETS)
 SESSION_EXCEPTION_TYPES = (WebSocketConnectionClosedException, ConnectionError, TimeoutError)
+# Erros que não significam conexão caída: não derrubam a sessão do cliente.
+NON_SESSION_EXCEPTION_TYPES = (KeyError, ValueError, TypeError, IndexError, ZeroDivisionError)
 SESSION_STATUS_TTL_SECONDS = 20
+CACHE_PRUNE_INTERVAL_SECONDS = 60.0
+CACHE_KEEP_EXPIRED_SECONDS = 600
 ACCOUNT_TTL_SECONDS = 45
 # Tempo máximo na fila do lock global para probes/market data sob carga.
 CALL_GATE_TIMEOUT_SECONDS = 2.5
@@ -358,6 +362,7 @@ class SessionManager:
         # N usuários gerem N chamadas upstream redundantes disputando o
         # _call_gate (ver [CALL_GATE_TIMEOUT] em PERFORMANCE_SISTEMA.md).
         self._market_data_cache: dict[str, CachedProbe] = {}
+        self._ultima_poda = 0.0
         self._market_data_cache_lock = Lock()
         self._login_progress: dict[str, LoginProgress] = {}
         self._instruments_cache: dict[str, InstrumentsCacheState] = {}
@@ -397,7 +402,21 @@ class SessionManager:
     def upsert(self, session: ManagedSession) -> ManagedSession:
         self.sessions[session.user_id] = session
         self.websockets[session.user_id] = getattr(session.client, "api", session.client)
+        self._reset_offline_state(session.user_id)
         return session
+
+    def _reset_offline_state(self, user_id: str) -> None:
+        """Sessão instalada: o veredito "offline" de antes não vale mais.
+
+        O painel consultava sem sessão e gravava ``offline_until = agora+60s``;
+        o cliente clicava Iniciar, a sessão voltava, mas nada zerava a marca e
+        o 1º ciclo recebia 404 SESSION_NOT_FOUND falso em todos os ativos
+        (30/09: 12 contas, ~60 s perdidos depois de cada Iniciar/reconexão).
+        """
+        probe = self.get_probe_state(user_id)
+        probe.failure_count = 0
+        probe.next_retry_at = 0.0
+        probe.offline_until = 0.0
 
     def remove(self, user_id: str) -> None:
         self.sessions.pop(user_id, None)
@@ -408,6 +427,8 @@ class SessionManager:
         probe = self.get_probe_state(user_id)
         probe.responses.clear()
         probe.last_request_at.clear()
+        if self.sessions.get(user_id) is not None:
+            self._reset_offline_state(user_id)
 
     def clear_user_runtime_cache(self, user_id: str) -> None:
         probe = self.get_probe_state(user_id)
@@ -477,6 +498,39 @@ class SessionManager:
             payload=payload,
             expires_at=time.time() + ttl_seconds,
         )
+        self.podar_caches()
+
+    def podar_caches(self, *, force: bool = False) -> int:
+        """Apaga respostas de mercado vencidas há mais de 10 minutos.
+
+        A chave de velas leva o ``endtime`` da vela: cada minuto criava chaves
+        novas por ativo e por usuário, e entrada vencida nunca saía. O serviço
+        crescia ~115 MB/h até o kernel matá-lo por falta de memória (30/09
+        05:30, 8,9 GB — e as sessões de todos os clientes caíram junto). Nada lê
+        entrada vencida há mais de 2 min (``STALE_MARKET_DATA_SECONDS``).
+
+        Returns:
+            Quantas entradas saíram.
+        """
+        agora = time.time()
+        if not force and agora - self._ultima_poda < CACHE_PRUNE_INTERVAL_SECONDS:
+            return 0
+        self._ultima_poda = agora
+        limite = agora - CACHE_KEEP_EXPIRED_SECONDS
+        removidas = 0
+        with self._market_data_cache_lock:
+            for chave in [c for c, e in self._market_data_cache.items() if e.expires_at < limite]:
+                del self._market_data_cache[chave]
+                removidas += 1
+        for estado in list(self._probe_cache.values()):
+            for chave in [c for c, e in list(estado.responses.items()) if e.expires_at < limite]:
+                estado.responses.pop(chave, None)
+                removidas += 1
+            for chave in [c for c, t in list(estado.last_request_at.items()) if t < limite]:
+                estado.last_request_at.pop(chave, None)
+        if removidas:
+            logger.info("[CACHE_PRUNED] removidas=%s", removidas)
+        return removidas
 
     def _throttled_probe(self, user_id: str, cache_key: str, *, path: str) -> tuple[int, dict[str, Any]] | None:
         if path != "/sessions/status":
@@ -574,6 +628,9 @@ class SessionManager:
         logger.debug("[CACHE_MISS] user_id=%s path=%s", user_id, path)
         if path == "/sessions/status":
             logger.debug("[SESSION_STATUS_CACHE_MISS] %s %s", user_id, path)
+        if probe.offline_until > now and self.sessions.get(user_id) is not None:
+            # Marca velha de antes da sessão voltar: não responde 404 falso.
+            self._reset_offline_state(user_id)
         if probe.offline_until > now:
             logger.warning("[SESSION_CHECK_SKIPPED] %s %s reason=offline", user_id, path)
             logger.warning("[USER_OFFLINE_SKIPPED] %s %s", user_id, path)
@@ -637,6 +694,7 @@ class SessionManager:
                 payload=payload,
                 expires_at=time.time() + ttl_seconds,
             )
+        self.podar_caches()
 
     def get_last_probe(self, user_id: str, cache_key: str) -> tuple[int, dict[str, Any]] | None:
         cached = self.get_probe_state(user_id).responses.get(cache_key)
@@ -867,7 +925,26 @@ class SessionManager:
                 if disconnect_on_error:
                     self._mark_disconnected(user_id, type(exc).__name__)
                 raise ServiceError(SESSION_DISCONNECTED, 409) from exc
+            except NON_SESSION_EXCEPTION_TYPES as exc:
+                # Erro de dado/programação (ex.: KeyError de ativo fora da
+                # tabela) não quer dizer que a conexão caiu: derrubar a sessão
+                # aqui obrigava o cliente a reconectar à toa (30/09, EURGBP).
+                logger.error(
+                    "[SESSION_OPERATION_ERROR] user_id=%s tipo=%s detalhe=%s",
+                    user_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
+                raise ServiceError(type(exc).__name__, 503) from exc
             except Exception as exc:
+                logger.error(
+                    "[SESSION_OPERATION_FAILED] user_id=%s tipo=%s detalhe=%s",
+                    user_id,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
                 if disconnect_on_error:
                     self._mark_disconnected(user_id, type(exc).__name__)
                 raise ServiceError(type(exc).__name__, 503) from exc
@@ -1001,8 +1078,10 @@ class SessionManager:
                 logger.info("[CONNECT_SUCCESS] user_id=%s", user_id)
                 return session
             except Exception as exc:
-                logger.warning(
-                    "[CONNECT_FAILED_HANDLED] user_id=%s detail=%s",
+                # A rota /connect registra a falha em [CONNECT_FAILED_HANDLED];
+                # aqui era a mesma linha de novo (cada falha contava 2x).
+                logger.info(
+                    "[CONNECT_ATTEMPT_FAILED] user_id=%s detail=%s",
                     user_id,
                     getattr(exc, "message", None) or type(exc).__name__,
                 )
@@ -1187,6 +1266,7 @@ class SessionManager:
                         timeout_seconds=LOGIN_TIMEOUT_SECONDS,
                     )
                 self._finalize_connect(new_session, ok, connect_reason, user_id=user_id, attempt=attempt)
+                herdar_resultados(old_client, new_session.client, user_id=user_id)
                 self.upsert(new_session)
                 self._persist_connected(new_session)
                 logger.info("[SESSION-RECONNECT-OK] %s restored_ssid=true", user_id)
@@ -1204,6 +1284,7 @@ class SessionManager:
                     timeout_seconds=LOGIN_TIMEOUT_SECONDS,
                 )
             self._finalize_connect(new_session, ok, connect_reason, user_id=user_id, attempt=attempt)
+            herdar_resultados(old_client, new_session.client, user_id=user_id)
             self.upsert(new_session)
             self._persist_connected(new_session)
             logger.info("[SESSION-RECONNECT-OK] %s restored_ssid=false", user_id)
@@ -1324,7 +1405,7 @@ class SessionManager:
         return self.store.persistence_debug()
 
     def _mark_disconnected(self, user_id: str, reason: str) -> None:
-        logger.warning("[SESSION-DISCONNECTED] %s", user_id)
+        logger.warning("[SESSION-DISCONNECTED] %s reason=%s", user_id, reason)
         session = self.get(user_id)
         if session is not None:
             try:
@@ -2466,14 +2547,96 @@ def read_digital_payout(client: Bullex, active: str) -> int | float | None:
         payout = getter(active, seconds=3)
     except SESSION_EXCEPTION_TYPES:
         raise
-    except Exception:
-        logger.exception("falha ao consultar payout digital de %s", active)
-        raise ServiceError(SESSION_DISCONNECTED, 409)
+    except Exception as exc:
+        # Erro de dado (ex.: ativo fora da tabela) não é sessão caída: devolver
+        # SESSION_DISCONNECTED aqui fazia o robô tratar o cliente como offline.
+        logger.warning(
+            "[DIGITAL_PAYOUT_READ_FAILED] active=%s tipo=%s detalhe=%s",
+            active,
+            type(exc).__name__,
+            exc,
+        )
+        return None
     return payout if payout else None
+
+
+def read_open_or_otc_payout(
+    client: Bullex,
+    profit_map: dict[str, dict[str, float]],
+    symbol: str,
+    open_turbo: bool | None,
+    open_binary: bool | None,
+) -> int | float | None:
+    """Payout do ativo: par aberto vai direto ao turbo/binário.
+
+    Par de mercado aberto não tem canal digital: ``get_digital_payout`` esperava
+    3 s (4 s reais) e voltava vazio em TODA consulta — 2.370 chamadas de ~4010 ms
+    desde 29/09. Com a sessão serial, 2–3 payouts na fila estouravam os 7,5 s do
+    robô (131 timeouts em 26 h) e atrasavam velas e confirmação de RSI. OTC segue
+    pelo digital primeiro, como antes.
+    """
+    if not normalize_binary_active(symbol).endswith("-OTC"):
+        return _payout_turbo_binary(profit_map, symbol, open_turbo, open_binary)
+    return read_digital_payout(client, symbol) or _payout_turbo_binary(
+        profit_map, symbol, open_turbo, open_binary
+    )
 
 
 _binary_open_cache: dict[str, tuple[float, dict[str, dict[str, bool]]]] = {}
 _binary_open_cache_lock = Lock()
+
+
+def register_broker_active(name: str, active_id: Any) -> bool:
+    """Põe na tabela da biblioteca um ativo que a corretora oferece e ela não conhece.
+
+    A tabela ``bullexapi/constants.py`` é fixa e não tinha ``EURGBP-op``: a compra
+    fazia ``OP_code.ACTIVES["EURGBP-op"]``, estourava ``KeyError`` e o tratamento
+    genérico derrubava a sessão do cliente (30/09: 4 vezes; 0 de 8 tentativas de
+    EURGBP aberto aceitas desde 28/09). O ``get_all_init_v2`` que já lemos a cada
+    minuto traz nome e id de cada ativo — é a fonte certa.
+
+    Args:
+        name: Nome na corretora (``EURGBP-op``).
+        active_id: Id do ativo (chave do dicionário ``actives``).
+
+    Returns:
+        True se o ativo foi acrescentado agora.
+    """
+    if not name or name in OP_code.ACTIVES:
+        return False
+    try:
+        OP_code.ACTIVES[name] = int(active_id)
+    except (TypeError, ValueError):
+        return False
+    logger.warning("[BROKER_ACTIVE_REGISTERED] name=%s id=%s", name, active_id)
+    return True
+
+
+def ensure_asset_in_broker_table(active: str, *, user_id: str) -> str:
+    """Recusa, antes da compra, ativo que a biblioteca não sabe comprar.
+
+    Sem id na tabela a biblioteca estoura KeyError dentro do buy. Recusar aqui
+    como "indisponível" põe o par no cooldown normal do robô, em vez de derrubar
+    a sessão do cliente.
+
+    Returns:
+        Nome do ativo na corretora.
+
+    Raises:
+        ServiceError: 409 "asset is not available" quando falta na tabela.
+    """
+    broker_active = to_broker_active(active)
+    if broker_active not in OP_code.ACTIVES:
+        logger.warning(
+            "[REAL BUY BLOCKED reason=ASSET_NOT_IN_BROKER_TABLE] user_id=%s active=%s broker=%s",
+            user_id,
+            active,
+            broker_active,
+        )
+        raise ServiceError(
+            f"asset is not available at the moment ({broker_active} not in broker table)", 409
+        )
+    return broker_active
 
 
 def parse_binary_open_map(init_result: Any) -> dict[str, dict[str, bool]]:
@@ -2501,11 +2664,12 @@ def parse_binary_open_map(init_result: Any) -> dict[str, dict[str, bool]]:
         actives = section.get("actives")
         if not isinstance(actives, dict):
             continue
-        for active in actives.values():
+        for active_id, active in actives.items():
             if not isinstance(active, dict):
                 continue
             raw_name = str(active.get("name") or "")
             name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
+            register_broker_active(name, active_id)
             # Indexado pelo NOSSO nome: assim TODA consulta existente
             # (`/payouts`, portao da compra, resolve_channel_open) volta a
             # encontrar o par aberto sem precisar mudar cada uma delas.
@@ -3312,8 +3476,7 @@ def get_payouts(active: str | None = None, x_user_id: str | None = Header(defaul
                 {
                     "symbol": symbol,
                     "payout": (
-                        read_digital_payout(session.client, symbol)
-                        or _payout_turbo_binary(profit_map, symbol, open_turbo, open_binary)
+                        read_open_or_otc_payout(session.client, profit_map, symbol, open_turbo, open_binary)
                         if active
                         else None
                     ),
@@ -3452,6 +3615,7 @@ def buy_real(payload: BuyOrderRequest, x_user_id: str | None = Header(default=No
             mark_binary_option_closed(user_id, payload.active, payload.expiration)
             raise ServiceError(reason, 409)
 
+        ensure_asset_in_broker_table(payload.active, user_id=user_id)
         ok, order_id = place_buy()
         if not ok and is_user_balance_not_found_error(order_id):
             # Profile cacheado costuma devolver balance_id REAL obsoleto; o saldo
@@ -3498,6 +3662,7 @@ def buy_real(payload: BuyOrderRequest, x_user_id: str | None = Header(default=No
                 mark_binary_option_closed(user_id, payload.active, payload.expiration)
             logger.warning("[REAL BUY BLOCKED reason=%s] user_id=%s", reason, user_id)
             raise ServiceError(reason, 409)
+        registrar_ordem_enviada(order_id, payload.expiration)
         logger.info("[REAL BUY SUCCESS order_id=%s] user_id=%s", order_id, user_id)
         return {
             "mode": "REAL",
@@ -3819,6 +3984,127 @@ def digital_result(order_id: str, x_user_id: str | None = Header(default=None)) 
     return build_success(session_manager.run(user_id, operation))
 
 
+def herdar_resultados(antigo: Any, novo: Any, *, user_id: str) -> int:
+    """Copia para o cliente novo os resultados de ordem que o antigo já recebeu.
+
+    O cliente reconectado nasce com ``socket_option_closed``/``order_binary``
+    vazios: um fechamento recebido pouco antes da queda sumia junto e a ordem
+    ficava PENDENTE para sempre. Só acrescenta — nunca sobrescreve o que o
+    cliente novo já tiver.
+
+    Returns:
+        Quantos resultados foram herdados.
+    """
+    herdados = 0
+    for nome in ("socket_option_closed", "order_binary"):
+        de = getattr(getattr(antigo, "api", None), nome, None)
+        para = getattr(getattr(novo, "api", None), nome, None)
+        if not isinstance(de, dict) or not isinstance(para, dict):
+            continue
+        for chave, valor in list(de.items()):
+            if chave not in para:
+                para[chave] = valor
+                herdados += 1
+    if herdados:
+        logger.info("[SESSION_RESULTS_INHERITED] user_id=%s herdados=%s", user_id, herdados)
+    return herdados
+
+
+# Quando cada ordem deve ter fechado (monotonic), gravado na compra. O resultado
+# normalmente chega pelo websocket da sessão; se o websocket caiu e reconectou
+# antes do fechamento, esse evento se perde e o endpoint respondia PENDENTE para
+# sempre (29/09: ordem 14307723702, R$15, nunca entrou no Histórico). Passada a
+# expiração, perguntamos à corretora pela lista de opções fechadas.
+ORDER_LOOKUP_AFTER_EXPIRY_SECONDS = 15.0
+ORDER_LOOKUP_MIN_INTERVAL_SECONDS = 15.0
+ORDER_LOOKUP_TIMEOUT_SECONDS = 3.0
+ORDER_LOOKUP_LIMIT = 50
+_ordens_fecham_em: dict[int, float] = {}
+_ultima_consulta_ordem: dict[int, float] = {}
+_ordens_lock = Lock()
+
+
+def registrar_ordem_enviada(order_id: Any, expiration_minutes: Any) -> None:
+    """Anota quando a ordem deve fechar, para saber quando perguntar à corretora."""
+    try:
+        chave = int(order_id)
+        minutos = max(1, int(expiration_minutes or 1))
+    except (TypeError, ValueError):
+        return
+    with _ordens_lock:
+        _ordens_fecham_em[chave] = time.monotonic() + minutos * 60
+        if len(_ordens_fecham_em) > 5000:  # só as recentes importam
+            for antiga in sorted(_ordens_fecham_em, key=_ordens_fecham_em.get)[:1000]:
+                _ordens_fecham_em.pop(antiga, None)
+                _ultima_consulta_ordem.pop(antiga, None)
+
+
+def _pode_consultar_corretora(order_id: int) -> bool:
+    agora = time.monotonic()
+    with _ordens_lock:
+        fecha_em = _ordens_fecham_em.get(order_id)
+        # Ordem desconhecida = enviada antes deste processo subir: já é antiga.
+        if fecha_em is not None and agora < fecha_em + ORDER_LOOKUP_AFTER_EXPIRY_SECONDS:
+            return False
+        if agora - _ultima_consulta_ordem.get(order_id, 0.0) < ORDER_LOOKUP_MIN_INTERVAL_SECONDS:
+            return False
+        _ultima_consulta_ordem[order_id] = agora
+    return True
+
+
+def parse_closed_option_result(data: Any, order_id: int) -> dict[str, Any] | None:
+    """Acha a ordem na resposta ``get-options`` e converte para o nosso contrato."""
+    if not isinstance(data, dict):
+        return None
+    corpo = data.get("msg") if isinstance(data.get("msg"), dict) else data
+    for opcao in corpo.get("closed_options") or []:
+        if not isinstance(opcao, dict):
+            continue
+        ids = opcao.get("id")
+        ids = ids if isinstance(ids, list) else [ids]
+        if str(order_id) not in {str(i) for i in ids}:
+            continue
+        resultado = str(opcao.get("win") or "").strip().lower()
+        if resultado not in {"win", "loose", "equal"}:
+            return None
+        valor = float(opcao.get("amount") or 0)
+        if resultado == "equal":
+            lucro = 0.0
+        elif resultado == "loose":
+            lucro = -valor
+        else:
+            lucro = float(opcao.get("win_amount") or 0) - valor
+        return {"order_id": order_id, "result": resultado, "profit": round(lucro, 2)}
+    return None
+
+
+def lookup_order_result_at_broker(client: Any, order_id: int, *, user_id: str) -> dict[str, Any] | None:
+    """Pergunta à corretora o resultado de uma ordem já expirada.
+
+    Não usa ``get_betinfo``/``get_optioninfo_v2`` da biblioteca: eles têm laço
+    sem fim e chamam ``connect()`` por dentro, o que travaria a sessão. Aqui a
+    espera tem teto e falha vira ``None`` (o chamador segue PENDENTE).
+    """
+    api = getattr(client, "api", None)
+    pedir = getattr(api, "get_options_v2", None)
+    if api is None or not callable(pedir):
+        return None
+    api.get_options_v2_data = None
+    pedir(ORDER_LOOKUP_LIMIT, "binary,turbo")
+    limite = time.monotonic() + ORDER_LOOKUP_TIMEOUT_SECONDS
+    while getattr(api, "get_options_v2_data", None) is None and time.monotonic() < limite:
+        time.sleep(0.05)
+    achado = parse_closed_option_result(getattr(api, "get_options_v2_data", None), order_id)
+    logger.warning(
+        "[ORDER_RESULT_BROKER_LOOKUP] user_id=%s order_id=%s respondeu=%s resultado=%s",
+        user_id,
+        order_id,
+        getattr(api, "get_options_v2_data", None) is not None,
+        (achado or {}).get("result"),
+    )
+    return achado
+
+
 @app.get("/orders/{order_id}/result")
 def order_result(order_id: str, x_user_id: str | None = Header(default=None)) -> dict[str, Any]:
     user_id = require_user_id(x_user_id)
@@ -3844,6 +4130,23 @@ def order_result(order_id: str, x_user_id: str | None = Header(default=None)) ->
             digital = read_digital_result(session.client, parsed_order_id)
             if digital.get("result") != "PENDING_RESULT":
                 return digital
+            if isinstance(parsed_order_id, int) and _pode_consultar_corretora(parsed_order_id):
+                try:
+                    achado = lookup_order_result_at_broker(
+                        session.client, parsed_order_id, user_id=user_id
+                    )
+                except SESSION_EXCEPTION_TYPES:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "[ORDER_RESULT_BROKER_LOOKUP_FAILED] user_id=%s order_id=%s",
+                        user_id,
+                        parsed_order_id,
+                        exc_info=True,
+                    )
+                    achado = None
+                if achado is not None:
+                    return achado
             return {"order_id": parsed_order_id, "result": "PENDING_RESULT", "profit": None}
         message = closed_order.get("msg") if isinstance(closed_order.get("msg"), dict) else closed_order
         if not isinstance(message, dict):

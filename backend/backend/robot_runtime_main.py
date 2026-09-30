@@ -594,6 +594,59 @@ async def _snapshot_publisher(gateway: object, stop: asyncio.Event) -> None:
             continue
 
 
+MEMORY_REPORT_INTERVAL_SECONDS = 600.0
+
+
+def _rss_mb() -> float:
+    """Memória residente do processo em MB (lida de /proc/self/status)."""
+    try:
+        for linha in open("/proc/self/status", encoding="ascii"):
+            if linha.startswith("VmRSS:"):
+                return round(int(linha.split()[1]) / 1024, 1)
+    except OSError:
+        pass
+    return -1.0
+
+
+async def _memory_reporter(gateway: object, stop: asyncio.Event) -> None:
+    """A cada 10 min: poda o cache de mercado e registra memória e caches.
+
+    Em 29–30/09 o runtime cresceu ~290 MB/h até o kernel matar processos por
+    falta de memória, e não havia uma linha de log que mostrasse a curva. Com
+    ``ROBOT_TRACEMALLOC=1`` o relatório traz também as linhas que mais cresceram
+    desde o anterior (custa CPU; ligar só para investigar).
+    """
+    import tracemalloc
+
+    rastrear = os.getenv("ROBOT_TRACEMALLOC", "").strip() in {"1", "true", "yes"}
+    anterior = None
+    if rastrear:
+        tracemalloc.start(10)
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=MEMORY_REPORT_INTERVAL_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            removidas = gateway.prune_market_caches(force=True)  # type: ignore[attr-defined]
+            logger.warning(
+                "[RUNTIME_MEMORY] rss_mb=%s workers=%s podadas=%s caches=%s",
+                _rss_mb(),
+                len(getattr(gateway, "robot_tasks", {}) or {}),
+                removidas,
+                gateway.market_cache_sizes(),  # type: ignore[attr-defined]
+            )
+            if rastrear:
+                foto = tracemalloc.take_snapshot()
+                if anterior is not None:
+                    for linha in foto.compare_to(anterior, "lineno")[:10]:
+                        logger.warning("[RUNTIME_MEMORY_GROWTH] %s", linha)
+                anterior = foto
+        except Exception:
+            logger.warning("[RUNTIME_MEMORY_REPORT_FAILED]", exc_info=True)
+
+
 def _ainda_pode_fechar(trade: dict, margem_segundos: int = 180) -> bool:
     """A vela desta ordem ainda não fechou (ou fechou agora há pouco)?
 
@@ -624,7 +677,43 @@ def _ainda_pode_fechar(trade: dict, margem_segundos: int = 180) -> bool:
     return (datetime.now(timezone.utc) - expira).total_seconds() < margem_segundos
 
 
-async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
+ORPHAN_SCAN_INTERVAL_SECONDS = 300.0
+ORPHAN_GIVE_UP_MINUTES = 60
+
+
+def _idade_minutos(trade: dict) -> float | None:
+    from datetime import datetime, timezone
+
+    bruto = trade.get("sent_at") or trade.get("opened_at") or trade.get("created_at")
+    try:
+        enviada = datetime.fromisoformat(str(bruto).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if enviada.tzinfo is None:
+        enviada = enviada.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - enviada).total_seconds() / 60
+
+
+async def _reconciliar_orfas_periodicamente(gateway: object, stop: asyncio.Event) -> None:
+    """Procura órfãs a cada 5 min, não só no boot.
+
+    Em 29/09 uma ordem perdeu o resultado com o runtime no ar há horas: a
+    recuperação só rodava no boot e a linha ficou PENDENTE até sumir do
+    relatório na virada do dia.
+    """
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=ORPHAN_SCAN_INTERVAL_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await _recuperar_ordens_orfas(gateway, horas=24, periodica=True)
+        except Exception:
+            logger.warning("[ORPHAN_TRADE_PERIODIC_FAILED]", exc_info=True)
+
+
+async def _recuperar_ordens_orfas(gateway: object, horas: int = 6, *, periodica: bool = False) -> None:
     """Busca o resultado das ordens que ficaram abertas quando o processo caiu.
 
     O monitor de resultado (`TradeResultMonitor`) é um ``asyncio.Task``: deploy,
@@ -653,7 +742,7 @@ async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
     if not pendentes:
         logger.info("[ORPHAN_TRADE_SCAN] pendentes=0 janela_horas=%s", horas)
         return
-    logger.warning(
+    (logger.info if periodica else logger.warning)(
         "[ORPHAN_TRADE_SCAN] pendentes=%s janela_horas=%s", len(pendentes), horas
     )
     buscar = getattr(gateway, "fetch_trade_result", None)
@@ -662,10 +751,18 @@ async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
     if not all(callable(x) for x in (buscar, normalizar, finalizar)):
         return
     finais_por_usuario: dict[str, dict[str, dict]] = {}
+    monitor = getattr(gateway, "trade_result_monitor", None)
     for user_id, trade in pendentes:
         order_id = str(trade.get("order_id") or "").strip()
         if not order_id or not _is_valid_account_user_id(user_id):
             continue
+        if periodica:
+            # Ordem com monitor vivo ou que ainda está na vela é caso normal.
+            acompanhando = getattr(monitor, "is_monitoring", None)
+            if callable(acompanhando) and acompanhando(user_id, order_id):
+                continue
+            if _ainda_pode_fechar(trade):
+                continue
         # Linha pendente com resultado já no Histórico não é órfã: é o espelho
         # que foi regravado por cima (28/09). Fechar de novo contaria o WIN
         # duas vezes — só corrige a linha do espelho.
@@ -735,6 +832,13 @@ async def _recuperar_ordens_orfas(gateway: object, horas: int = 6) -> None:
                 order_id,
                 None if resultado is None else resultado[0],
             )
+            idade = _idade_minutos(trade)
+            if periodica and idade is not None and idade > ORPHAN_GIVE_UP_MINUTES:
+                # Nem a corretora respondeu em 1 h: fecha como TIMEOUT e avisa
+                # em ERROR (vira e-mail) para alguém conferir e lançar.
+                fechar = getattr(gateway, "marcar_timeout_no_espelho", None)
+                if callable(fechar):
+                    fechar(user_id, order_id)
             continue
         nome, lucro = resultado
         try:
@@ -866,6 +970,8 @@ async def amain() -> None:
     listener = asyncio.create_task(_cmd_listener(gateway, stop), name="robot-cmd-listener")
     publisher = asyncio.create_task(_snapshot_publisher(gateway, stop), name="robot-snapshot")
     religar = asyncio.create_task(_religar_quem_estava_ligado(gateway, stop), name="boot-resume")
+    memoria = asyncio.create_task(_memory_reporter(gateway, stop), name="memory-reporter")
+    orfas = asyncio.create_task(_reconciliar_orfas_periodicamente(gateway, stop), name="orphan-scan")
     # Denuncia no log qualquer chamada síncrona que trave o loop (ver
     # backend/loop_watchdog.py — incidente de entradas atrasadas de 10/09).
     from backend.loop_watchdog import EVENT_LOOP_WATCHDOG_ENABLED, EventLoopWatchdog
@@ -879,6 +985,8 @@ async def amain() -> None:
     listener.cancel()
     publisher.cancel()
     religar.cancel()
+    memoria.cancel()
+    orfas.cancel()
     if watchdog is not None:
         watchdog.cancel()
     await gateway.shutdown_robot_workers()

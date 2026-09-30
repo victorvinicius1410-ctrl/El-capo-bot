@@ -21,6 +21,10 @@ services:
     ports:
       - "8080:8080"
     restart: unless-stopped
+    # Rede de segurança (30/09): vazamento reinicia só este container, em vez
+    # de o kernel matar o que estiver maior com o servidor sem memória.
+    mem_limit: 2g
+    memswap_limit: 2g
     depends_on:
       - bullex-service
       - redis
@@ -43,6 +47,10 @@ services:
     volumes:
       - backend-data:/data
     restart: unless-stopped
+    # Rede de segurança (30/09): vazamento reinicia só este container, em vez
+    # de o kernel matar o que estiver maior com o servidor sem memória.
+    mem_limit: 4g
+    memswap_limit: 4g
     depends_on:
       - bullex-service
       - redis
@@ -88,6 +96,10 @@ services:
     expose:
       - "8000"
     restart: unless-stopped
+    # Rede de segurança (30/09): vazamento reinicia só este container, em vez
+    # de o kernel matar o que estiver maior com o servidor sem memória.
+    mem_limit: 4g
+    memswap_limit: 4g
 
 volumes:
   backend-data:

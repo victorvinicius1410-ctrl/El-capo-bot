@@ -391,6 +391,10 @@ def set_display_score(state: Any, wins: int, losses: int, profit: float) -> None
     state.profit = profit
 
 
+# Ordem pendente há mais que isto já fechou na corretora (M15 + folga).
+STALE_PENDING_LAST_TRADE_SECONDS = 2 * 3600
+
+
 def record_removed_trade(state: Any, trade: dict[str, Any]) -> bool:
     """Anota no livro do estado uma ordem REAL apagada no Shift+O.
 
@@ -1266,6 +1270,13 @@ class AutoTrader:
                 continue
             state.last_trade = {**last, **trade}
             return
+        # Não achou no Histórico de hoje: se a ordem é antiga, ela fechou há muito
+        # tempo e o resultado vive no Histórico/espelho, não aqui. Carregá-la como
+        # PENDENTE fazia o persist_robot regravar o espelho por cima do WIN
+        # (30/09: WIN de 28/09 do cliente 11e0b3d5 voltou a PENDENTE).
+        enviada = parse_datetime(last.get("sent_at") or last.get("opened_at"))
+        if enviada is not None and (utc_now() - enviada).total_seconds() > STALE_PENDING_LAST_TRADE_SECONDS:
+            state.last_trade = None
 
     @staticmethod
     def _recompute_score_from_history(

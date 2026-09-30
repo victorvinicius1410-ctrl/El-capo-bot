@@ -22,7 +22,7 @@ class UnavailableAssetCooldownTest(unittest.TestCase):
             gateway_main.unavailable_asset_cooldown_seconds(
                 gateway_main.register_unavailable_asset_strike("EURJPY-OTC")
             )
-            for _ in range(5)
+            for _ in range(len(gateway_main.UNAVAILABLE_ASSET_COOLDOWN_LADDER_SECONDS) + 1)
         ]
 
         # Primeiro degrau segue sendo uma vela M1 — recusa isolada não é punida.
@@ -82,6 +82,45 @@ class UnavailableAssetCooldownTest(unittest.TestCase):
             gateway_main.register_unavailable_asset_strike("EURJPY-OTC"), 2
         )
 
+
+
+class BloqueioGlobalTest(unittest.TestCase):
+    """Par morto sai para TODAS as contas a partir da 2ª recusa (29–30/09)."""
+
+    def setUp(self) -> None:
+        gateway_main._unavailable_asset_strikes.clear()
+        gateway_main.active_cooldowns.clear()
+        self.addCleanup(gateway_main._unavailable_asset_strikes.clear)
+        self.addCleanup(gateway_main.active_cooldowns.clear)
+
+    def test_recusa_isolada_nao_bloqueia_outras_contas(self) -> None:
+        gateway_main.mark_execution_channel_unavailable("conta-a", "EURJPY-OTC", "M1")
+        self.assertIsNotNone(gateway_main.active_cooldown_remaining("conta-a", "EURJPY-OTC"))
+        self.assertIsNone(gateway_main.active_cooldown_remaining("conta-b", "EURJPY-OTC"))
+
+    def test_segunda_recusa_bloqueia_todas(self) -> None:
+        gateway_main.mark_execution_channel_unavailable("conta-a", "EURJPY-OTC", "M1")
+        gateway_main.mark_execution_channel_unavailable("conta-b", "EURJPY-OTC", "M1")
+        restante = gateway_main.active_cooldown_remaining("conta-c", "EURJPY-OTC")
+        self.assertIsNotNone(restante)
+        self.assertGreater(restante, 200)  # degrau de 300 s
+        self.assertIsNone(gateway_main.active_cooldown_remaining("conta-c", "GBPUSD-OTC"))
+
+    def test_ordem_aceita_libera_todas(self) -> None:
+        for conta in ("a", "b", "c"):
+            gateway_main.mark_execution_channel_unavailable(conta, "EURJPY-OTC", "M1")
+        gateway_main.clear_unavailable_asset_strikes("EURJPY-OTC")
+        self.assertIsNone(gateway_main.active_cooldown_remaining("conta-d", "EURJPY-OTC"))
+
+    def test_fim_do_degrau_deixa_uma_sonda_tentar(self) -> None:
+        gateway_main.mark_execution_channel_unavailable("a", "EURJPY-OTC", "M1")
+        gateway_main.mark_execution_channel_unavailable("b", "EURJPY-OTC", "M1")
+        strikes, _ = gateway_main._unavailable_asset_strikes["EURJPY-OTC"]
+        gateway_main._unavailable_asset_strikes["EURJPY-OTC"] = (
+            strikes,
+            gateway_main.utc_now() - timedelta(seconds=301),
+        )
+        self.assertIsNone(gateway_main.global_asset_block_remaining("EURJPY-OTC"))
 
 if __name__ == "__main__":
     unittest.main()

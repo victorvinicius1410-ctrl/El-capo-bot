@@ -963,6 +963,11 @@ class AutoTraderCycleTests(unittest.IsolatedAsyncioTestCase):
         worker_patcher = patch.object(main, "ensure_robot_worker")
         worker_patcher.start()
         self.addCleanup(worker_patcher.stop)
+        # Recusa de par e velas velhas valem para TODAS as contas (bloqueio
+        # global): sem limpar, a recusa de um teste bloqueia o par no seguinte.
+        main._unavailable_asset_strikes.clear()
+        main._ativos_com_velas_velhas.clear()
+        main.active_cooldowns.clear()
 
     async def asyncTearDown(self) -> None:
         """Cancela qualquer worker que tenha escapado do patch de setUp."""
@@ -2563,7 +2568,7 @@ class AutoTraderCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade["order_attempts"], 2)
         self.assertTrue(trade["fallback_candidate_used"])
         monitor.assert_called_once_with(user_id, "fallback-1", trade["expires_at"])
-        self.assertIn("[ORDER_SEND_FAILED]", output)
+        self.assertIn("[ORDER_SEND_REFUSED]", output)
         self.assertIn("[ORDER_FALLBACK_NEXT_CANDIDATE]", output)
         self.assertIn("[ORDER_SEND_SUCCESS]", output)
 
@@ -2636,7 +2641,7 @@ class AutoTraderCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(data["seconds_until_next_cycle"], 0)
         self.assertLessEqual(data["seconds_until_next_cycle"], 60)
         monitor.assert_not_called()
-        self.assertIn("[ORDER_SEND_FAILED]", output)
+        self.assertIn("[ORDER_SEND_REFUSED]", output)
         self.assertIn("[ORDER_FALLBACK_NEXT_CANDIDATE]", output)
         self.assertIn("[ORDER_REJECTED]", output)
 
