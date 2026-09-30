@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -180,8 +181,8 @@ class EspelhoProtegidoTests(unittest.TestCase):
         publicar.assert_called_once_with(self.user, ["9001"])
         self.assertTrue(main.is_deleted_order(self.user, "9001"))
         self.assertTrue(estado.last_trade["score_removed"])
-        # O stop continua vendo o dinheiro real da ordem apagada.
-        self.assertEqual([t["order_id"] for t in trader._histories[self.user]], ["9001"])
+        # Some de tudo (decisão do dono, 30/09): nem o stop vê mais a ordem.
+        self.assertEqual(trader._histories[self.user], [])
         with patch.object(main, "robot_runtime_mode", return_value="worker"):
             self.assertIsNone(main._trade_for_mirror(self.user, estado.last_trade))
             # Mesmo sem a marca local (outro processo), a lápide segura.
@@ -348,65 +349,24 @@ class ViradaDoDiaTests(unittest.TestCase):
         self.assertEqual(data["score_day"], main.brasilia_today().isoformat())
 
 
-class StopDepoisDaExclusaoTests(unittest.TestCase):
-    """Loss real apagado no Shift+O some do placar, mas o stop segue contando —
-    inclusive depois de um restore (Iniciar, deploy)."""
+class ExclusaoSomeDeTudoTests(unittest.TestCase):
+    """Operação real apagada no Shift+O some de tudo: placar, stop, memória e padrões
+    (decisão do dono, 30/09)."""
 
     def setUp(self) -> None:
         self.user = "5e5e5e5e-0000-4000-8000-000000000001"
         main.auto_trader._states.pop(self.user, None)
         main.auto_trader._histories.pop(self.user, None)
+        main.auto_trader._completed_order_ids.pop(self.user, None)
 
-    def _estado_com_stop(self, trader: AutoTrader) -> object:
-        estado = trader.get(self.user)
+    def test_gateway_baixa_o_placar_real_e_o_stop_deixa_de_contar(self) -> None:
+        from backend.auto_trader import resolve_robot_stop_reason
+
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 1, 3, -215.0
         estado.stop_loss_mode = "operations"
         estado.stop_loss_operations = 3
-        estado.stop_loss = 30.0
-        return estado
-
-    def test_livro_ignora_sintetica_e_guarda_real(self) -> None:
-        from backend.auto_trader import record_removed_trade
-
-        estado = AutoTrader().get(self.user)
-        agora = utc_now().isoformat()
-        self.assertFalse(record_removed_trade(estado, {"order_id": "3f2a0c1e-uuid", "result": "LOSS", "finished_at": agora}))
-        self.assertTrue(record_removed_trade(estado, {"order_id": "9901", "result": "LOSS", "profit": -100, "finished_at": agora}))
-        self.assertTrue(record_removed_trade(estado, {"order_id": "9901", "result": "LOSS", "profit": -100, "finished_at": agora}))
-        self.assertEqual([i["order_id"] for i in estado.removed_trades], ["9901"])
-
-    def test_restore_mantem_o_loss_apagado_no_stop(self) -> None:
-        from backend.auto_trader import record_removed_trade, resolve_robot_stop_reason
-
-        base = utc_now() - timedelta(minutes=10)
-        historico = [
-            _ordem("9911", "WIN", 85.0, base),
-            _ordem("9912", "LOSS", -100.0, base + timedelta(minutes=1)),
-            _ordem("9914", "LOSS", -100.0, base + timedelta(minutes=3)),
-        ]
-        antes = AutoTrader()
-        payload_estado = self._estado_com_stop(antes)
-        record_removed_trade(payload_estado, _ordem("9913", "LOSS", -100.0, base + timedelta(minutes=2)))
-        payload = payload_estado.to_dict()
-
-        trader = AutoTrader()
-        estado = trader.restore(self.user, payload, RestoreTrades(historico, authoritative=True))
-        self.assertEqual((estado.wins, estado.losses), (1, 2))  # placar sem o apagado
-        self.assertEqual(resolve_robot_stop_reason(estado), "STOP_LOSS_HIT")  # stop com ele
-        self.assertEqual(trader.management_totals(self.user)["net_profit"], -215.0)
-
-    def test_memoria_com_a_ordem_nao_conta_duas_vezes(self) -> None:
-        from backend.auto_trader import record_removed_trade
-
-        trader = AutoTrader()
-        estado = trader.get(self.user)
-        apagada = _ordem("9921", "LOSS", -100.0, utc_now() - timedelta(minutes=1))
-        trader._histories[self.user] = [dict(apagada)]
-        record_removed_trade(estado, apagada)
-        self.assertEqual(trader.management_totals(self.user)["net_profit"], -100.0)
-
-    def test_exclusao_anota_o_livro_e_avisa_o_runtime(self) -> None:
-        estado = main.auto_trader.get(self.user)
-        estado.wins, estado.losses, estado.profit = 1, 2, -115.0
+        self.assertEqual(resolve_robot_stop_reason(estado), "STOP_LOSS_HIT")
         apagada = _ordem("9931", "LOSS", -100.0, utc_now() - timedelta(minutes=1))
         with (
             patch.object(main, "robot_runtime_mode", return_value="external"),
@@ -417,27 +377,80 @@ class StopDepoisDaExclusaoTests(unittest.TestCase):
             patch.object(main.robot_bus, "publish_command") as comando,
         ):
             main.apply_marketing_score_removal(self.user, apagada)
-        self.assertEqual((estado.wins, estado.losses), (1, 1))
-        self.assertEqual([i["order_id"] for i in estado.removed_trades], ["9931"])
-        self.assertEqual(comando.call_args.kwargs["removed_trade"]["order_id"], "9931")
+        self.assertEqual((estado.wins, estado.losses, estado.profit), (1, 2, -115.0))
+        self.assertEqual((estado.stop_offset_wins, estado.stop_offset_losses), (0, 0))
+        self.assertIsNone(resolve_robot_stop_reason(estado))  # o loss apagado não conta
+        enviado = comando.call_args.kwargs["removed_trade"]
+        self.assertEqual(enviado["order_id"], "9931")
+        self.assertIn("|", enviado["pattern_key"])
 
-    def test_runtime_anota_o_livro_no_apply_score(self) -> None:
-        agora = utc_now().isoformat()
+    def test_linha_sintetica_continua_so_na_vitrine(self) -> None:
+        estado = main.auto_trader.get(self.user)
+        estado.wins, estado.losses, estado.profit = 3, 0, 26.1
+        estado.stop_offset_wins = 2
+        sintetica = {"order_id": "3f2a0c1e-aaaa-bbbb-cccc-000000000001", "result": "WIN", "profit": 8.7}
+        with (
+            patch.object(main, "persist_robot"),
+            patch.object(main, "publish_marketing_score_to_overlay"),
+            patch.object(main, "adopt_live_session_score_if_blank"),
+            patch.object(main.robot_bus, "set_score_authority"),
+        ):
+            main.apply_marketing_score_removal(self.user, sintetica)
+        self.assertEqual((estado.wins, estado.stop_offset_wins), (2, 1))
+
+    def test_runtime_tira_da_memoria_do_stop_e_desfaz_padroes(self) -> None:
+        estado = main.auto_trader.get(self.user)
+        apagada = _ordem("9941", "LOSS", -100.0, utc_now() - timedelta(minutes=1))
+        main.auto_trader._histories[self.user] = [dict(apagada), _ordem("9942", "WIN", 85.0, utc_now())]
+        estado.wins, estado.losses, estado.profit = 1, 1, -15.0
         with (
             patch.object(main, "persist_robot"),
             patch.object(main, "publish_robot_control_snapshot"),
             patch.object(main.robot_bus, "set_score_authority"),
+            patch.object(main.pattern_memory, "forget_outcome") as esquecer,
         ):
             asyncio.run(
                 robot_runtime_main._handle_command(
                     main,
                     {
-                        "user_id": self.user, "action": "apply_score", "wins": 0, "losses": 0, "profit": 0,
-                        "removed_trade": {"order_id": "9941", "result": "LOSS", "profit": -100, "finished_at": agora},
+                        "user_id": self.user, "action": "apply_score", "wins": 1, "losses": 0, "profit": 85.0,
+                        "removed_trade": {"order_id": "9941", "result": "LOSS", "profit": -100.0, "pattern_key": "X|1|Y|PUT|M1"},
                     },
                 )
             )
-        self.assertEqual([i["order_id"] for i in main.auto_trader.get(self.user).removed_trades], ["9941"])
+        self.assertEqual((estado.wins, estado.losses, estado.stop_offset_losses), (1, 0, 0))
+        self.assertEqual([t["order_id"] for t in main.auto_trader._histories[self.user]], ["9942"])
+        self.assertEqual(main.auto_trader.management_totals(self.user)["net_profit"], 85.0)
+        self.assertEqual(esquecer.call_args.args[1]["order_id"], "9941")  # a cópia da memória, chave exata
+
+    def test_runtime_sem_a_operacao_usa_a_chave_do_gateway(self) -> None:
+        with patch.object(main.pattern_memory, "forget_outcome") as esquecer:
+            robot_runtime_main.apagar_operacao_do_runtime(
+                main, self.user, {"order_id": "9951", "result": "WIN", "profit": 8.7, "pattern_key": "A|2|B|CALL|M1"}
+            )
+        self.assertEqual(esquecer.call_args.kwargs["key"], "A|2|B|CALL|M1")
+
+
+class MemoriaDePadroesTests(unittest.TestCase):
+    def test_desfazer_devolve_o_caderno_ao_que_era(self) -> None:
+        from backend.pattern_memory import PatternMemoryService, _payload_da_chave, pattern_key_from_payload
+
+        chave = "NZDUSD-OTC|19|CONTINUATION|CALL|M5"
+        self.assertEqual(pattern_key_from_payload(_payload_da_chave(chave, "LOSS")), chave)
+        servico = PatternMemoryService.__new__(PatternMemoryService)
+        servico.enabled = True
+        servico.use_global = True
+        servico._lock = threading.Lock()
+        servico._by_user = {}
+        servico._hydrated_users = set()
+        servico._store = None
+        trade = {**_payload_da_chave(chave, "LOSS"), "profit": -100.0}
+        servico.record_outcome("u", trade)
+        servico.record_outcome("u", {**_payload_da_chave(chave, "WIN"), "profit": 85.0})
+        self.assertTrue(servico.forget_outcome("u", trade))
+        pessoal = servico._by_user["u"][chave]
+        self.assertEqual((pessoal.wins, pessoal.losses, pessoal.profit), (1, 0, 85.0))
+        self.assertFalse(servico.forget_outcome("u", key=chave, result="LOSS", profit=-1))  # já não há loss
 
 
 class OrfaJaFinalTests(unittest.TestCase):

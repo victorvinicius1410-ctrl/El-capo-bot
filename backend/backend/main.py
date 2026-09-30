@@ -31,8 +31,6 @@ from backend.auto_trader import (
     is_synthetic_trade,
     resolve_robot_stop_reason,
     STALE_PENDING_LAST_TRADE_SECONDS,
-    record_removed_trade,
-    removed_trades_in_window,
     set_display_score,
     should_hide_live_loss,
     strip_ai_fields,
@@ -76,11 +74,13 @@ from backend.status import (
 from backend.robot_persistence import (
     RobotPersistence,
     create_robot_persistence,
+    expand_trade_history_analysis,
     extract_robot_settings,
 )
 from backend.pattern_memory import (
     PATTERN_MEMORY_BLOCK,
     create_pattern_memory_service,
+    pattern_key_from_payload,
 )
 from backend.reversion_strategy import (
     REVZ_ENABLED,
@@ -3466,14 +3466,21 @@ def publish_marketing_score_to_overlay(
         profit = round(float(state.profit or 0), 2)
         extra: dict[str, Any] = {}
         if isinstance(removed_trade, dict) and not is_synthetic_trade(removed_trade):
-            # O runtime anota o mesmo livro: é ele quem decide o stop. Linha
-            # sintética do Shift+O não é dinheiro e não vai.
+            # O runtime apaga a operação da memória dele (stop e padrões).
+            # Linha sintética do Shift+O não é dinheiro e não vai.
             extra["removed_trade"] = {
                 "order_id": removed_trade.get("order_id"),
                 "broker_order_id": removed_trade.get("broker_order_id"),
                 "result": removed_trade.get("result"),
                 "profit": removed_trade.get("profit"),
-                "finished_at": removed_trade.get("finished_at"),
+                "is_gale": bool(removed_trade.get("is_gale")),
+                # Reserva: se o runtime não tiver mais a operação em memória, é
+                # com esta chave que ele desfaz a memória de padrões.
+                "pattern_key": pattern_key_from_payload(
+                    expand_trade_history_analysis(dict(removed_trade))
+                    if isinstance(removed_trade.get("analysis_json"), dict)
+                    else removed_trade
+                ),
             }
         robot_bus.publish_command(
             normalized,
@@ -3648,18 +3655,30 @@ def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
     try:
         adopt_live_session_score_if_blank(normalized_user)
         state = auto_trader.get(normalized_user)
-        # Tirar do placar não desfaz dinheiro na corretora: a baixa vai para
-        # `stop_offset_*` e o stop continua vendo a operação real.
-        set_display_score(
-            state,
-            int(state.wins) - (1 if result == "WIN" else 0),
-            int(state.losses) - (1 if result == "LOSS" else 0),
-            float(state.profit) - profit,
-        )
-        # Livro das ordens reais apagadas: sobrevive ao restore (Iniciar,
-        # deploy) para o stop não esquecer o dinheiro que já saiu da conta.
         removida = {**trade, "result": result, "profit": profit}
-        record_removed_trade(state, removida)
+        if is_synthetic_trade(removida):
+            # Linha gerada no Shift+O: está no placar E em `stop_offset_*`; tirar
+            # dos dois mantém o stop contando só ordem real.
+            set_display_score(
+                state,
+                int(state.wins) - (1 if result == "WIN" else 0),
+                int(state.losses) - (1 if result == "LOSS" else 0),
+                float(state.profit) - profit,
+            )
+        else:
+            # Ordem real apagada some de TUDO (decisão do dono, 30/09): baixa o
+            # placar real, sem mexer em `stop_offset_*`, e o stop deixa de contar.
+            state.wins = max(0, int(state.wins) - (1 if result == "WIN" else 0))
+            state.losses = max(0, int(state.losses) - (1 if result == "LOSS" else 0))
+            state.profit = round(float(state.profit) - profit, 2)
+            if robot_runtime_mode() != "external":
+                # Sem runtime separado, o "aprendizado" vive aqui: desfaz também.
+                pattern_memory.forget_outcome(
+                    normalized_user,
+                    expand_trade_history_analysis(dict(removida))
+                    if isinstance(removida.get("analysis_json"), dict)
+                    else removida,
+                )
         # Marca ANTES de persistir/publicar: o persist é assíncrono e o
         # snapshot do runtime pode chegar no meio. A partir daqui todo
         # reconcile (gateway e runtime) obedece a este placar.
@@ -3720,17 +3739,6 @@ def delete_marketing_robot_history_item(
     normalized_order = str(order_id or "").strip()
     if not normalized_user or not normalized_order:
         return None
-    # Lápide ANTES de apagar o espelho: se a ordem ainda é o `last_trade` de
-    # algum processo, o `persist_robot` seguinte a recriava em robot_trades e o
-    # "Iniciar Operação" contava o loss apagado de novo (28/09, 2x3 → 1x4).
-    try:
-        mark_deleted_orders(normalized_user, [normalized_order])
-    except Exception:
-        logger.exception(
-            "[DELETED_ORDERS_MARK_FAILED] user_id=%s order_id=%s",
-            normalized_user,
-            normalized_order,
-        )
     try:
         deleted = robot_persistence.delete_trade_history_item(
             normalized_user,
@@ -3753,6 +3761,19 @@ def delete_marketing_robot_history_item(
     except Exception:
         logger.exception(
             "[MARKETING_MEMORY_HISTORY_DELETE_FAILED] user_id=%s order_id=%s",
+            normalized_user,
+            normalized_order,
+        )
+
+    # Lápide ANTES de apagar o espelho (e depois de ler a operação da memória,
+    # que ela também apaga): se a ordem ainda é o `last_trade` de algum
+    # processo, o `persist_robot` seguinte a recriava em robot_trades e o
+    # "Iniciar Operação" contava o loss apagado de novo (28/09, 2x3 → 1x4).
+    try:
+        mark_deleted_orders(normalized_user, [normalized_order])
+    except Exception:
+        logger.exception(
+            "[DELETED_ORDERS_MARK_FAILED] user_id=%s order_id=%s",
             normalized_user,
             normalized_order,
         )
@@ -7452,14 +7473,6 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
     except Exception:
         logger.warning("[MANAGEMENT_HISTORY_FALLBACK] user_id=%s", user_id, exc_info=True)
         trades = auto_trader.history(user_id).get("trades", [])
-    # Ordem real apagada no Shift+O saiu do Histórico, mas o dinheiro saiu da
-    # conta: o stop continua contando (livro `removed_trades`).
-    presentes = {str(t.get("order_id") or "") for t in trades}
-    trades = list(trades) + [
-        dict(item)
-        for item in removed_trades_in_window(state)
-        if str(item.get("order_id")) not in presentes
-    ]
 
     for trade in trades:
         result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
@@ -11358,7 +11371,6 @@ CAMPOS_DO_PLACAR = (
     "stop_offset_wins",
     "stop_offset_losses",
     "stop_offset_profit",
-    "removed_trades",
     "score_day",
 )
 

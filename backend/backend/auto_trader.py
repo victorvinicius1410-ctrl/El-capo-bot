@@ -395,61 +395,6 @@ def set_display_score(state: Any, wins: int, losses: int, profit: float) -> None
 STALE_PENDING_LAST_TRADE_SECONDS = 2 * 3600
 
 
-def record_removed_trade(state: Any, trade: dict[str, Any]) -> bool:
-    """Anota no livro do estado uma ordem REAL apagada no Shift+O.
-
-    Ordem sintética (UUID do Shift+O) não é dinheiro e fica fora. Guarda só o
-    que o stop precisa e poda o que não é de hoje.
-
-    Args:
-        state: Estado do robô.
-        trade: Operação apagada (precisa de ``order_id`` e ``result``).
-
-    Returns:
-        True se entrou no livro.
-    """
-    if not isinstance(trade, dict) or is_synthetic_trade(trade):
-        return False
-    order_id = str(trade.get("order_id") or "").strip()
-    result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
-    if not order_id or result not in {"WIN", "LOSS"}:
-        return False
-    livro = [
-        item
-        for item in (getattr(state, "removed_trades", None) or [])
-        if str(item.get("order_id")) != order_id and _is_today_record(item)
-    ]
-    livro.append(
-        {
-            "order_id": order_id,
-            "result": result,
-            "profit": round(float(trade.get("profit") or 0), 2),
-            "finished_at": str(trade.get("finished_at") or utc_now().isoformat()),
-        }
-    )
-    state.removed_trades = livro[-100:]
-    return True
-
-
-def _is_today_record(item: dict[str, Any]) -> bool:
-    finished_at = parse_datetime(item.get("finished_at"))
-    return finished_at is not None and is_brasilia_today(finished_at)
-
-
-def removed_trades_in_window(state: Any) -> list[dict[str, Any]]:
-    """Ordens reais apagadas que ainda contam para o stop (hoje, após o reset)."""
-    reset_at = parse_datetime(getattr(state, "stop_reset_at", None))
-    saida = []
-    for item in getattr(state, "removed_trades", None) or []:
-        finished_at = parse_datetime(item.get("finished_at"))
-        if finished_at is None or not is_brasilia_today(finished_at):
-            continue
-        if reset_at is not None and finished_at < reset_at:
-            continue
-        saida.append(item)
-    return saida
-
-
 def clear_stop_offsets(state: Any, *, profit_only: bool = False) -> None:
     """Zera a parte do Shift+O junto com o placar que ela compunha."""
     state.stop_offset_profit = 0.0
@@ -532,12 +477,6 @@ class RobotState:
     stop_offset_wins: int = 0
     stop_offset_losses: int = 0
     stop_offset_profit: float = 0.0
-    # Ordens REAIS apagadas no Shift+O hoje ({order_id, result, profit,
-    # finished_at}). Saem do placar e do Histórico, mas o dinheiro saiu da
-    # conta: o stop continua contando. Sem este livro, o restore (Iniciar,
-    # deploy) recalculava os offsets só pelo Histórico e o stop esquecia os
-    # losses apagados. Ver removed_trades_in_window.
-    removed_trades: list[dict[str, Any]] = field(default_factory=list)
     max_entries_per_cycle: int = 1
     # Modo LIVE: cadência de demonstração para transmissão. Só conta de
     # marketing consegue ligar (o endpoint recusa as demais). Afrouxa o portão
@@ -1331,14 +1270,8 @@ class AutoTrader:
             for item in trades
             if str(item.get("parent_order_id") or "").strip()
         }
-        # Ordens reais apagadas no Shift+O: fora do placar exibido, mas o stop
-        # segue vendo o dinheiro — viram offset negativo logo abaixo.
-        apagadas = removed_trades_in_window(state)
-        ids_apagadas = {str(item.get("order_id")) for item in apagadas}
         for trade in trades:
             if should_hide_live_loss(trade, state):
-                continue
-            if str(trade.get("order_id") or "").strip() in ids_apagadas:
                 continue
             if (
                 str(trade.get("order_id") or "").strip() in pernas_superadas
@@ -1376,12 +1309,6 @@ class AutoTrader:
                 else:
                     synthetic_losses += 1
                 synthetic_profit += float(trade.get("profit") or 0)
-        for item in apagadas:
-            if item.get("result") == "WIN":
-                synthetic_wins -= 1
-            else:
-                synthetic_losses -= 1
-            synthetic_profit -= float(item.get("profit") or 0)
         state.wins = wins
         state.losses = losses
         state.profit = round(profit, 2)
@@ -2542,13 +2469,6 @@ class AutoTrader:
         trades = list(self._histories.get(user_id, []))
         if include_trade is not None:
             trades.append(dict(include_trade))
-        # Ordem real apagada no Shift+O ainda é dinheiro que saiu da conta.
-        presentes = {str(t.get("order_id") or "") for t in trades}
-        trades.extend(
-            dict(item)
-            for item in removed_trades_in_window(state)
-            if str(item.get("order_id")) not in presentes
-        )
 
         gross_profit = 0.0
         gross_loss = 0.0
@@ -3447,35 +3367,35 @@ class AutoTrader:
             return False
         return normalized_order in self._completed_order_ids.get(str(user_id or "").strip(), set())
 
-    def mark_trade_removed(self, user_id: str, order_id: str) -> bool:
-        """Aplica a exclusão do Shift+O na memória deste processo.
+    def mark_trade_removed(self, user_id: str, order_id: str) -> dict[str, Any] | None:
+        """Apaga da memória deste processo a operação excluída no Shift+O.
 
-        Mantém o id em ``_completed_order_ids`` (resultado atrasado não conta de
-        novo) e, se ela for o ``last_trade``, marca ``score_removed`` para o
-        ``persist_robot`` não regravá-la no espelho ``robot_trades``.
-
-        NÃO tira a ordem do histórico em memória: a exclusão baixa o placar
-        (via ``stop_offset_*``), mas o stop continua vendo o dinheiro real que
-        saiu da conta, e ``management_totals`` soma por esse histórico.
+        Operação apagada some de TUDO (decisão do dono, 30/09): placar, stop e
+        histórico em memória. Aqui: sai de ``_histories`` (que alimenta o stop em
+        dinheiro), fica em ``_completed_order_ids`` (resultado atrasado não a
+        traz de volta) e, se for o ``last_trade``, ganha ``score_removed`` para o
+        ``persist_robot`` não recriá-la no espelho ``robot_trades``.
 
         Args:
             user_id: Dono da sessão.
             order_id: Ordem apagada.
 
         Returns:
-            True se a ordem era o ``last_trade`` da sessão.
+            A operação que estava no histórico em memória (para desfazer a
+            memória de padrões com a mesma chave), ou ``None``.
         """
         normalized_user = str(user_id or "").strip()
         normalized_order = str(order_id or "").strip()
         if not normalized_user or not normalized_order:
-            return False
+            return None
+        removida = self.remove_history_trade(normalized_user, normalized_order)
         self._completed_order_ids.setdefault(normalized_user, set()).add(normalized_order)
         state = self._states.get(normalized_user)
         last = getattr(state, "last_trade", None) if state is not None else None
         if isinstance(last, dict) and str(last.get("order_id") or "").strip() == normalized_order:
             state.last_trade = {**last, "score_removed": True}
-            return True
-        return False
+            removida = removida or dict(last)
+        return removida
 
     def replace_history(self, user_id: str, trades: list[dict[str, Any]]) -> None:
         """

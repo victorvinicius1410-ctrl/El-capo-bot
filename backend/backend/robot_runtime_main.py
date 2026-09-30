@@ -252,6 +252,33 @@ def _hydrate_user_from_persistence(
         )
 
 
+def apagar_operacao_do_runtime(gateway: object, user_id: str, removida: dict) -> None:
+    """Tira do runtime a ordem apagada no Shift+O: memória, stop e padrões.
+
+    A memória de padrões é desfeita com a MESMA chave com que foi registrada:
+    a da operação que o runtime tinha em memória; se ela já não estiver aqui
+    (restart), a chave calculada pelo gateway a partir da linha apagada.
+    """
+    order_id = str(removida.get("order_id") or "").strip()
+    na_memoria = gateway.auto_trader.mark_trade_removed(user_id, order_id)  # type: ignore[attr-defined]
+    padroes = getattr(gateway, "pattern_memory", None)
+    esquecer = getattr(padroes, "forget_outcome", None)
+    if not callable(esquecer):
+        return
+    try:
+        if isinstance(na_memoria, dict) and na_memoria.get("result"):
+            esquecer(user_id, na_memoria)
+        elif removida.get("pattern_key") and not removida.get("is_gale"):
+            esquecer(
+                user_id,
+                key=str(removida["pattern_key"]),
+                result=str(removida.get("result") or ""),
+                profit=float(removida.get("profit") or 0),
+            )
+    except Exception:
+        logger.warning("[PATTERN_MEMORY_FORGET_FAILED] user_id=%s order_id=%s", user_id, order_id, exc_info=True)
+
+
 async def _handle_command(gateway: object, payload: dict) -> None:
     """Aplica start/stop/ensure no auto_trader local do runtime."""
     user_id = str(payload.get("user_id") or "").strip()
@@ -444,16 +471,11 @@ async def _handle_command(gateway: object, payload: dict) -> None:
         from backend.auto_trader import set_display_score
 
         state = gateway.auto_trader.get(user_id)  # type: ignore[attr-defined]
+        removida = payload.get("removed_trade")
         try:
-            # Placar do Shift+O é vitrine: a diferença vai para
-            # `stop_offset_*` e o stop segue contando só ordem real. Sem isso
-            # um "gerar placar" 8x2 disparava STOP_WIN_HIT (10/09 19:53).
-            set_display_score(
-                state,
-                int(payload.get("wins") or 0),
-                int(payload.get("losses") or 0),
-                float(payload.get("profit") or 0),
-            )
+            wins = int(payload.get("wins") or 0)
+            losses = int(payload.get("losses") or 0)
+            profit = float(payload.get("profit") or 0)
         except (TypeError, ValueError):
             logger.warning(
                 "[ROBOT_RUNTIME_APPLY_SCORE_INVALID] user_id=%s payload=%s",
@@ -461,13 +483,17 @@ async def _handle_command(gateway: object, payload: dict) -> None:
                 payload,
             )
             return
-        # Livro das ordens reais apagadas: o stop do runtime continua contando
-        # o dinheiro mesmo depois de um restore (Iniciar, deploy).
-        removida = payload.get("removed_trade")
-        if isinstance(removida, dict):
-            from backend.auto_trader import record_removed_trade
-
-            record_removed_trade(state, removida)
+        if isinstance(removida, dict) and removida.get("order_id"):
+            # Ordem REAL apagada no Shift+O some de tudo (decisão do dono,
+            # 30/09): placar real (sem `stop_offset_*`, então o stop também
+            # deixa de contar), histórico em memória e memória de padrões.
+            apagar_operacao_do_runtime(gateway, user_id, removida)
+            state.wins, state.losses, state.profit = wins, losses, round(profit, 2)
+        else:
+            # Placar do Shift+O é vitrine: a diferença vai para
+            # `stop_offset_*` e o stop segue contando só ordem real. Sem isso
+            # um "gerar placar" 8x2 disparava STOP_WIN_HIT (10/09 19:53).
+            set_display_score(state, wins, losses, profit)
         # Exclusão do Shift+O: se a ordem apagada é o `last_trade` daqui, marca
         # para o `persist_robot` abaixo não recriá-la no espelho robot_trades.
         apagada = getattr(gateway, "is_deleted_order", None)

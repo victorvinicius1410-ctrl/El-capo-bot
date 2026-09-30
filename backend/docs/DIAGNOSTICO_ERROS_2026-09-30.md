@@ -25,6 +25,14 @@ Plano aprovado: `/root/.claude/plans/cria-um-planejamento-para-floofy-willow.md`
 | I | ~2/3 dos e-mails eram condição esperada logada como ERROR. | Recusas esperadas em WARNING (`[ORDER_SEND_REFUSED]`), RSI e saldo sem traceback, `[ORDER_SUBMITTING]` no lugar do `[ORDER_SENT]` pré-envio, painel fechado em INFO. Vigia em 2 níveis (ver `VIGIA_DE_ERROS.md`). | e-mail na hora só do inesperado |
 | H | nginx: 17 × 502 de robôs no staging parado (sem `default_server` na 443). | `000-padrao-443` com `ssl_reject_handshake`; site `api.elcapo2.shop` desativado (arquivo em `sites-available`). | 0 × 502 |
 
+## Exclusão no Shift+O: some de tudo (decisão do dono, 30/09)
+
+Operação REAL apagada no Shift+O sai do placar, do **stop** (operações e dinheiro), do Histórico, do
+espelho `robot_trades` (lápide `robot:deleted_orders`), do histórico em memória dos dois processos e da
+**memória de padrões** (`PatternMemoryService.forget_outcome`, com a mesma chave com que foi registrada).
+Antes, a baixa ia para `stop_offset_*` e o stop continuava contando a ordem. Linha sintética (gerada no
+Shift+O) continua só na vitrine (`set_display_score`).
+
 ## Não feito (e por quê)
 - **Cache de abertura global no bullex**: o mapa por usuário é usado por `mark_binary_option_closed` e
   `clear_binary_open_cache`; torná-lo global exige refatorar esses caminhos. O ganho maior (4 s do digital)

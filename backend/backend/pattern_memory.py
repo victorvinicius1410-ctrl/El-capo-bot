@@ -200,6 +200,26 @@ def build_pattern_key(
     )
 
 
+def _payload_da_chave(chave: str, resultado: str) -> dict[str, Any]:
+    """Remonta ativo/hora/setup/direção/timeframe a partir de ``ATIVO|HH|SETUP|DIR|TF``."""
+    partes = chave.split("|")
+    if len(partes) != 5:
+        return {"result": resultado}
+    ativo, hora, setup, direcao, timeframe = partes
+    try:
+        hora_int = int(hora)
+    except ValueError:
+        hora_int = 0
+    return {
+        "active": ativo,
+        "opened_at": f"2000-01-01T{hora_int:02d}:00:00+00:00",
+        "strategy_setup": setup,
+        "direction": direcao,
+        "timeframe": timeframe,
+        "result": resultado,
+    }
+
+
 def pattern_key_from_payload(
     payload: dict[str, Any] | None,
     *,
@@ -244,6 +264,18 @@ class PatternStats:
         else:
             return
         self.profit = round(float(self.profit) + float(profit or 0), 2)
+
+    def revert(self, result: str, profit: float) -> bool:
+        """Desfaz um ``apply`` (operação apagada no Shift+O). False se não havia."""
+        normalized = str(result or "").strip().upper()
+        if normalized == "WIN" and self.wins > 0:
+            self.wins -= 1
+        elif normalized == "LOSS" and self.losses > 0:
+            self.losses -= 1
+        else:
+            return False
+        self.profit = round(float(self.profit) - float(profit or 0), 2)
+        return True
 
     def merge(self, other: "PatternStats") -> None:
         """Soma contadores de outro agregado (unificação de cadernos)."""
@@ -414,6 +446,67 @@ class PatternMemoryService:
             gate_snapshot.win_rate,
         )
         return gate_snapshot
+
+    def forget_outcome(
+        self,
+        user_id: str,
+        trade: dict[str, Any] | None = None,
+        *,
+        key: str | None = None,
+        result: str | None = None,
+        profit: float | None = None,
+    ) -> bool:
+        """Desfaz o que ``record_outcome`` somou para uma operação apagada.
+
+        Operação apagada no Shift+O some de tudo (decisão do dono, 30/09),
+        inclusive do que o robô "aprendeu" com ela.
+
+        Args:
+            user_id: Dono da operação.
+            trade: A operação como foi registrada (dá a chave exata).
+            key: Chave pronta, quando a operação não está mais em memória.
+            result: WIN/LOSS (se ``trade`` não vier).
+            profit: Lucro (se ``trade`` não vier).
+
+        Returns:
+            True se algum caderno foi corrigido.
+        """
+        if not self.enabled:
+            return False
+        normalized_user = str(user_id or "").strip()
+        dados = trade if isinstance(trade, dict) else {}
+        if not normalized_user or bool(dados.get("is_gale")):
+            return False
+        resultado = str(result or dados.get("final_result") or dados.get("result") or "").strip().upper()
+        if resultado not in {"WIN", "LOSS"}:
+            return False
+        chave = key or (pattern_key_from_payload(dados) if dados else None)
+        if not chave:
+            return False
+        if not dados:
+            # Só a chave: remonta os campos que o upsert grava nas colunas, para
+            # não sobrescrevê-las com valores padrão.
+            dados = _payload_da_chave(chave, resultado)
+        lucro = float(profit if profit is not None else dados.get("profit") or 0)
+        corrigiu = False
+        with self._lock:
+            pessoal = self._by_user.get(normalized_user, {}).get(chave)
+            if pessoal is not None and pessoal.revert(resultado, lucro):
+                corrigiu = True
+                self._persist_upsert(normalized_user, chave, dados, pessoal)
+            if self.use_global:
+                global_ = self._by_user.get(GLOBAL_PATTERN_OWNER, {}).get(chave)
+                if global_ is not None and global_.revert(resultado, lucro):
+                    corrigiu = True
+                    self._persist_upsert_global(chave, dados, global_)
+        logger.info(
+            "[PATTERN_MEMORY_FORGOTTEN] user_id=%s key=%s result=%s corrigiu=%s",
+            normalized_user,
+            chave,
+            resultado,
+            corrigiu,
+        )
+        return corrigiu
 
     def rebuild_from_history(self, user_id: str, history: list[dict[str, Any]]) -> int:
         """
