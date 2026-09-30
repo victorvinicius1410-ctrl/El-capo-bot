@@ -1,7 +1,7 @@
 """Bancada 6: os cenários das Fases 1 e 2.
 
 Gale abandonado, ordem órfã depois de deploy, TIMEOUT reconciliado no dono do
-placar, virada do dia de Brasília e retry na gravação do Histórico.
+placar, placar que atravessa a meia-noite e retry na gravação do Histórico.
 """
 from __future__ import annotations
 
@@ -192,40 +192,58 @@ async def s74_timeout_reconciliado_no_runtime():
 
 
 async def s75_virada_do_dia():
+    """Regra do dono (30/09): o placar atravessa a meia-noite; só o Reiniciar zera."""
+    from backend import placar_janela
+
     u = "66666666-0000-4000-8000-000000000075"
-    ontem = utc_now() - datetime.timedelta(days=1)
-    trade = {
-        "order_id": proximo_id(), "active": "EURUSD-OTC", "direction": "CALL",
-        "amount": 10.0, "confidence": 90, "payout": 87.0, "timeframe": "M1",
-        "result": "WIN", "profit": 8.7, "sent_at": ontem.isoformat(),
-        "finished_at": ontem.isoformat(), "final_result": "WIN", "cycle_result": "WIN",
-    }
-    st = M.auto_trader.get(u)
-    st.enabled = True
-    M.auto_trader._histories[u] = [dict(trade)]
-    M.robot_persistence.save_trade(u, trade)
-    M.robot_persistence.save_trade_history(u, trade)
-    st.wins, st.losses, st.profit = 1, 0, 8.7      # placar atravessou a meia-noite
-    M.persist_robot(u)
-    time.sleep(0.5)
-    antes = smem(u)
-    # Finge que o último ciclo deste usuário rodou ontem — ontem em BRASÍLIA.
-    # Com a data UTC, entre 21h e meia-noite de Brasília "ontem UTC" é o
-    # próprio dia de Brasília e o cenário falhava sem defeito no produto.
-    M._ultimo_dia_do_placar[u] = M.brasilia_today() - datetime.timedelta(days=1)
-    virou = M.reset_session_score_on_new_day(u)
-    time.sleep(0.5)
-    vivo = smem(u)
-    # E a reidratação seguinte tem de concordar com a memória viva.
-    M.auto_trader._states.pop(u, None)
-    M.auto_trader.restore(u, M.robot_persistence.load_state(u) or {},
-                          M.robot_persistence.load_trades_for_restore(u), source="supabase")
-    ok = virou and vivo == (0, 0, 0.0) and smem(u) == vivo
-    check("S75 placar vira o dia e a reidratação concorda",
-          "execute_robot_worker_cycle -> reset_session_score_on_new_day",
-          "0x0 na memória viva e o mesmo valor depois de reidratar",
-          f"antes da virada={antes} virou={virou} memoria viva={vivo} "
-          f"apos reidratar={smem(u)}", ok)
+    # A regra contínua em produção vale desde o dia do deploy; aqui, desde
+    # 3 dias atrás, para a operação de ontem estar dentro dela.
+    corte_original = placar_janela.PLACAR_CONTINUO_DESDE
+    placar_janela.PLACAR_CONTINUO_DESDE = utc_now() - datetime.timedelta(days=3)
+    try:
+        ontem = utc_now() - datetime.timedelta(days=1)
+        trade = {
+            "order_id": proximo_id(), "active": "EURUSD-OTC", "direction": "CALL",
+            "amount": 10.0, "confidence": 90, "payout": 87.0, "timeframe": "M1",
+            "result": "WIN", "profit": 8.7, "sent_at": ontem.isoformat(),
+            "finished_at": ontem.isoformat(), "final_result": "WIN", "cycle_result": "WIN",
+        }
+        st = M.auto_trader.get(u)
+        st.enabled = True
+        st.stop_reset_at = utc_now() - datetime.timedelta(days=2)
+        M.auto_trader._histories[u] = [dict(trade)]
+        M.robot_persistence.save_trade(u, trade)
+        M.robot_persistence.save_trade_history(u, trade)
+        st.wins, st.losses, st.profit = 1, 0, 8.7      # placar atravessou a meia-noite
+        M.persist_robot(u)
+        time.sleep(0.5)
+        sem_virada = not hasattr(M, "reset_session_score_on_new_day")
+
+        def reidratar():
+            M.auto_trader._states.pop(u, None)
+            salvo = M.robot_persistence.load_state(u) or {}
+            M.auto_trader.restore(
+                u, salvo,
+                M.robot_persistence.load_trades_for_restore(
+                    u, stop_reset_at=salvo.get("stop_reset_at")
+                ),
+                source="supabase",
+            )
+            return smem(u)
+
+        depois_da_meia_noite = reidratar()
+        M.auto_trader.reset_score(u)
+        M.persist_robot(u)
+        time.sleep(0.5)
+        depois_do_reiniciar = reidratar()
+    finally:
+        placar_janela.PLACAR_CONTINUO_DESDE = corte_original
+    ok = sem_virada and depois_da_meia_noite == (1, 0, 8.7) and depois_do_reiniciar == (0, 0, 0.0)
+    check("S75 placar atravessa a meia-noite; só o Reiniciar zera",
+          "restore -> _recompute_score_from_history (janela desde o Reiniciar)",
+          "1x0 de ontem continua depois de reidratar; 0x0 depois do Reiniciar",
+          f"sem virada no código={sem_virada} depois da meia-noite={depois_da_meia_noite} "
+          f"depois do Reiniciar={depois_do_reiniciar}", ok)
 
 
 async def s76_retry_na_gravacao():

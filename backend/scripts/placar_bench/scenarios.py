@@ -320,8 +320,8 @@ async def s14_baixa_intencional():
 
 
 async def s15_virada_do_dia():
-    """Virada do dia: ver bench6.py (S75), que exercita o caminho completo."""
-    check("S15 virada do dia (coberto em bench6 S75)", "reset_session_score_on_new_day",
+    """Placar sem virada do dia: ver bench6.py (S75), que exercita o caminho completo."""
+    check("S15 placar sem virada do dia (coberto em bench6 S75)", "placar_janela",
           "cenário movido para bench6", "movido", True)
 
 
