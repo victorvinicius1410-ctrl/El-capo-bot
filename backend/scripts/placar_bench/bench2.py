@@ -102,7 +102,10 @@ def open_trade(u, order_id, amount=10.0, tf="M1", is_gale=False, gale_step=0, pa
 async def opera(u, resultados):
     """Roda operações reais como o runtime faz, uma a uma."""
     for i, (res, lucro) in enumerate(resultados, start=1):
-        oid = f"{u[-4:]}-{i}"
+        # Id numérico, como o da corretora: id com letra conta como Shift+O
+        # (is_synthetic_trade) e o resumo de gestão ignora — era o que fazia o
+        # S27 ver 0 operações e o Stop Win nunca disparar.
+        oid = f"143{u[-4:]}{i:03d}"
         open_trade(u, oid)
         await M.finish_monitored_trade(u, oid, res, lucro)
     publish(u)
@@ -216,7 +219,7 @@ async def s27_resumo_de_gestao():
 async def s28_shift_o_pelo_runtime():
     u = "22222222-0000-4000-8000-000000000028"
     gw("GET", "/robot/state", u)
-    M.robot_bus.publish_command(u, "apply_score", {"wins": 8, "losses": 2, "profit": 480.0})
+    M.robot_bus.publish_command(u, "apply_score", wins=8, losses=2, profit=480.0)
     time.sleep(2.5)                      # o bench-runtime consome o comando
     snap = sredis(u)
     st, p = gw("GET", "/robot/state", u)

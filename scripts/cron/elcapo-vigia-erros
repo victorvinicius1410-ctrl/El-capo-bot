@@ -1,0 +1,5 @@
+# Vigia de erros: lê logs dos containers, nginx e cron do site, checa saúde e
+# manda e-mail de todo erro novo (cada tipo no máximo 1x a cada 24h) + resumo
+# diário às 08h de Brasília. Instalar: cp scripts/cron/elcapo-vigia-erros /etc/cron.d/
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root flock -n /run/elcapo-vigia-erros.lock /opt/elcapo/scripts/vigia-erros.sh victorvinicius1410@gmail.com >/dev/null 2>&1

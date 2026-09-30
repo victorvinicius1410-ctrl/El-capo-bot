@@ -30,6 +30,8 @@ from backend.auto_trader import (
     parse_datetime,
     is_synthetic_trade,
     resolve_robot_stop_reason,
+    record_removed_trade,
+    removed_trades_in_window,
     set_display_score,
     should_hide_live_loss,
     strip_ai_fields,
@@ -3278,6 +3280,7 @@ def publish_marketing_score_to_overlay(
     user_id: str,
     *,
     trust_local_score: bool = False,
+    removed_trade: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """
     Espelha o placar do gateway no Redis/WS e no robot-runtime.
@@ -3307,12 +3310,24 @@ def publish_marketing_score_to_overlay(
         wins = max(0, int(state.wins or 0))
         losses = max(0, int(state.losses or 0))
         profit = round(float(state.profit or 0), 2)
+        extra: dict[str, Any] = {}
+        if isinstance(removed_trade, dict) and not is_synthetic_trade(removed_trade):
+            # O runtime anota o mesmo livro: é ele quem decide o stop. Linha
+            # sintética do Shift+O não é dinheiro e não vai.
+            extra["removed_trade"] = {
+                "order_id": removed_trade.get("order_id"),
+                "broker_order_id": removed_trade.get("broker_order_id"),
+                "result": removed_trade.get("result"),
+                "profit": removed_trade.get("profit"),
+                "finished_at": removed_trade.get("finished_at"),
+            }
         robot_bus.publish_command(
             normalized,
             "apply_score",
             wins=wins,
             losses=losses,
             profit=profit,
+            **extra,
         )
         logger.info(
             "[MARKETING_SCORE_DELEGATED] user_id=%s wins=%s losses=%s profit=%s",
@@ -3487,6 +3502,10 @@ def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
             int(state.losses) - (1 if result == "LOSS" else 0),
             float(state.profit) - profit,
         )
+        # Livro das ordens reais apagadas: sobrevive ao restore (Iniciar,
+        # deploy) para o stop não esquecer o dinheiro que já saiu da conta.
+        removida = {**trade, "result": result, "profit": profit}
+        record_removed_trade(state, removida)
         # Marca ANTES de persistir/publicar: o persist é assíncrono e o
         # snapshot do runtime pode chegar no meio. A partir daqui todo
         # reconcile (gateway e runtime) obedece a este placar.
@@ -3500,6 +3519,7 @@ def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
         publish_marketing_score_to_overlay(
             normalized_user,
             trust_local_score=True,
+            removed_trade=removida,
         )
         logger.info(
             "[MARKETING_SCORE_REMOVED] user_id=%s result=%s wins=%s losses=%s profit=%s",
@@ -7269,6 +7289,14 @@ def build_management_summary(user_id: str, state: Any) -> dict[str, Any]:
     except Exception:
         logger.warning("[MANAGEMENT_HISTORY_FALLBACK] user_id=%s", user_id, exc_info=True)
         trades = auto_trader.history(user_id).get("trades", [])
+    # Ordem real apagada no Shift+O saiu do Histórico, mas o dinheiro saiu da
+    # conta: o stop continua contando (livro `removed_trades`).
+    presentes = {str(t.get("order_id") or "") for t in trades}
+    trades = list(trades) + [
+        dict(item)
+        for item in removed_trades_in_window(state)
+        if str(item.get("order_id")) not in presentes
+    ]
 
     for trade in trades:
         result = str(trade.get("result") or trade.get("final_result") or "").strip().upper()
@@ -13618,15 +13646,16 @@ async def timeout_monitored_trade(user_id: str, order_id: str) -> None:
     async with auto_trader.lock(user_id):
         timed_out, state = auto_trader.timeout_trade(user_id, order_id)
         if timed_out and state.last_trade:
-            try:
-                save_visible_trade_history(user_id, state.last_trade)
-                logger.info(
-                    "[HISTORY_SAVED] user_id=%s order_id=%s result=TIMEOUT final_result=TIMEOUT",
-                    user_id,
-                    order_id,
-                )
-            except Exception:
-                logger.exception("[ROBOT HISTORY ERROR] user_id=%s order_id=%s", user_id, order_id)
+            # TIMEOUT fica FORA do Histórico de propósito: o resultado é
+            # desconhecido (build_trade_history_item recusa). Tentar gravar só
+            # gerava ERROR com traceback a cada timeout — e um [HISTORY_SAVED]
+            # falso. A ordem vai para o espelho robot_trades pelo persist abaixo,
+            # que é de onde o restore e a reconciliação de TIMEOUT a leem.
+            logger.info(
+                "[TIMEOUT_KEPT_OUT_OF_HISTORY] user_id=%s order_id=%s",
+                user_id,
+                order_id,
+            )
         persist_robot(user_id)
 
 

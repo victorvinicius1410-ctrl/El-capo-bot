@@ -461,6 +461,13 @@ async def _handle_command(gateway: object, payload: dict) -> None:
                 payload,
             )
             return
+        # Livro das ordens reais apagadas: o stop do runtime continua contando
+        # o dinheiro mesmo depois de um restore (Iniciar, deploy).
+        removida = payload.get("removed_trade")
+        if isinstance(removida, dict):
+            from backend.auto_trader import record_removed_trade
+
+            record_removed_trade(state, removida)
         # Exclusão do Shift+O: se a ordem apagada é o `last_trade` daqui, marca
         # para o `persist_robot` abaixo não recriá-la no espelho robot_trades.
         apagada = getattr(gateway, "is_deleted_order", None)
