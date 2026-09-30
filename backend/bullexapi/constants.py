@@ -370,7 +370,7 @@ ACTIVES = {
 	"ONTUSD-L": 1339,
 	"ATOMUSD-L": 1340,
 	"WORK": 1343,
-	"EURJPY-OTC": 1346,
+	"EURJPY-OTC": 79,  # 1346 era um ativo desativado (velas de jun/2025); a BullEx usa 79
 	"FDJP": 1350,
 	"CAN": 1351,
 	"VIAC": 1352,

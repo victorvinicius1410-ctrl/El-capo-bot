@@ -27,10 +27,17 @@ class TabelaDeAtivosTests(unittest.TestCase):
         main.parse_binary_open_map(init)
         self.assertEqual(OP_code.ACTIVES["TESTEPAR-op"], 99901)
 
-    def test_nao_sobrescreve_id_conhecido(self) -> None:
-        original = OP_code.ACTIVES["EURUSD-op"]
-        main.register_broker_active("EURUSD-op", 1)
-        self.assertEqual(OP_code.ACTIVES["EURUSD-op"], original)
+    def test_codigo_desatualizado_segue_a_corretora(self) -> None:
+        """30/09: EURJPY-OTC com 1346 (morto) na tabela; a BullEx usa 79."""
+        original = OP_code.ACTIVES["EURJPY-OTC"]
+        try:
+            OP_code.ACTIVES["EURJPY-OTC"] = 1346
+            init = {"turbo": {"actives": {"79": {"name": "front.EURJPY-OTC", "enabled": True, "is_suspended": False}}}}
+            main.parse_binary_open_map(init)
+            self.assertEqual(OP_code.ACTIVES["EURJPY-OTC"], 79)
+            self.assertFalse(main.register_broker_active("EURJPY-OTC", 79))  # já igual: nada muda
+        finally:
+            OP_code.ACTIVES["EURJPY-OTC"] = original
 
     def test_ativo_fora_da_tabela_e_recusado_como_indisponivel(self) -> None:
         with self.assertRaises(main.ServiceError) as ctx:

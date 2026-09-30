@@ -69,9 +69,14 @@ MAX_ITENS_EMAIL = 30
 MEMORIA_LIVRE_MINIMA_PCT = 20
 FUSO_BRASILIA = datetime.timezone(datetime.timedelta(hours=-3))
 
-# Regex de linhas que NÃO são erro, cada uma com o motivo. Vazio de propósito:
-# o dono pediu todo erro. Só entra aqui o que for comprovadamente ruído.
-IGNORAR: list[tuple[str, str]] = []
+# Regex de linhas que NÃO são erro do sistema, cada uma com o motivo. Pedido do
+# dono (30/09): erro do CLIENTE (senha errada, sem saldo) não deve chegar nem no
+# resumo — o sistema já trata e não há nada a fazer do nosso lado.
+IGNORAR: list[tuple[str, str]] = [
+    (r"invalid_credentials", "cliente digitou a senha da corretora errada"),
+    (r"(?i)insufficient funds|saldo_insuficiente|ORDER_REJECTED_INSUFFICIENT_FUNDS", "cliente sem saldo na corretora"),
+    (r"ROBOT_STOPPED_BALANCE_ZERO|REAL_BALANCE_NOT_DETECTED", "cliente sem saldo na corretora"),
+]
 
 # Erro ESPERADO: é contado e aparece no resumo diário (e no alerta de volume),
 # mas não gera e-mail na hora. Cada padrão com o motivo.

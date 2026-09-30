@@ -2587,7 +2587,7 @@ _binary_open_cache_lock = Lock()
 
 
 def register_broker_active(name: str, active_id: Any) -> bool:
-    """Põe na tabela da biblioteca um ativo que a corretora oferece e ela não conhece.
+    """Alinha a tabela da biblioteca ao código que a corretora informa para o ativo.
 
     A tabela ``bullexapi/constants.py`` é fixa e não tinha ``EURGBP-op``: a compra
     fazia ``OP_code.ACTIVES["EURGBP-op"]``, estourava ``KeyError`` e o tratamento
@@ -2600,15 +2600,22 @@ def register_broker_active(name: str, active_id: Any) -> bool:
         active_id: Id do ativo (chave do dicionário ``actives``).
 
     Returns:
-        True se o ativo foi acrescentado agora.
+        True se o ativo foi acrescentado ou teve o código corrigido agora.
     """
-    if not name or name in OP_code.ACTIVES:
+    if not name:
         return False
     try:
-        OP_code.ACTIVES[name] = int(active_id)
+        novo_id = int(active_id)
     except (TypeError, ValueError):
         return False
-    logger.warning("[BROKER_ACTIVE_REGISTERED] name=%s id=%s", name, active_id)
+    antigo_id = OP_code.ACTIVES.get(name)
+    if antigo_id == novo_id:
+        return False
+    # A corretora manda: o código da tabela fixa pode estar desatualizado. Em
+    # 30/09 o EURJPY-OTC estava como 1346 (ativo desativado, velas de jun/2025,
+    # toda compra recusada) e a BullEx usa 79 — no painel dela o par está vivo.
+    OP_code.ACTIVES[name] = novo_id
+    logger.warning("[BROKER_ACTIVE_REGISTERED] name=%s id=%s antes=%s", name, novo_id, antigo_id)
     return True
 
 
