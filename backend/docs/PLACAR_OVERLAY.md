@@ -5,8 +5,8 @@
 > **nunca rebaixa** o placar persistido: `_protect_session_score_on_persist`
 > barra a gravação e loga `[SCORE_PERSIST_DOWNGRADE_BLOCKED]`. A única baixa
 > legítima carrega marca de baixa intencional (`score_authority`) — "Reiniciar
-> placar", "Reiniciar ciclo" e exclusão no Shift+O (a virada do dia saiu na noite de
-> 30/09/2026: ver a seção abaixo). O runtime, por sua vez, **nunca reidrata** o
+> placar", "Reiniciar ciclo" e exclusão no Shift+O (a virada do dia saiu em
+> 01/10/2026: ver a seção abaixo). O runtime, por sua vez, **nunca reidrata** o
 > placar do banco: a memória viva dele já foi recalculada pelo Histórico da
 > janela. Ver `PLACAR_DIAGNOSTICO_2026-09-15.md`.
 
@@ -20,7 +20,7 @@ Atualizado em **2026-09-07**.
 
 Espelho detalhado: [`Frontend/docs/PLACAR_OVERLAY.md`](../frontend/docs/PLACAR_OVERLAY.md).
 
-## Regra (2026-09-30, noite) — placar e stop só zeram no "Reiniciar placar"
+## Regra (2026-10-01) — placar e stop só zeram no "Reiniciar placar"
 
 Decisão do dono em 30/09: o placar **e o stop** (operações e dinheiro) só voltam
 a zero quando o cliente clica em **Reiniciar placar**. Não existe mais virada à

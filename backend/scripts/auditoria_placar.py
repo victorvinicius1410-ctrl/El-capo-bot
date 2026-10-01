@@ -11,7 +11,7 @@ Confere quatro coisas:
 
 1. **Placar × Histórico** — ``robot_states.wins/losses`` tem de bater com os
    ciclos fechados desde o último "Reiniciar placar" (placar contínuo, sem
-   virada à meia-noite desde 30/09/2026 — ``backend/placar_janela.py``). Só
+   virada à meia-noite desde 01/10/2026 — ``backend/placar_janela.py``). Só
    entra quem operou nos últimos 2 dias: placar parado não diverge sozinho.
 2. **Espelho pendente com resultado final** — linha ``PENDING_RESULT`` em
    ``robot_trades`` cuja ordem já está WIN/LOSS/DRAW no Histórico: alguém
