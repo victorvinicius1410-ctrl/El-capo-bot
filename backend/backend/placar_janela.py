@@ -12,7 +12,7 @@ a partir de :data:`PLACAR_CONTINUO_DESDE` (início do dia do deploy). Assim, no
 deploy, o placar de cada cliente é exatamente o de hoje, e daí em diante ele
 só cresce até o próximo Reiniciar. Ninguém "herda" dias antigos de uma vez.
 
-Ver docs/PLACAR_OVERLAY.md §2026-09-30 (noite).
+Ver docs/PLACAR_OVERLAY.md §2026-10-01.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from backend.brasilia_time import BRASILIA_TZ
 # Início do dia (Brasília) em que a regra entrou no ar. O script de deploy
 # confere que é o dia de hoje: com data errada, o placar de todos saltaria
 # (data antiga) ou perderia operações de hoje (data futura).
-PLACAR_CONTINUO_DESDE = datetime(2026, 9, 30, tzinfo=BRASILIA_TZ).astimezone(timezone.utc)
+PLACAR_CONTINUO_DESDE = datetime(2026, 10, 1, tzinfo=BRASILIA_TZ).astimezone(timezone.utc)
 
 # Carimbo ``score_day`` que o runtime grava no placar (snapshot Redis e
 # ``robot_states``). O nome do campo ficou por compatibilidade: antes guardava

@@ -5,7 +5,7 @@ Antes a meia-noite de Brasília zerava o placar e o stop. Agora a janela vai do
 isso muda: a transição no deploy, o stop em dinheiro acima das 100 operações
 que o robô guarda em memória, a exclusão no Shift+O de uma operação antiga, o
 stop que continua batido depois da meia-noite e a leitura paginada do banco.
-Ver backend/docs/PLACAR_OVERLAY.md §2026-09-30 (noite).
+Ver backend/docs/PLACAR_OVERLAY.md §2026-10-01.
 """
 
 from __future__ import annotations
