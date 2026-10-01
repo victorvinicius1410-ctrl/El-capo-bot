@@ -24,7 +24,7 @@ from backend.auto_trader import (
     resolve_robot_stop_reason,
     utc_now,
 )
-from backend.brasilia_time import BRASILIA_TZ
+from backend.brasilia_time import BRASILIA_TZ, history_cutoff
 from backend.robot_persistence import (
     RestoreTrades,
     SQLiteRobotPersistence,
@@ -241,9 +241,13 @@ class LeituraDoBancoTests(unittest.TestCase):
         self.assertTrue(trades.authoritative)
 
     def test_restore_sempre_le_o_dia_de_hoje(self) -> None:
-        """Reiniciar há 1 min: a memória segue com as operações do dia."""
-        self.persist.save_trade_history(USER, _op("7401", "WIN", 8.0, utc_now() - timedelta(minutes=30)))
-        reset = utc_now() - timedelta(minutes=1)
+        """Reiniciado hoje depois de operar: a memória segue com as operações do dia."""
+        # Âncoras dentro do dia de Brasília, para o teste valer a qualquer hora
+        # (com "30 min atrás", logo depois da meia-noite a operação virava ontem).
+        inicio_do_dia = history_cutoff(1)
+        decorrido = utc_now() - inicio_do_dia
+        self.persist.save_trade_history(USER, _op("7401", "WIN", 8.0, inicio_do_dia + decorrido / 3))
+        reset = inicio_do_dia + decorrido * 2 / 3
         trades = self.persist.load_trades_for_restore(USER, stop_reset_at=reset)
         self.assertEqual([t["order_id"] for t in trades], ["7401"])
         estado = AutoTrader().restore(USER, _payload(reset), trades)
