@@ -1063,6 +1063,8 @@ class AutoTrader:
     # Dinheiro (e ordens) da janela do stop que já saiu de `_histories`.
     _stop_acumulado: dict[str, dict[str, float]] = field(default_factory=dict)
     _ordens_no_acumulado: dict[str, set[str]] = field(default_factory=dict)
+    # Contador do placar no banco (``backend.placar_contador``); None = desligado.
+    contador_do_placar: Any = None
     _sources: dict[str, StateSource] = field(default_factory=dict)
 
     def get(self, user_id: str) -> RobotState:
@@ -2948,6 +2950,8 @@ class AutoTrader:
             history = self._histories.setdefault(user_id, [])
             history.append(dict(parent_trade))
             self._limitar_historico(user_id, history)
+            # A perna que perdeu não pontua (o ciclo segue), mas o dinheiro saiu.
+            self._lancar_no_contador(user_id, normalized_order_id, dinheiro=round(loss_profit, 2))
         return True, state
 
     def count_late_result(
@@ -3012,10 +3016,19 @@ class AutoTrader:
                 "cycle_result": normalizado,
             }
         )
-        if not should_hide_live_loss(fechado, state):
+        vai_ao_historico = not should_hide_live_loss(fechado, state)
+        if vai_ao_historico:
             historico = self._histories.setdefault(user_id, [])
             historico.append(dict(fechado))
             self._limitar_historico(user_id, historico)
+        self._lancar_no_contador(
+            user_id,
+            order_id,
+            wins=1 if normalizado == "WIN" else 0,
+            losses=1 if normalizado == "LOSS" and not ocultar_loss else 0,
+            profit=saldo_do_placar,
+            dinheiro=round(lucro, 2) if vai_ao_historico and normalizado in {"WIN", "LOSS"} else 0.0,
+        )
         logger.warning(
             "[LATE_RESULT_COUNTED] user_id=%s order_id=%s result=%s profit=%s "
             "wins=%s losses=%s",
@@ -3080,6 +3093,14 @@ class AutoTrader:
                     historico[indice] = dict(trade)
                     break
         self._clear_gale_state(state)
+        # Mesma ordem que já entrou no contador (só o dinheiro, no trigger_gale):
+        # o fechamento do ciclo vai com chave própria para não ser descartado.
+        self._lancar_no_contador(
+            user_id,
+            f"{order_id}#ciclo",
+            losses=0 if ocultar_loss else 1,
+            profit=saldo_do_placar,
+        )
         logger.warning(
             "[GALE_ABANDONED_LOSS_COUNTED] user_id=%s order_id=%s step=%s "
             "cycle_profit=%s wins=%s losses=%s",
@@ -3303,10 +3324,23 @@ class AutoTrader:
             "at": finished_at.isoformat(),
         }
         self._clear_gale_state(state, preserve_context=True)
-        if not should_hide_live_loss(trade, state):
+        vai_ao_historico = not should_hide_live_loss(trade, state)
+        if vai_ao_historico:
             history = self._histories.setdefault(user_id, [])
             history.append(dict(trade))
             self._limitar_historico(user_id, history)
+        self._lancar_no_contador(
+            user_id,
+            normalized_order_id,
+            wins=1 if normalized_result == "WIN" else 0,
+            losses=1 if normalized_result == "LOSS" and vai_ao_historico else 0,
+            profit=cycle_profit,
+            dinheiro=(
+                round(trade_profit, 2)
+                if vai_ao_historico and normalized_result in {"WIN", "LOSS"}
+                else 0.0
+            ),
+        )
         if state.enabled and normalized_result in {"WIN", "LOSS"}:
             management_totals = self.management_totals(user_id)
             stop_reason = resolve_robot_stop_reason(
@@ -3395,6 +3429,32 @@ class AutoTrader:
         if not normalized_order:
             return False
         return normalized_order in self._completed_order_ids.get(str(user_id or "").strip(), set())
+
+    def _lancar_no_contador(
+        self,
+        user_id: str,
+        chave: str,
+        *,
+        wins: int = 0,
+        losses: int = 0,
+        profit: float = 0.0,
+        dinheiro: float = 0.0,
+    ) -> None:
+        """Manda ao contador do banco o mesmo efeito que acabou de ir ao placar.
+
+        As regras (gale conta um ciclo, LOSS oculto do LIVE, empate não conta)
+        já foram aplicadas por quem chama: aqui só vão os números. Nunca
+        bloqueia nem levanta exceção — o contador é a sombra na fase 1.
+        """
+        contador = self.contador_do_placar
+        if contador is None:
+            return
+        try:
+            contador.lancar(
+                user_id, chave, wins=wins, losses=losses, profit=profit, dinheiro=dinheiro
+            )
+        except Exception:
+            logger.warning("[PLACAR_CONTADOR_LANCAR_FALHOU] user_id=%s chave=%s", user_id, chave, exc_info=True)
 
     def _zerar_acumulado_do_stop(self, user_id: str) -> None:
         """Esquece o acumulado do stop (Reiniciar placar ou restore)."""

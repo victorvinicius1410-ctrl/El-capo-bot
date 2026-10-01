@@ -105,6 +105,29 @@ class AuditoriaTests(unittest.TestCase):
             achados = auditoria_placar.auditar("b", "k", agora=AGORA)
         self.assertEqual([d["historico"] for d in achados["divergentes"]], [(2, 1)])
 
+    def test_contador_em_sombra_aparece_sem_disparar_alerta(self) -> None:
+        estados, historico, _ = self._dia()
+        contador = [{"user_id": U1, "wins": 2, "losses": 2, "profit": 0, "atualizado_em": _t(30)}]
+
+        def listar(_base, _chave, tabela, _params):
+            return {"robot_states": estados, "robot_trade_history": historico,
+                    "robot_trades": [], "placar": contador}[tabela]
+
+        with patch.object(auditoria_placar, "_listar", listar):
+            achados = auditoria_placar.auditar("b", "k", agora=AGORA)
+        self.assertTrue(achados["contador_ativo"])
+        self.assertEqual(
+            [(d["banco"], d["contador"]) for d in achados["contador_divergente"]], [((2, 3), (2, 2))]
+        )
+        self.assertEqual(auditoria_placar.total(achados), 0)  # sombra: sem e-mail
+        self.assertIn("contador x placar (sombra)", "\n".join(
+            auditoria_placar.descrever(achados, detalhe=True, horas_orfa=1)))
+
+    def test_sem_tabela_do_contador_a_checagem_some(self) -> None:
+        with patch.object(auditoria_placar, "_listar", _tabelas(*self._dia())):
+            achados = auditoria_placar.auditar("b", "k", agora=AGORA)
+        self.assertFalse(achados["contador_ativo"])
+
     def test_corrigir_so_mexe_no_espelho(self) -> None:
         with patch.object(auditoria_placar, "_listar", _tabelas(*self._dia())):
             achados = auditoria_placar.auditar("b", "k", agora=AGORA)

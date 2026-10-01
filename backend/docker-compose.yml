@@ -16,6 +16,9 @@ services:
       DEV_REDIS_URL: "redis://redis:6379/0"
       # Fase 4: API/WS sem workers locais — robot-runtime executa os ciclos.
       ROBOT_RUNTIME_MODE: "external"
+      # Contador do placar (docs/PLACAR_CONTADOR.md): off | sombra. Ligar só
+      # depois de rodar backend/migration_placar_contador.sql no Supabase.
+      PLACAR_CONTADOR: "${PLACAR_CONTADOR:-off}"
     volumes:
       - backend-data:/data
     ports:
@@ -44,6 +47,7 @@ services:
       PROD_REDIS_URL: "redis://redis:6379/0"
       DEV_REDIS_URL: "redis://redis:6379/0"
       ROBOT_RUNTIME_MODE: "worker"
+      PLACAR_CONTADOR: "${PLACAR_CONTADOR:-off}"
     volumes:
       - backend-data:/data
     restart: unless-stopped

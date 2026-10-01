@@ -37,6 +37,7 @@ from backend.auto_trader import (
     utc_now,
 )
 from backend.brasilia_time import history_cutoff
+from backend.placar_contador import ContadorDoPlacar
 from backend.placar_janela import (
     MARCA_PLACAR_CONTINUO,
     PLACAR_CONTINUO_DESDE,
@@ -3229,6 +3230,9 @@ except ValueError:
     bullex_credentials_service = None
 auto_trader = AutoTrader()
 robot_persistence: RobotPersistence = create_robot_persistence()
+# Placar como contador único no banco (fase 1: sombra, PLACAR_CONTADOR=sombra).
+# Resolve a persistência na hora de gravar: testes e bancada trocam a instância.
+contador_do_placar = ContadorDoPlacar(lambda: robot_persistence)
 pattern_memory = create_pattern_memory_service()
 feedback_store: FeedbackStore = create_feedback_store()
 # Rate-limit de auto-reconexão por usuário (evita martelar login Bullex).
@@ -3545,6 +3549,7 @@ def sync_marketing_display_to_robot(
                 )
             else:
                 set_display_score(state, incoming_wins, incoming_losses, incoming_profit)
+            contador_do_placar.vitrine(user_id, state.wins, state.losses, state.profit)
             # Confia no placar local: reconcile com Redis antigo desfazia
             # exclusão/geração com total menor que o snapshot prévio.
             # Persist antes do publish para o enrich do GET não reelevar pela DB.
@@ -3675,7 +3680,13 @@ def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
                 int(state.losses) - (1 if result == "LOSS" else 0),
                 float(state.profit) - profit,
             )
+            contador_do_placar.vitrine(normalized_user, state.wins, state.losses, state.profit)
         else:
+            # Contador: desfaz exatamente o que esta ordem somou (e o fechamento
+            # de ciclo dela, se foi gale abandonado).
+            contador_do_placar.apagar(
+                normalized_user, str(trade.get("order_id") or trade.get("id") or "")
+            )
             # Ordem real apagada some de TUDO (decisão do dono, 30/09): baixa o
             # placar real, sem mexer em `stop_offset_*`, e o stop deixa de contar.
             state.wins = max(0, int(state.wins) - (1 if result == "WIN" else 0))
@@ -15971,10 +15982,50 @@ async def read_restored_session_status(user_id: str) -> bool:
     return False
 
 
+def semear_contador_do_placar(user_id: str) -> None:
+    """Carga inicial do contador com o placar recém-restaurado (não sobrescreve).
+
+    O restore acabou de recalcular o placar pelo Histórico da janela; é esse o
+    ponto de partida do contador. Cliente que já tem linha no contador não muda
+    (``placar_semear`` não faz nada), então reinício de serviço não zera nem
+    duplica nada.
+
+    Args:
+        user_id: Cliente restaurado.
+    """
+    if not contador_do_placar.ligado:
+        return
+    state = auto_trader.get(user_id)
+    totais = auto_trader.management_totals(user_id)
+    wins = int(state.wins or 0)
+    losses = int(state.losses or 0)
+    contador_do_placar.semear(
+        user_id,
+        inicio_do_placar(getattr(state, "stop_reset_at", None)),
+        wins=wins,
+        losses=losses,
+        profit=round(float(state.profit or 0), 2),
+        stop_wins=max(0, wins - int(state.stop_offset_wins or 0)),
+        stop_losses=max(0, losses - int(state.stop_offset_losses or 0)),
+        stop_ganho=totais["gross_profit"],
+        stop_perda=totais["gross_loss"],
+    )
+
+
 @app.on_event("startup")
 async def restore_robot_states() -> None:
     print("[STARTUP_RESTORE_BEGIN]", flush=True)
     logger.warning("[STARTUP_RESTORE_BEGIN] mode=%s", robot_runtime_mode())
+    # Só o dono do placar lança resultados no contador: o runtime (worker) ou
+    # o processo único fora do modo external. O gateway external só reinicia,
+    # apaga (Shift+O) e ajusta a vitrine — ações do cliente que passam por ele.
+    dono_do_placar = robot_runtime_mode() != "external"
+    if dono_do_placar:
+        auto_trader.contador_do_placar = contador_do_placar
+    if contador_do_placar.ligado:
+        logger.warning(
+            "[PLACAR_CONTADOR_LIGADO] modo=%s dono=%s", contador_do_placar.modo, dono_do_placar
+        )
     logger.info("[STARTUP_RESTORE_DISABLED] no session restore on startup")
     restored_count = 0
     # Quem não tem linha no Histórico desde a entrada da regra contínua
@@ -16008,6 +16059,8 @@ async def restore_robot_states() -> None:
                 trades,
                 source=robot_persistence_source(),
             )
+            if dono_do_placar:
+                semear_contador_do_placar(user_id)
             robot_state_hydrated_users.add(user_id)
             restored_count += 1
             logger.info(
@@ -17499,6 +17552,7 @@ async def robot_reset_cycle(
     user_id = auth["user_id"]
     async with auto_trader.lock(user_id):
         state = auto_trader.reset_cycle(user_id, reset_score=True, reset_daily_profit=True)
+        contador_do_placar.reiniciar(user_id, state.stop_reset_at)
         # Mesma regra do "Reiniciar placar": sem a marca o `persist_robot`
         # recusaria gravar o zero e o placar voltaria pelo snapshot Redis.
         mark_session_score_authority(user_id, 0, 0, 0.0)
@@ -17560,6 +17614,7 @@ async def robot_reset_score(auth: dict[str, str] = Depends(require_headers)) -> 
     user_id = auth["user_id"]
     async with auto_trader.lock(user_id):
         state = auto_trader.reset_score(user_id)
+        contador_do_placar.reiniciar(user_id, state.stop_reset_at)
         # Baixa intencional: marcar 0-0 (em vez de só limpar a marca anterior)
         # é o que autoriza o gateway a gravar o zero — o `persist_robot` agora
         # recusa rebaixar o placar sem essa marca. Ela também substitui a marca

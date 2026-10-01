@@ -300,6 +300,40 @@ def auditar(
                 "chave": f"placar:{user_id}",
             })
 
+    # Contador do placar (fase sombra, docs/PLACAR_CONTADOR.md): o contador no
+    # banco tem de bater com o placar de hoje (robot_states). Sem a tabela
+    # (migration não rodou) a checagem só não acontece.
+    contador_divergente: list[dict] = []
+    contador_ativo = False
+    auditados = sorted(set(por_cliente) | {u for u, e in estados.items() if (e or {}).get("wins") or (e or {}).get("losses")})
+    try:
+        contador: dict[str, dict] = {}
+        for inicio in range(0, len(auditados), 50):
+            lote = auditados[inicio:inicio + 50]
+            for linha in _listar(base, chave, "placar", {
+                "select": "user_id,wins,losses,profit,atualizado_em",
+                "user_id": f"in.({','.join(lote)})",
+                "order": "user_id.asc",
+            }):
+                contador[str(linha["user_id"])] = linha
+        contador_ativo = True
+    except Exception:  # noqa: BLE001 - tabela ausente ou API fora: sem checagem
+        contador = {}
+    for user_id in auditados if contador_ativo else []:
+        linha = contador.get(user_id)
+        if linha is None or _idade(agora, linha.get("atualizado_em")) <= CARENCIA_SEGUNDOS:
+            continue
+        estado = estados.get(user_id) or {}
+        placar = (int(estado.get("wins") or 0), int(estado.get("losses") or 0))
+        no_contador = (int(linha.get("wins") or 0), int(linha.get("losses") or 0))
+        if placar != no_contador:
+            contador_divergente.append({
+                "user_id": user_id,
+                "banco": placar,
+                "contador": no_contador,
+                "chave": f"contador:{user_id}",
+            })
+
     return {
         "corte": corte,
         "clientes": len(por_cliente),
@@ -307,6 +341,8 @@ def auditar(
         "pendentes_com_final": pendentes_com_final,
         "orfas": orfas,
         "sem_historico": sem_historico,
+        "contador_ativo": contador_ativo,
+        "contador_divergente": contador_divergente,
     }
 
 
@@ -320,8 +356,17 @@ def descrever(achados: dict, *, detalhe: bool, horas_orfa: int) -> list[str]:
         f"  ordens órfãs (> {horas_orfa}h)              : {len(achados['orfas'])}",
         f"  operação sem Histórico            : {len(achados['sem_historico'])}",
     ]
+    if achados.get("contador_ativo"):
+        linhas.append(
+            f"  contador x placar (sombra)        : {len(achados['contador_divergente'])} divergente(s)"
+        )
     if not detalhe:
         return linhas
+    if achados.get("contador_divergente"):
+        linhas.append("\nContador do placar diferente do placar de hoje (fase sombra):")
+        for item in achados["contador_divergente"]:
+            banco, cont = item["banco"], item["contador"]
+            linhas.append(f"  {item['user_id']}  placar={banco[0]}x{banco[1]}  contador={cont[0]}x{cont[1]}")
     if achados["divergentes"]:
         linhas.append("\nDivergências (placar no banco x ciclos fechados no Histórico):")
         for item in achados["divergentes"]:

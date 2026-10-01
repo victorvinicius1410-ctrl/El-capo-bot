@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 from backend.brasilia_time import history_cutoff, history_cutoff_iso
 from backend.placar_janela import inicio_do_placar
@@ -377,6 +378,70 @@ class RobotPersistence(ABC):
             if fim is not None and fim >= corte:
                 itens.append(item)
         return itens
+
+    # --- Placar como contador único (backend/migration_placar_contador.sql) ---
+    # Sem suporte, devolvem None: o contador fica desligado e nada quebra.
+
+    def placar_lancar(
+        self,
+        user_id: str,
+        chave: str,
+        *,
+        wins: int,
+        losses: int,
+        profit: float,
+        dinheiro: float,
+        sintetica: bool = False,
+    ) -> dict[str, Any] | None:
+        """Soma o efeito de uma ordem no placar, no máximo uma vez por período.
+
+        Args:
+            user_id: Cliente.
+            chave: Ordem (``<id>`` ou ``<id>#ciclo`` no fechamento do gale abandonado).
+            wins: Vitórias somadas ao placar exibido.
+            losses: Derrotas somadas ao placar exibido.
+            profit: Lucro somado ao placar exibido (lucro do ciclo, com gale).
+            dinheiro: Dinheiro real da perna, para o stop em R$.
+            sintetica: Vitrine do Shift+O (não entra no stop).
+
+        Returns:
+            A linha do placar depois do lançamento, ou None sem suporte.
+        """
+        return None
+
+    def placar_apagar(self, user_id: str, order_id: str) -> dict[str, Any] | None:
+        """Desfaz o que a ordem somou (Shift+O). Repetir não muda nada."""
+        return None
+
+    def placar_reiniciar(self, user_id: str, desde: datetime | None = None) -> dict[str, Any] | None:
+        """Zera o placar e abre um período novo ("Reiniciar placar")."""
+        return None
+
+    def placar_vitrine(
+        self, user_id: str, wins: int, losses: int, profit: float
+    ) -> dict[str, Any] | None:
+        """Leva o placar exibido a estes números sem mexer no stop (Shift+O)."""
+        return None
+
+    def placar_semear(
+        self,
+        user_id: str,
+        desde: datetime,
+        *,
+        wins: int,
+        losses: int,
+        profit: float,
+        stop_wins: int,
+        stop_losses: int,
+        stop_ganho: float,
+        stop_perda: float,
+    ) -> dict[str, Any] | None:
+        """Carga inicial; não faz nada se o cliente já tem placar."""
+        return None
+
+    def placar_ler(self, user_ids: list[str]) -> dict[str, dict[str, Any]] | None:
+        """Linhas do placar por cliente, ou None sem suporte."""
+        return None
 
     def load_user_ids_with_history_since(self, desde: datetime) -> set[str] | None:
         """Clientes com alguma linha no Histórico desde ``desde``.
@@ -1059,6 +1124,31 @@ class SQLiteRobotPersistence(RobotPersistence):
                     robot_restored integer not null default 0,
                     last_restore_at text
                 );
+                create table if not exists placar (
+                    user_id text primary key,
+                    desde text not null,
+                    wins integer not null default 0,
+                    losses integer not null default 0,
+                    profit real not null default 0,
+                    stop_wins integer not null default 0,
+                    stop_losses integer not null default 0,
+                    stop_ganho real not null default 0,
+                    stop_perda real not null default 0,
+                    versao integer not null default 0,
+                    atualizado_em text not null
+                );
+                create table if not exists placar_lancamentos (
+                    user_id text not null,
+                    desde text not null,
+                    order_id text not null,
+                    d_wins integer not null default 0,
+                    d_losses integer not null default 0,
+                    d_profit real not null default 0,
+                    dinheiro real not null default 0,
+                    sintetica integer not null default 0,
+                    criado_em text not null,
+                    primary key (user_id, desde, order_id)
+                );
                 """
             )
             self._ensure_column(connection, "robot_user_settings", "martingale_enabled", "integer not null default 0")
@@ -1091,6 +1181,170 @@ class SQLiteRobotPersistence(RobotPersistence):
                     "update robot_states set state_json = ? where user_id = ?",
                     (json.dumps(state), row["user_id"]),
                 )
+
+    # --- Placar como contador: espelho em SQLite das funções do Postgres ---
+
+    @staticmethod
+    def _placar_linha(connection: sqlite3.Connection, user_id: str) -> dict[str, Any] | None:
+        row = connection.execute("select * from placar where user_id = ?", (user_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _placar_garantir(connection: sqlite3.Connection, user_id: str, desde: str | None = None) -> dict[str, Any]:
+        connection.execute(
+            "insert into placar (user_id, desde, atualizado_em) values (?, ?, ?) "
+            "on conflict(user_id) do nothing",
+            (user_id, desde or utc_iso(), utc_iso()),
+        )
+        return dict(connection.execute("select * from placar where user_id = ?", (user_id,)).fetchone())
+
+    @staticmethod
+    def _placar_aplicar(
+        connection: sqlite3.Connection,
+        user_id: str,
+        wins: int,
+        losses: int,
+        profit: float,
+        dinheiro: float,
+        sintetica: bool,
+        sinal: int,
+    ) -> None:
+        real = 0 if sintetica else 1
+        connection.execute(
+            """
+            update placar set
+                wins = wins + ?, losses = losses + ?, profit = round(profit + ?, 2),
+                stop_wins = stop_wins + ?, stop_losses = stop_losses + ?,
+                stop_ganho = round(stop_ganho + ?, 2), stop_perda = round(stop_perda + ?, 2),
+                versao = versao + 1, atualizado_em = ?
+            where user_id = ?
+            """,
+            (
+                sinal * wins,
+                sinal * losses,
+                sinal * profit,
+                sinal * wins * real,
+                sinal * losses * real,
+                sinal * dinheiro * real if dinheiro > 0 else 0.0,
+                sinal * abs(dinheiro) * real if dinheiro < 0 else 0.0,
+                utc_iso(),
+                user_id,
+            ),
+        )
+
+    def placar_lancar(
+        self,
+        user_id: str,
+        chave: str,
+        *,
+        wins: int,
+        losses: int,
+        profit: float,
+        dinheiro: float,
+        sintetica: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            connection.execute("begin immediate")
+            linha = self._placar_garantir(connection, user_id)
+            cursor = connection.execute(
+                "insert into placar_lancamentos "
+                "(user_id, desde, order_id, d_wins, d_losses, d_profit, dinheiro, sintetica, criado_em) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict do nothing",
+                (user_id, linha["desde"], chave, wins, losses, profit, dinheiro, int(sintetica), utc_iso()),
+            )
+            if cursor.rowcount == 1:
+                self._placar_aplicar(connection, user_id, wins, losses, profit, dinheiro, sintetica, 1)
+            return self._placar_linha(connection, user_id)
+
+    def placar_apagar(self, user_id: str, order_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            connection.execute("begin immediate")
+            linha = self._placar_linha(connection, user_id)
+            if linha is None:
+                return None
+            apagadas = connection.execute(
+                "select * from placar_lancamentos where user_id = ? and desde = ? "
+                "and (order_id = ? or order_id = ?)",
+                (user_id, linha["desde"], order_id, f"{order_id}#ciclo"),
+            ).fetchall()
+            for item in apagadas:
+                connection.execute(
+                    "delete from placar_lancamentos where user_id = ? and desde = ? and order_id = ?",
+                    (user_id, item["desde"], item["order_id"]),
+                )
+                self._placar_aplicar(
+                    connection, user_id, item["d_wins"], item["d_losses"], item["d_profit"],
+                    item["dinheiro"], bool(item["sintetica"]), -1,
+                )
+            return self._placar_linha(connection, user_id)
+
+    def placar_reiniciar(self, user_id: str, desde: datetime | None = None) -> dict[str, Any] | None:
+        inicio = (desde or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                insert into placar (user_id, desde, atualizado_em) values (?, ?, ?)
+                on conflict(user_id) do update set
+                    desde = excluded.desde, wins = 0, losses = 0, profit = 0,
+                    stop_wins = 0, stop_losses = 0, stop_ganho = 0, stop_perda = 0,
+                    versao = versao + 1, atualizado_em = excluded.atualizado_em
+                """,
+                (user_id, inicio, utc_iso()),
+            )
+            return self._placar_linha(connection, user_id)
+
+    def placar_vitrine(
+        self, user_id: str, wins: int, losses: int, profit: float
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            connection.execute("begin immediate")
+            linha = self._placar_garantir(connection, user_id)
+            d_wins = int(wins) - int(linha["wins"])
+            d_losses = int(losses) - int(linha["losses"])
+            d_profit = round(float(profit) - float(linha["profit"]), 2)
+            if d_wins or d_losses or abs(d_profit) > 1e-9:
+                connection.execute(
+                    "insert into placar_lancamentos "
+                    "(user_id, desde, order_id, d_wins, d_losses, d_profit, dinheiro, sintetica, criado_em) "
+                    "values (?, ?, ?, ?, ?, ?, 0, 1, ?)",
+                    (user_id, linha["desde"], f"vitrine:{uuid4()}", d_wins, d_losses, d_profit, utc_iso()),
+                )
+                self._placar_aplicar(connection, user_id, d_wins, d_losses, d_profit, 0.0, True, 1)
+            return self._placar_linha(connection, user_id)
+
+    def placar_semear(
+        self,
+        user_id: str,
+        desde: datetime,
+        *,
+        wins: int,
+        losses: int,
+        profit: float,
+        stop_wins: int,
+        stop_losses: int,
+        stop_ganho: float,
+        stop_perda: float,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            connection.execute(
+                "insert into placar (user_id, desde, wins, losses, profit, stop_wins, stop_losses, "
+                "stop_ganho, stop_perda, versao, atualizado_em) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
+                "on conflict(user_id) do nothing",
+                (
+                    user_id, desde.astimezone(timezone.utc).isoformat(), wins, losses, round(profit, 2),
+                    stop_wins, stop_losses, round(stop_ganho, 2), round(stop_perda, 2), utc_iso(),
+                ),
+            )
+            return self._placar_linha(connection, user_id)
+
+    def placar_ler(self, user_ids: list[str]) -> dict[str, dict[str, Any]] | None:
+        ids = [str(u) for u in user_ids if str(u or "").strip()]
+        if not ids:
+            return {}
+        with self._connect() as connection:
+            marcas = ",".join("?" for _ in ids)
+            rows = connection.execute(f"select * from placar where user_id in ({marcas})", ids).fetchall()
+        return {str(row["user_id"]): dict(row) for row in rows}
 
     def _ensure_column(self, connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         existing = {
@@ -1602,6 +1856,94 @@ class SupabaseRobotPersistence(RobotPersistence):
         if return_response:
             return response
         return response.json() if response.content else []
+
+    # --- Placar como contador: funções de backend/migration_placar_contador.sql ---
+
+    def _placar_rpc(self, funcao: str, argumentos: dict[str, Any]) -> dict[str, Any] | None:
+        linhas = self._request("POST", f"/rpc/{funcao}", argumentos)
+        if isinstance(linhas, list):
+            return dict(linhas[0]) if linhas else None
+        return dict(linhas) if isinstance(linhas, dict) else None
+
+    def placar_lancar(
+        self,
+        user_id: str,
+        chave: str,
+        *,
+        wins: int,
+        losses: int,
+        profit: float,
+        dinheiro: float,
+        sintetica: bool = False,
+    ) -> dict[str, Any] | None:
+        return self._placar_rpc(
+            "placar_lancar",
+            {
+                "p_user": user_id,
+                "p_order": chave,
+                "p_wins": int(wins),
+                "p_losses": int(losses),
+                "p_profit": round(float(profit), 2),
+                "p_dinheiro": round(float(dinheiro), 2),
+                "p_sintetica": bool(sintetica),
+            },
+        )
+
+    def placar_apagar(self, user_id: str, order_id: str) -> dict[str, Any] | None:
+        return self._placar_rpc("placar_apagar", {"p_user": user_id, "p_order": str(order_id)})
+
+    def placar_reiniciar(self, user_id: str, desde: datetime | None = None) -> dict[str, Any] | None:
+        argumentos: dict[str, Any] = {"p_user": user_id}
+        if desde is not None:
+            argumentos["p_desde"] = desde.astimezone(timezone.utc).isoformat()
+        return self._placar_rpc("placar_reiniciar", argumentos)
+
+    def placar_vitrine(
+        self, user_id: str, wins: int, losses: int, profit: float
+    ) -> dict[str, Any] | None:
+        return self._placar_rpc(
+            "placar_vitrine",
+            {"p_user": user_id, "p_wins": int(wins), "p_losses": int(losses), "p_profit": round(float(profit), 2)},
+        )
+
+    def placar_semear(
+        self,
+        user_id: str,
+        desde: datetime,
+        *,
+        wins: int,
+        losses: int,
+        profit: float,
+        stop_wins: int,
+        stop_losses: int,
+        stop_ganho: float,
+        stop_perda: float,
+    ) -> dict[str, Any] | None:
+        return self._placar_rpc(
+            "placar_semear",
+            {
+                "p_user": user_id,
+                "p_desde": desde.astimezone(timezone.utc).isoformat(),
+                "p_wins": int(wins),
+                "p_losses": int(losses),
+                "p_profit": round(float(profit), 2),
+                "p_stop_wins": int(stop_wins),
+                "p_stop_losses": int(stop_losses),
+                "p_stop_ganho": round(float(stop_ganho), 2),
+                "p_stop_perda": round(float(stop_perda), 2),
+            },
+        )
+
+    def placar_ler(self, user_ids: list[str]) -> dict[str, dict[str, Any]] | None:
+        ids = [str(u) for u in user_ids if str(u or "").strip()]
+        if not ids:
+            return {}
+        encontrados: dict[str, dict[str, Any]] = {}
+        for inicio in range(0, len(ids), 80):
+            lote = ",".join(quote(u, safe="") for u in ids[inicio:inicio + 80])
+            for row in self._request("GET", f"/placar?user_id=in.({lote})&select=*"):
+                encontrados[str(row.get("user_id"))] = dict(row)
+        return encontrados
 
     def close(self) -> None:
         """Fecha o client HTTP compartilhado."""
