@@ -54,7 +54,7 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from backend.placar_janela import conta_no_placar, inicio_do_placar  # noqa: E402
+from backend.placar_janela import conta_no_placar, inicio_do_placar, placar_da_regra_atual  # noqa: E402
 
 FUSO_BRASILIA = datetime.timezone(datetime.timedelta(hours=-3))
 # Operação recém-fechada: `persist_robot` grava em background.
@@ -303,11 +303,21 @@ def auditar(
     # Contador do placar (fase sombra, docs/PLACAR_CONTADOR.md): o contador no
     # banco tem de bater com o placar de hoje (robot_states). Sem a tabela
     # (migration não rodou) a checagem só não acontece.
+    # Só entra placar gravado pela regra contínua (carimbo `score_day`): o de
+    # cliente parado desde antes dela é número velho — em 02/10 eram 166
+    # "divergências" falsas, todas sem carimbo, com o contador certo em 0x0.
     contador_divergente: list[dict] = []
     contador_ativo = False
-    auditados = sorted(set(por_cliente) | {u for u, e in estados.items() if (e or {}).get("wins") or (e or {}).get("losses")})
+    auditados = sorted(
+        u for u, e in estados.items()
+        if placar_da_regra_atual((e or {}).get("score_day"))
+        and (u in por_cliente or (e or {}).get("wins") or (e or {}).get("losses"))
+    )
     try:
         contador: dict[str, dict] = {}
+        # Sonda: sem a tabela (migration não rodou) cai no except abaixo, mesmo
+        # quando não há ninguém para comparar.
+        _listar(base, chave, "placar", {"select": "user_id", "order": "user_id.asc", "limit": "1"})
         for inicio in range(0, len(auditados), 50):
             lote = auditados[inicio:inicio + 50]
             for linha in _listar(base, chave, "placar", {

@@ -107,7 +107,13 @@ class AuditoriaTests(unittest.TestCase):
 
     def test_contador_em_sombra_aparece_sem_disparar_alerta(self) -> None:
         estados, historico, _ = self._dia()
-        contador = [{"user_id": U1, "wins": 2, "losses": 2, "profit": 0, "atualizado_em": _t(30)}]
+        estados[0]["state_json"]["score_day"] = "continuo"
+        # Cliente parado desde antes da regra: placar velho no banco, contador 0x0.
+        estados.append({"user_id": U2, "state_json": {"wins": 5, "losses": 5}})
+        contador = [
+            {"user_id": U1, "wins": 2, "losses": 2, "profit": 0, "atualizado_em": _t(30)},
+            {"user_id": U2, "wins": 0, "losses": 0, "profit": 0, "atualizado_em": _t(600)},
+        ]
 
         def listar(_base, _chave, tabela, _params):
             return {"robot_states": estados, "robot_trade_history": historico,
