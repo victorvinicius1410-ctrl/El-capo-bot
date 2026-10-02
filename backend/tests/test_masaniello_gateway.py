@@ -86,7 +86,7 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
                 await task
         main.robot_tasks.clear()
 
-    async def _save(self, user_id: str, body: dict[str, Any], account_type: str = "client"):
+    async def _save(self, user_id: str, body: dict[str, Any], account_type: str = "marketing"):
         with (
             patch.object(main, "persist_robot", return_value=None),
             patch.object(main, "stop_robot_worker", new=AsyncMock()),
@@ -148,6 +148,31 @@ class MasanielloConfigEndpointTests(_GatewayCase):
         response = await self._save("u-off", _config(masanielloEnabled=False, masanielloCapital=1))
         self.assertEqual(response.status_code, 200)
         self.assertFalse(json.loads(response.body)["data"]["masaniello_enabled"])
+
+    async def test_conta_de_cliente_fica_no_em_breve(self) -> None:
+        for tipo in ("client", "trial", "", None):
+            user_id = f"u-cliente-{tipo}"
+            auth = {"user_id": user_id} if tipo is None else {"user_id": user_id, "account_type": tipo}
+            with (
+                patch.object(main, "persist_robot", return_value=None),
+                patch.object(main, "stop_robot_worker", new=AsyncMock()),
+            ):
+                response = await main.robot_config(_config(entryValue=9), auth)
+            with self.subTest(tipo):
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(json.loads(response.body)["data"]["masaniello_enabled"])
+                state = main.auto_trader.get(user_id)
+                self.assertFalse(main.masaniello_active(state))
+                self.assertEqual(main.required_order_amount(state), 9.0)
+
+    async def test_conta_que_perde_a_liberacao_volta_ao_valor_fixo_ao_salvar(self) -> None:
+        await self._save("u-rebaixada", _config(), account_type="marketing")
+        self.assertTrue(main.auto_trader.get("u-rebaixada").masaniello_enabled)
+        # Mesmo sem mandar o campo, salvar como cliente desliga.
+        await self._save("u-rebaixada", {"entryValue": 7}, account_type="client")
+        state = main.auto_trader.get("u-rebaixada")
+        self.assertFalse(state.masaniello_enabled)
+        self.assertEqual(state.masaniello_cycle, None)
 
     async def test_conta_marketing_liga_e_o_live_suspende(self) -> None:
         response = await self._save("u-mkt", _config(entryValue=9), account_type="marketing")

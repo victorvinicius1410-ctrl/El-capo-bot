@@ -17251,6 +17251,20 @@ async def debug_robot_settings(
     )
 
 
+# Tipos de conta que podem usar o Gerenciamento Consistente. Por decisão do
+# dono (02/10/2026) a função fica em teste na conta marketing e aparece como
+# "Em breve", com cadeado, para o cliente. Para liberar: acrescentar o tipo
+# aqui e em `CONSISTENT_MANAGEMENT_ACCOUNT_TYPES` no painel
+# (`frontend/src/lib/masanielloPresentation.ts`). Com o modo LIVE ligado ele
+# fica suspenso de qualquer jeito (`masaniello_active`).
+MASANIELLO_ACCOUNT_TYPES = frozenset({"marketing"})
+
+
+def masaniello_allowed_for_account(account_type: Any) -> bool:
+    """True se o tipo de conta pode ligar o Gerenciamento Consistente."""
+    return str(account_type or "").strip().lower() in MASANIELLO_ACCOUNT_TYPES
+
+
 def validate_masaniello_config(
     user_id: str,
     update: RobotConfigUpdate,
@@ -17361,10 +17375,18 @@ async def robot_config(
             )
         filtered_body["market_mode"] = selectable
     partial_update = RobotConfigUpdate.model_validate(filtered_body)
-    # Conta marketing também pode ligar o Gerenciamento Consistente (02/10/2026,
-    # a pedido do dono): o ciclo só acompanha ordem real com a marca dele, então
-    # operação do Shift+O não o distorce. O que não convive é o modo LIVE, que
-    # esconde loss — e esse já fica de fora em `masaniello_active`.
+    if not masaniello_allowed_for_account(auth.get("account_type")):
+        # "Em breve" para conta de cliente: o painel mostra a opção com
+        # cadeado, e aqui ela é recusada mesmo que o corpo peça. Vale em toda
+        # gravação, então uma conta que deixou de ser liberada volta ao valor
+        # fixo no próximo salvar/iniciar.
+        if partial_update.masaniello_enabled:
+            logger.info(
+                "[MASANIELLO_DENIED_ACCOUNT] user_id=%s account_type=%s",
+                user_id,
+                auth.get("account_type"),
+            )
+        partial_update.masaniello_enabled = False
     masaniello_error = validate_masaniello_config(user_id, partial_update)
     if masaniello_error is not None:
         return json_response(400, masaniello_error)
