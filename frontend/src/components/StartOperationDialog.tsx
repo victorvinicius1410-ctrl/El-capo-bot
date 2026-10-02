@@ -63,7 +63,11 @@ import {
 } from "@/lib/robotSettings";
 import { MoneyInput } from "./MoneyInput";
 import { Switch } from "@/components/ui/switch";
-import { ConsistentManagementFields, ConsistentManagementToggle } from "./ConsistentManagement";
+import {
+  ConsistentManagementFields,
+  ConsistentManagementToggle,
+  useConsistentManagementAccess,
+} from "./ConsistentManagement";
 import { MarketModeLockPopover } from "@/components/MarketModeLockPopover";
 import {
   OPEN_MARKET_MAINTENANCE_SHORT,
@@ -223,12 +227,15 @@ export function StartOperationDialog({
   // Consistente. Onde ele ainda não subiu (backend antigo), a chave não
   // aparece: ligá-la ali seria uma opção que o robô ignora em silêncio.
   const consistentSupported = cachedRobotState?.masaniello_enabled !== undefined;
+  // Liberado para esta conta, ou "Em breve" com cadeado (conta de cliente, ou
+  // servidor que ainda não tem a função).
+  const consistentAvailable = useConsistentManagementAccess(consistentSupported) === "available";
   const cachedCycle = cachedRobotState?.masaniello_cycle ?? null;
   const masanielloCycle = cachedCycle && cachedCycle.id !== endedCycleId ? cachedCycle : null;
   // Modo LIVE ligado (conta marketing): o robô ignora o gerenciamento, então o
   // formulário volta para valor fixo + stops e a chave fica travada.
   const liveOn = cachedRobotState?.live_demo === true;
-  const masanielloOn = consistentSupported && draft.masanielloEnabled && !liveOn;
+  const masanielloOn = consistentAvailable && draft.masanielloEnabled && !liveOn;
   // O que vale para validar saldo/capital nesta partida. A preferência
   // gravada (`draft.masanielloEnabled`) NÃO muda por causa do LIVE.
   const effectiveDraft: OperationConfig = masanielloOn
@@ -370,6 +377,9 @@ export function StartOperationDialog({
     try {
       const safeDraft: OperationConfig = {
         ...draft,
+        // "Em breve": mesmo com uma preferência antiga guardada, não pede a
+        // função ao servidor (e o gale volta a poder ser ligado).
+        masanielloEnabled: consistentAvailable && draft.masanielloEnabled,
         entryValue: clampEntryValueForCurrency(draft.entryValue, accountCurrency),
         marketMode: coerceSelectableMarketMode(draft.marketMode),
       };
@@ -567,7 +577,7 @@ export function StartOperationDialog({
             </FormSection>
 
             <FormSection icon={ShieldCheck} title="Gerenciamento">
-              <div className={`grid gap-2 ${consistentSupported ? "sm:grid-cols-2" : ""}`}>
+              <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.7fr)]">
                 <div
                   className={`flex items-center justify-between gap-3 rounded-lg border bg-background/40 px-3 py-2 text-xs font-medium ${
                     galeOn ? "border-primary/60" : "border-border"
@@ -590,22 +600,21 @@ export function StartOperationDialog({
                     }
                   />
                 </div>
-                {consistentSupported ? (
-                  <ConsistentManagementToggle
-                    compact
-                    checked={masanielloOn}
-                    disabled={starting}
-                    liveOn={liveOn}
-                    currency={accountCurrency}
-                    onChange={(checked) =>
-                      patchDraft(
-                        checked
-                          ? { masanielloEnabled: true, martingaleEnabled: false }
-                          : { masanielloEnabled: false },
-                      )
-                    }
-                  />
-                ) : null}
+                <ConsistentManagementToggle
+                  compact
+                  soon={!consistentAvailable}
+                  checked={masanielloOn}
+                  disabled={starting}
+                  liveOn={liveOn}
+                  currency={accountCurrency}
+                  onChange={(checked) =>
+                    patchDraft(
+                      checked
+                        ? { masanielloEnabled: true, martingaleEnabled: false }
+                        : { masanielloEnabled: false },
+                    )
+                  }
+                />
               </div>
 
               {masanielloOn ? (

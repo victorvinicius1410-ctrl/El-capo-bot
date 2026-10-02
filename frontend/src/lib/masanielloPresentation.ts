@@ -23,6 +23,36 @@ import { entryLimitsForCurrency } from "./robotSettings.ts";
 
 export const CONSISTENT_MANAGEMENT_LABEL = "Gerenciamento Consistente";
 
+/**
+ * Tipos de conta que já podem usar o Gerenciamento Consistente. Decisão do
+ * dono (02/10/2026): em teste na conta marketing; para o cliente aparece com
+ * cadeado e "Em breve". Para liberar, acrescentar o tipo aqui e em
+ * `MASANIELLO_ACCOUNT_TYPES` no backend (`backend/main.py`) — o servidor
+ * recusa por conta própria quem não está na lista.
+ */
+export const CONSISTENT_MANAGEMENT_ACCOUNT_TYPES: readonly string[] = ["marketing"];
+
+export type ConsistentManagementAccess = "available" | "soon";
+
+/**
+ * A opção está liberada para esta conta, ou é "Em breve"?
+ *
+ * Precisa das duas coisas: o servidor conhecer a função (ele só manda
+ * `masaniello_enabled` no estado do robô se conhece) e o tipo da conta estar
+ * liberado. Sem saber o tipo ainda (perfil carregando), fica "Em breve".
+ */
+export function consistentManagementAccess(input: {
+  serverSupports: boolean;
+  accountType?: string | null;
+}): ConsistentManagementAccess {
+  const type = String(input.accountType ?? "")
+    .trim()
+    .toLowerCase();
+  return input.serverSupports && CONSISTENT_MANAGEMENT_ACCOUNT_TYPES.includes(type)
+    ? "available"
+    : "soon";
+}
+
 export interface MasanielloProfileOption {
   value: MasanielloProfile;
   label: string;

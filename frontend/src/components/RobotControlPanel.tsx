@@ -5,6 +5,7 @@ import { MoneyInput } from "@/components/MoneyInput";
 import {
   ConsistentManagementFields,
   ConsistentManagementToggle,
+  useConsistentManagementAccess,
 } from "@/components/ConsistentManagement";
 import { MasanielloCalculator } from "@/components/MasanielloCalculator";
 import { MarketModeLockPopover } from "@/components/MarketModeLockPopover";
@@ -76,7 +77,9 @@ export function RobotControlPanel() {
   // Consistente. Onde ele ainda não subiu (backend antigo), a chave não
   // aparece: ligá-la ali seria uma opção que o robô ignora em silêncio.
   const consistentSupported = robotState.data?.masaniello_enabled !== undefined;
-  const masanielloOn = consistentSupported && settings.masanielloEnabled && !liveOn;
+  // Liberado para esta conta, ou "Em breve" com cadeado.
+  const consistentAvailable = useConsistentManagementAccess(consistentSupported) === "available";
+  const masanielloOn = consistentAvailable && settings.masanielloEnabled && !liveOn;
   const masanielloCycle = robotState.data?.masaniello_cycle ?? null;
   const payoutRef = masanielloPayoutRef(robotState.data?.min_payout);
   const continuingCycle =
@@ -127,6 +130,8 @@ export function RobotControlPanel() {
         ? settings
         : { ...settings, marketMode: selectableMode }),
       entryValue: clampEntryValueForCurrency(settings.entryValue, currency),
+      // "Em breve": conta sem a função nunca pede ela ao servidor.
+      masanielloEnabled: consistentAvailable && settings.masanielloEnabled,
     };
     if (toSave.marketMode !== settings.marketMode) {
       setSettings(toSave);
@@ -437,21 +442,20 @@ export function RobotControlPanel() {
               className="h-4 w-4 accent-primary"
             />
           </label>
-          {consistentSupported ? (
-            <ConsistentManagementToggle
-              checked={masanielloOn}
-              disabled={busy || running}
-              liveOn={liveOn}
-              currency={currency}
-              onChange={(checked) =>
-                patch(
-                  checked
-                    ? { masanielloEnabled: true, martingaleEnabled: false }
-                    : { masanielloEnabled: false },
-                )
-              }
-            />
-          ) : null}
+          <ConsistentManagementToggle
+            soon={!consistentAvailable}
+            checked={masanielloOn}
+            disabled={busy || running}
+            liveOn={liveOn}
+            currency={currency}
+            onChange={(checked) =>
+              patch(
+                checked
+                  ? { masanielloEnabled: true, martingaleEnabled: false }
+                  : { masanielloEnabled: false },
+              )
+            }
+          />
           <label className="block space-y-1.5 text-sm">
             <span className="font-medium">Quantidade de Gales</span>
             <input

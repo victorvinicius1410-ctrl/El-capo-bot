@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { newMasanielloCycle, simulateMasaniello } from "./masaniello.ts";
 import {
+  consistentManagementAccess,
   masanielloCycleBalance,
   masanielloCycleHeadline,
   masanielloFormView,
@@ -138,4 +139,18 @@ test("linha do overlay só com ciclo em andamento", () => {
   const meta = simulateMasaniello(100, 10, 4, 80, ["W", "W", "W", "W"], { minEntry: 5 });
   assert.equal(masanielloOverlayLine(meta, "BRL"), null);
   assert.equal(masanielloOverlayLine(null, "BRL"), null);
+});
+
+test("cliente vê 'Em breve'; marketing usa, se o servidor conhece a função", () => {
+  const access = (serverSupports: boolean, accountType?: string | null) =>
+    consistentManagementAccess({ serverSupports, accountType });
+  assert.equal(access(true, "marketing"), "available");
+  assert.equal(access(true, "Marketing "), "available");
+  assert.equal(access(true, "client"), "soon");
+  assert.equal(access(true, "trial"), "soon");
+  // Perfil ainda carregando: não libera por engano.
+  assert.equal(access(true, undefined), "soon");
+  assert.equal(access(true, null), "soon");
+  // Servidor antigo (produção hoje): ninguém usa, nem marketing.
+  assert.equal(access(false, "marketing"), "soon");
 });

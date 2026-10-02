@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
-import { CircleHelp, ListOrdered, RotateCcw, Undo2 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { CircleHelp, ListOrdered, Lock, RotateCcw, Undo2 } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -20,11 +21,15 @@ import {
 } from "@/lib/masaniello";
 import {
   CONSISTENT_MANAGEMENT_LABEL,
+  type ConsistentManagementAccess,
   MASANIELLO_PROFILE_OPTIONS,
+  consistentManagementAccess,
   masanielloFormView,
   masanielloRowNote,
 } from "@/lib/masanielloPresentation";
+import { meAccessQueryOptions } from "@/lib/meAccessQuery";
 import type { RobotSettings } from "@/lib/robotSettings";
+import { useAuth } from "@/lib/useAuth";
 
 /** Os dois formulários (diálogo e página) têm destaque de cor diferente. */
 export type ConsistentAccent = "dialog" | "panel";
@@ -49,6 +54,21 @@ export type ConsistentManagementValue = Pick<
   | "masanielloWins"
 >;
 
+/**
+ * A opção está liberada para quem está logado, ou é "Em breve"?
+ *
+ * @param serverSupports O servidor mandou `masaniello_enabled` no estado do
+ *   robô (só manda se conhece a função).
+ */
+export function useConsistentManagementAccess(serverSupports: boolean): ConsistentManagementAccess {
+  const { user } = useAuth();
+  const access = useQuery({ ...meAccessQueryOptions(), enabled: Boolean(user?.id) });
+  return consistentManagementAccess({
+    serverSupports,
+    accountType: access.data?.account_type,
+  });
+}
+
 /** Aviso mostrado no lugar da chave quando o modo LIVE está ligado. */
 export const CONSISTENT_LIVE_NOTICE =
   "Indisponível com o modo LIVE ligado. Desligue o LIVE para usar.";
@@ -64,6 +84,11 @@ interface ToggleProps {
   liveOn?: boolean;
   /** Linha baixa com interruptor, para o pop-up de Iniciar. */
   compact?: boolean;
+  /**
+   * "Em breve": a conta ainda não tem a função. Mostra o cadeado no lugar do
+   * interruptor; o "?" continua abrindo a explicação.
+   */
+  soon?: boolean;
   onChange: (checked: boolean) => void;
 }
 
@@ -74,6 +99,7 @@ export function ConsistentManagementToggle({
   currency,
   liveOn = false,
   compact = false,
+  soon = false,
   onChange,
 }: ToggleProps) {
   const [helpOpen, setHelpOpen] = useState(false);
@@ -81,10 +107,15 @@ export function ConsistentManagementToggle({
     <div
       className={`flex items-center justify-between gap-3 border bg-background/40 font-medium ${
         compact ? "rounded-lg px-3 py-2 text-xs" : "rounded-xl px-4 py-3 text-sm"
-      } ${checked && !liveOn ? "border-primary/60" : "border-border"}`}
+      } ${checked && !liveOn && !soon ? "border-primary/60" : "border-border"}`}
     >
       <span className="flex flex-wrap items-center gap-x-2">
-        <label htmlFor="consistent-management-toggle">{CONSISTENT_MANAGEMENT_LABEL}</label>
+        <label
+          htmlFor={soon ? undefined : "consistent-management-toggle"}
+          className={soon ? "text-muted-foreground" : undefined}
+        >
+          {CONSISTENT_MANAGEMENT_LABEL}
+        </label>
         <button
           type="button"
           onClick={() => setHelpOpen(true)}
@@ -94,13 +125,21 @@ export function ConsistentManagementToggle({
         >
           <CircleHelp className="h-4 w-4" aria-hidden />
         </button>
-        {liveOn ? (
+        {liveOn && !soon ? (
           <span className="basis-full text-[11px] font-normal text-muted-foreground">
             {CONSISTENT_LIVE_NOTICE}
           </span>
         ) : null}
       </span>
-      {compact ? (
+      {soon ? (
+        <span
+          className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border bg-background/60 px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground"
+          title="Esta opção ainda não está liberada para a sua conta"
+        >
+          <Lock className="h-3 w-3" aria-hidden />
+          Em breve
+        </span>
+      ) : compact ? (
         <Switch
           id="consistent-management-toggle"
           className="data-[state=unchecked]:bg-muted-foreground/30"
