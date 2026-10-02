@@ -5,8 +5,9 @@ entrada deixa de ser o "Valor por entrada" fixo e passa a ser calculado pelo
 Algoritmo de Masaniello a partir de um **capital do ciclo**. O plano também é
 o stop: Stop Win, Stop Loss e gale não valem neste modo.
 
-Estado em 02/10/2026: implementado no ramo `gerenciamento-consistente`, só no
-sistema 02. Não está em produção.
+Estado em 02/10/2026: **em produção e no sistema 02** (mesmo commit, `a82b17c`),
+liberado só para conta marketing. Conta de cliente vê a opção com cadeado e
+"Em breve". Ainda falta a primeira prova com ordem real (ver "Como conferir").
 
 ## O que o cliente configura
 
@@ -57,7 +58,8 @@ A explicação do "?" diz isso e não pode passar a prometer lucro.
 | Reiniciar placar | Zera o placar; não mexe no ciclo. |
 | Reiniciar ciclo (`/robot/reset-cycle`) | Apaga o ciclo junto com o Histórico. |
 | Desligar o modo | Encerra o ciclo em andamento (`ABANDONED`). |
-| Conta marketing | Pode usar (decisão do dono, 02/10): o ciclo só acompanha ordem real com a marca dele, então operação do Shift+O não o distorce. |
+| Quem pode usar | Só conta marketing por enquanto (decisão do dono, 02/10). O servidor recusa as demais em `POST /robot/config` (`MASANIELLO_ACCOUNT_TYPES` em `main.py`) e o painel mostra cadeado + "Em breve" (`CONSISTENT_MANAGEMENT_ACCOUNT_TYPES` em `masanielloPresentation.ts`). Para liberar ao cliente, acrescentar o tipo nos DOIS lugares. |
+| Shift+O na conta marketing | Não distorce o ciclo: ele só acompanha ordem real com a marca dele. |
 | Modo LIVE ligado | Gerenciamento suspenso (`masaniello_active` falso): o LIVE esconde loss e o ciclo não fecharia a conta. O robô volta ao valor fixo e aos stops de sempre; a configuração fica guardada, a chave aparece travada com o aviso e a calculadora some. |
 
 ## Onde está
