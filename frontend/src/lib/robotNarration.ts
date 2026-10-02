@@ -122,11 +122,19 @@ export function buildRobotNarrationEvents(
     trade?.result === "PENDING_RESULT";
 
   if (stopKind) {
+    // Gerenciamento Consistente: o stop é o fim do ciclo, e o número que
+    // importa é o resultado do CICLO, não o placar da sessão.
+    const ciclo = state.masaniello_enabled && !state.live_demo ? state.masaniello_cycle : null;
+    const cicloEncerrado = ciclo && (ciclo.status === "TARGET_HIT" || ciclo.status === "BUST");
+    const resultadoDoCiclo = ciclo ? ciclo.capital_atual - ciclo.capital_inicial : 0;
     events.push({
       key: eventKey(stopKind, orderId, signalCreatedAt, signal,
         `${state.profit}:${state.wins}:${state.losses}:${state.stop_reason ?? ""}`),
-      text:
-        stopKind === "STOP_WIN"
+      text: cicloEncerrado
+        ? stopKind === "STOP_WIN"
+          ? `Meta do ciclo batida. Resultado do ciclo de ${speakMoney(resultadoDoCiclo)}. O robô parou. Para continuar, inicie uma nova operação.`
+          : `Os erros do ciclo se esgotaram e o capital do ciclo foi perdido. Resultado do ciclo de ${speakMoney(resultadoDoCiclo)}. O robô foi pausado. Respeite o seu gerenciamento antes de iniciar outro ciclo.`
+        : stopKind === "STOP_WIN"
           ? `Meta de lucro atingida. Resultado atual de ${speakMoney(state.profit)}. Respeite o seu gerenciamento e siga com disciplina. Vamos em frente com o robo do Sergio Trader.`
           : `Limite de perda atingido. Resultado atual de ${speakMoney(state.profit)}. Respeite o seu gerenciamento para proteger o capital. O robo foi pausado com seguranca.`,
     });
@@ -136,7 +144,9 @@ export function buildRobotNarrationEvents(
   if (!state.enabled || status === "STOPPED") {
     events.push({
       key: "WELCOME_STOPPED",
-      text: "Bem-vindo ao robô do Sérgio Trader. Para iniciar, faça login na Bullex. Depois, ligue o robô. Não esqueça de configurar o valor da entrada, o stop win, e o stop loss.",
+      text: state.masaniello_enabled
+        ? "Bem-vindo ao robô do Sérgio Trader. Para iniciar, faça login na Bullex. Depois, ligue o robô. Não esqueça de conferir o capital e o perfil do gerenciamento consistente."
+        : "Bem-vindo ao robô do Sérgio Trader. Para iniciar, faça login na Bullex. Depois, ligue o robô. Não esqueça de configurar o valor da entrada, o stop win, e o stop loss.",
     });
     return events;
   }

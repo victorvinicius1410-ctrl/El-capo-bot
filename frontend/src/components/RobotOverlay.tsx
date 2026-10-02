@@ -20,6 +20,7 @@ import {
 } from "@/lib/robotPresentation";
 import { maskMoney, privacyToggleLabel, togglePrivacyMode, usePrivacyMode } from "@/lib/privacyMode";
 import { isStudyActive } from "@/lib/studyMode";
+import { masanielloOverlayLine } from "@/lib/masanielloPresentation";
 import {
   DEFAULT_ROBOT_SETTINGS,
   ENTRY_VALUE_STEP,
@@ -125,6 +126,10 @@ export function RobotOverlay({
   const scoreLosses = robotState?.losses ?? lastKnownScoreRef.current.losses;
   const scoreProfit = robotState ? robotState.profit : lastKnownScoreRef.current.profit;
   const now = useNowTicker();
+  // Resumo do ciclo do Gerenciamento Consistente (some com o modo desligado).
+  const masanielloLine = robotState?.masaniello_enabled
+    ? masanielloOverlayLine(robotState.masaniello_cycle, account?.currency)
+    : null;
   const presentation = getRobotStatusPresentation(robotState, now);
   // LIVE: sem balão de entrada e sem resultado LOSS; o contador prévio de
   // losses permanece visível e congelado.
@@ -583,6 +588,14 @@ export function RobotOverlay({
           </div>
         ) : null}
         {study ? null : <ProfitBadge profit={scoreProfit} currency={account?.currency} />}
+        {!study && masanielloLine ? (
+          <p
+            className="mt-1 max-w-full rounded-full border border-border bg-background/60 px-3 py-1 text-center text-[11px] font-semibold text-muted-foreground"
+            data-testid="masaniello-overlay-line"
+          >
+            {masanielloLine}
+          </p>
+        ) : null}
         {!adminModelControls && (onStartOperation || onStopOperation || onResetScore) ? (
           <div
             className="z-10 mt-1 flex flex-col items-center gap-1.5"

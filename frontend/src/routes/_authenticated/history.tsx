@@ -39,6 +39,7 @@ import {
   useLiveTradingData,
 } from "@/hooks/useLiveTradingData";
 import { meAccessQueryOptions } from "@/lib/meAccessQuery";
+import { MasanielloCalculator } from "@/components/MasanielloCalculator";
 import { useMarketingPanel } from "@/lib/marketingPanelContext";
 import {
   isMarketingSimulationAccount,
@@ -64,7 +65,7 @@ function HistoryPage() {
   );
   const [analysisItem, setAnalysisItem] = useState<RobotHistoryItem | null>(null);
   const history = useRobotHistory(days);
-  const { robotState } = useLiveTradingData();
+  const { robotState, account } = useLiveTradingData();
   // Modo Estudo: esconde os losses do estudo enquanto ele estiver ligado, e o
   // aviso abaixo diz quantos. Desligou, a lista volta inteira.
   const study = filterStudyHistory(
@@ -175,6 +176,16 @@ function HistoryPage() {
           Icon={BarChart3}
         />
       </div>
+
+      {robotState.data?.masaniello_cycle &&
+      !robotState.data.live_demo &&
+      (robotState.data.masaniello_enabled || robotState.data.masaniello_cycle.status === "ACTIVE") ? (
+        <MasanielloCalculator
+          cycle={robotState.data.masaniello_cycle}
+          currency={account.data?.currency ?? null}
+          className="page-surface overflow-hidden"
+        />
+      ) : null}
 
       <section className="page-surface overflow-hidden">
         <div className="border-b border-border px-5 py-4">

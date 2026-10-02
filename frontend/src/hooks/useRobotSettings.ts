@@ -4,6 +4,7 @@ import { ApiError, robotConfig } from "@/lib/api";
 import {
   cycleMinutesForTimeframe,
   getRobotSettingsSnapshot,
+  masanielloConfigPayload,
   markRobotSettingsSynced,
   setRobotSettingsForUser,
   subscribeRobotSettings,
@@ -47,6 +48,7 @@ export function useRobotSettings(userId?: string | null) {
       martingale_enabled: next.martingaleEnabled,
       martingale_steps: next.martingaleSteps,
       martingale_multiplier: next.martingaleMultiplier,
+      ...masanielloConfigPayload(next),
       ai_analysis_enabled: false,
       ai_confirmation_required: false,
       ai_min_confidence: null,

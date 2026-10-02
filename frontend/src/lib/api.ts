@@ -339,6 +339,12 @@ const KNOWN_ERROR_MESSAGES: Record<string, string> = {
     "Stop Win já foi atingido. Para operar de novo, aumente o Stop Win em Iniciar Operação, ou clique em Reiniciar placar.",
   STOP_LOSS_HIT:
     "Stop Loss já foi atingido. Para operar de novo, aumente o Stop Loss em Iniciar Operação, ou clique em Reiniciar placar.",
+  MASANIELLO_CAPITAL_TOO_LOW:
+    "O capital do ciclo é baixo demais: a primeira entrada ficaria abaixo do mínimo da corretora. Aumente o capital ou escolha um perfil com entradas maiores.",
+  MASANIELLO_INVALID_PLAN:
+    "Plano do Gerenciamento Consistente inválido: o número de acertos tem que ser menor que o número de operações.",
+  MASANIELLO_RESULT_PENDING:
+    "O resultado da última ordem do ciclo não chegou. Confira a operação na corretora antes de continuar.",
   ACCESS_INACTIVE:
     "Seu acesso está inativo ou aguardando aprovação. Regularize no Financeiro ou aguarde a liberação.",
   SIMULATED_TRADE_NOT_FOUND:
@@ -933,5 +939,12 @@ export const robotLiveMode = (enabled: boolean) =>
 export const robotStudyMode = (enabled: boolean) =>
   apiRequest("/robot/study-mode", { method: "POST", body: JSON.stringify({ enabled }) });
 export const robotResetCycle = () => apiRequest("/robot/reset-cycle", { method: "POST" });
+/**
+ * Encerra o ciclo em andamento do Gerenciamento Consistente (só com o robô
+ * parado). O próximo "Iniciar" abre um ciclo novo com o capital configurado.
+ * Não mexe no placar nem no Histórico.
+ */
+export const robotMasanielloEndCycle = () =>
+  apiRequest<Record<string, unknown>>("/robot/masaniello/end-cycle", { method: "POST" });
 export const robotResetScore = () => apiRequest("/robot/reset-score", { method: "POST" });
 export const robotSyncConnection = () => apiRequest("/robot/sync-connection", { method: "POST" });

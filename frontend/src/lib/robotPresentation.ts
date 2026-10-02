@@ -416,6 +416,18 @@ function baseRobotStatusPresentation(
       result,
     };
   }
+  // Gerenciamento Consistente: o fim do ciclo é o stop (o backend reusa os
+  // mesmos status) e o robô já está parado quando chega aqui. Vem ANTES do
+  // "Robo parado" porque a regra do modo é parar e avisar: sem isto o overlay
+  // mostraria só "parado" e o cliente não saberia que o ciclo acabou.
+  const cicloEncerrado =
+    state.masaniello_enabled && !state.live_demo ? state.masaniello_cycle?.status : undefined;
+  if (status === "STOP_WIN_HIT" && cicloEncerrado === "TARGET_HIT") {
+    return presentation("stopped", "Meta do ciclo batida", "Clique em Iniciar para um novo ciclo");
+  }
+  if (status === "STOP_LOSS_HIT" && cicloEncerrado === "BUST") {
+    return presentation("stopped", "Capital do ciclo perdido", "Clique em Iniciar para um novo ciclo");
+  }
   if (status === "STOPPED" || isIdle(state)) return presentation("stopped", "Robo parado");
   if (status === "STOP_WIN_HIT") return presentation("stopped", "Stop Win atingido", "Robo pausado");
   if (status === "STOP_LOSS_HIT") return presentation("stopped", "Stop Loss atingido", "Robo pausado");

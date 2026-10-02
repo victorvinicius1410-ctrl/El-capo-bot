@@ -2,6 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, Loader2, Lock, Save } from "lucide-react";
 import { toast } from "sonner";
 import { MoneyInput } from "@/components/MoneyInput";
+import {
+  ConsistentManagementFields,
+  ConsistentManagementToggle,
+} from "@/components/ConsistentManagement";
+import { MasanielloCalculator } from "@/components/MasanielloCalculator";
 import { MarketModeLockPopover } from "@/components/MarketModeLockPopover";
 import {
   OPEN_MARKET_MAINTENANCE_SHORT,
@@ -14,7 +19,9 @@ import {
   revertOptimisticOperation,
 } from "@/hooks/useLiveTradingData";
 import { useRobotSettings } from "@/hooks/useRobotSettings";
-import { robotStart, robotStop } from "@/lib/api";
+import { robotMasanielloEndCycle, robotStart, robotStop } from "@/lib/api";
+import { masanielloPlanForProfile, masanielloWillContinue } from "@/lib/masaniello";
+import { masanielloFormView, masanielloPayoutRef } from "@/lib/masanielloPresentation";
 import { entryValueBalanceError, formatBullExBalance, isBullExConnected } from "@/lib/bullexConnection";
 import { isRobotOperationRunning } from "@/lib/robotState";
 import { useAuth } from "@/lib/useAuth";
@@ -51,7 +58,7 @@ export function RobotControlPanel() {
   const queryClient = useQueryClient();
   const { account, accountStatus, robotState } = useLiveTradingData();
   const { settings, setSettings, saveSettings } = useRobotSettings(user?.id);
-  const [pending, setPending] = useState<"save" | "toggle" | null>(null);
+  const [pending, setPending] = useState<"save" | "toggle" | "end-cycle" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const running = isRobotOperationRunning(robotState.data);
@@ -62,9 +69,44 @@ export function RobotControlPanel() {
   const currency = account.data?.currency ?? null;
   const balance = account.data?.balance ?? null;
   const entryLimits = entryLimitsForCurrency(currency);
+  // Modo LIVE ligado (conta marketing): o robô ignora o gerenciamento, então o
+  // formulário volta para valor fixo + stops e a chave fica travada.
+  const liveOn = robotState.data?.live_demo === true;
+  // O servidor só manda `masaniello_enabled` se conhece o Gerenciamento
+  // Consistente. Onde ele ainda não subiu (backend antigo), a chave não
+  // aparece: ligá-la ali seria uma opção que o robô ignora em silêncio.
+  const consistentSupported = robotState.data?.masaniello_enabled !== undefined;
+  const masanielloOn = consistentSupported && settings.masanielloEnabled && !liveOn;
+  const masanielloCycle = robotState.data?.masaniello_cycle ?? null;
+  const payoutRef = masanielloPayoutRef(robotState.data?.min_payout);
+  const continuingCycle =
+    masanielloOn &&
+    masanielloWillContinue(masanielloCycle, {
+      capital: settings.masanielloCapital,
+      ...masanielloPlanForProfile(
+        settings.masanielloProfile,
+        settings.masanielloOperations,
+        settings.masanielloWins,
+      ),
+      payoutRef,
+    });
+  // No Gerenciamento Consistente quem manda é o capital do ciclo (ou só a
+  // próxima entrada, se vai continuar um ciclo); no valor fixo, a entrada.
   const balanceError = useMemo(
-    () => entryValueBalanceError(balance, settings.entryValue),
-    [balance, settings.entryValue],
+    () =>
+      masanielloOn
+        ? masanielloFormView({
+            capital: settings.masanielloCapital,
+            profile: settings.masanielloProfile,
+            operations: settings.masanielloOperations,
+            wins: settings.masanielloWins,
+            payoutRef,
+            currency,
+            balance,
+            continuing: continuingCycle,
+          }).error
+        : entryValueBalanceError(balance, settings.entryValue),
+    [balance, currency, settings, masanielloOn, payoutRef, continuingCycle],
   );
 
   useEffect(() => {
@@ -110,6 +152,24 @@ export function RobotControlPanel() {
       setError(message);
       toast.error(message);
       return false;
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function endCycle(): Promise<void> {
+    setPending("end-cycle");
+    try {
+      const response = await robotMasanielloEndCycle();
+      if (!response.ok) {
+        toast.error(response.error);
+        return;
+      }
+      if (user?.id && response.data) {
+        applyRobotMutationToCache(queryClient, user.id, response.data);
+      }
+      void robotState.refetch();
+      toast.success("Ciclo encerrado. O próximo Iniciar começa um ciclo novo.");
     } finally {
       setPending(null);
     }
@@ -196,7 +256,7 @@ export function RobotControlPanel() {
             <Bot className="h-5 w-5" /> Robô
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Defina aqui o que o robô usa na corretora: timeframe, mercado, valores e gale.
+            Defina aqui o que o robô usa na corretora: timeframe, mercado, valores e gerenciamento.
             Saldo conectado: {formatBullExBalance(balance, currency)}.
           </p>
         </div>
@@ -288,70 +348,110 @@ export function RobotControlPanel() {
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2">
-          <MoneyInput
-            label="Valor por entrada"
-            currency={currency}
-            min={entryLimits.min}
-            step={ENTRY_VALUE_STEP}
-            value={settings.entryValue}
-            disabled={busy || running}
-            helperText={entryValueHelperText(currency)}
-            onChange={(value) => {
-              const parsed = parseEntryValueInput(value, settings.entryValue, currency);
-              if (parsed == null) return;
-              patch({ entryValue: parsed });
-            }}
-          />
-          <div className="space-y-2 sm:col-span-2">
-            <PanelStopField
-              kind="win"
-              mode={settings.stopWinMode}
-              moneyValue={settings.stopWin}
-              operationsValue={settings.stopWinOperations}
-              currency={currency}
+          {masanielloOn ? (
+            <ConsistentManagementFields
+              accent="panel"
+              value={settings}
+              onChange={patch}
               disabled={busy || running}
-              onModeChange={(mode) => patch({ stopWinMode: mode })}
-              onMoneyChange={(value) => {
-                const parsed = parseStopMoneyInput(value, settings.stopWin);
-                if (parsed == null) return;
-                patch({ stopWin: parsed });
-              }}
-              onOperationsChange={(value) => {
-                const parsed = parseStopOperationsInput(value, settings.stopWinOperations);
-                if (parsed == null) return;
-                patch({ stopWinOperations: parsed });
-              }}
-            />
-            <PanelStopField
-              kind="loss"
-              mode={settings.stopLossMode}
-              moneyValue={settings.stopLoss}
-              operationsValue={settings.stopLossOperations}
               currency={currency}
-              disabled={busy || running}
-              onModeChange={(mode) => patch({ stopLossMode: mode })}
-              onMoneyChange={(value) => {
-                const parsed = parseStopMoneyInput(value, settings.stopLoss);
-                if (parsed == null) return;
-                patch({ stopLoss: parsed });
-              }}
-              onOperationsChange={(value) => {
-                const parsed = parseStopOperationsInput(value, settings.stopLossOperations);
-                if (parsed == null) return;
-                patch({ stopLossOperations: parsed });
-              }}
+              balance={balance}
+              payoutRef={payoutRef}
+              cycle={masanielloCycle}
+              onEndCycle={running ? undefined : () => void endCycle()}
+              endingCycle={pending === "end-cycle"}
             />
-          </div>
+          ) : (
+            <>
+              <MoneyInput
+                label="Valor por entrada"
+                currency={currency}
+                min={entryLimits.min}
+                step={ENTRY_VALUE_STEP}
+                value={settings.entryValue}
+                disabled={busy || running}
+                helperText={entryValueHelperText(currency)}
+                onChange={(value) => {
+                  const parsed = parseEntryValueInput(value, settings.entryValue, currency);
+                  if (parsed == null) return;
+                  patch({ entryValue: parsed });
+                }}
+              />
+              <div className="space-y-2 sm:col-span-2">
+                <PanelStopField
+                  kind="win"
+                  mode={settings.stopWinMode}
+                  moneyValue={settings.stopWin}
+                  operationsValue={settings.stopWinOperations}
+                  currency={currency}
+                  disabled={busy || running}
+                  onModeChange={(mode) => patch({ stopWinMode: mode })}
+                  onMoneyChange={(value) => {
+                    const parsed = parseStopMoneyInput(value, settings.stopWin);
+                    if (parsed == null) return;
+                    patch({ stopWin: parsed });
+                  }}
+                  onOperationsChange={(value) => {
+                    const parsed = parseStopOperationsInput(value, settings.stopWinOperations);
+                    if (parsed == null) return;
+                    patch({ stopWinOperations: parsed });
+                  }}
+                />
+                <PanelStopField
+                  kind="loss"
+                  mode={settings.stopLossMode}
+                  moneyValue={settings.stopLoss}
+                  operationsValue={settings.stopLossOperations}
+                  currency={currency}
+                  disabled={busy || running}
+                  onModeChange={(mode) => patch({ stopLossMode: mode })}
+                  onMoneyChange={(value) => {
+                    const parsed = parseStopMoneyInput(value, settings.stopLoss);
+                    if (parsed == null) return;
+                    patch({ stopLoss: parsed });
+                  }}
+                  onOperationsChange={(value) => {
+                    const parsed = parseStopOperationsInput(value, settings.stopLossOperations);
+                    if (parsed == null) return;
+                    patch({ stopLossOperations: parsed });
+                  }}
+                />
+              </div>
+            </>
+          )}
           <label className="flex items-center justify-between gap-3 rounded-xl border border-border bg-background/40 px-4 py-3 text-sm font-medium">
             <span>Gale ativado</span>
             <input
               type="checkbox"
-              checked={settings.martingaleEnabled}
-              disabled={busy || running}
-              onChange={(event) => patch({ martingaleEnabled: event.target.checked })}
+              checked={settings.martingaleEnabled && !masanielloOn}
+              disabled={busy || running || masanielloOn}
+              // Os dois não convivem: ligar o gale desliga o Gerenciamento
+              // Consistente (só dá para chegar aqui com ele fora de ação).
+              onChange={(event) =>
+                patch(
+                  event.target.checked
+                    ? { martingaleEnabled: true, masanielloEnabled: false }
+                    : { martingaleEnabled: false },
+                )
+              }
               className="h-4 w-4 accent-primary"
             />
           </label>
+          {consistentSupported ? (
+            <ConsistentManagementToggle
+              checked={masanielloOn}
+              disabled={busy || running}
+              liveOn={liveOn}
+              currency={currency}
+              onChange={(checked) =>
+                patch(
+                  checked
+                    ? { masanielloEnabled: true, martingaleEnabled: false }
+                    : { masanielloEnabled: false },
+                )
+              }
+            />
+          ) : null}
           <label className="block space-y-1.5 text-sm">
             <span className="font-medium">Quantidade de Gales</span>
             <input
@@ -360,7 +460,7 @@ export function RobotControlPanel() {
               max={10}
               step={1}
               value={settings.martingaleSteps}
-              disabled={busy || running || !settings.martingaleEnabled}
+              disabled={busy || running || !settings.martingaleEnabled || masanielloOn}
               onChange={(event) =>
                 patch({
                   martingaleSteps: Math.max(1, Math.floor(Number(event.target.value) || 1)),
@@ -377,7 +477,7 @@ export function RobotControlPanel() {
               max={20}
               step={0.1}
               value={settings.martingaleMultiplier}
-              disabled={busy || running || !settings.martingaleEnabled}
+              disabled={busy || running || !settings.martingaleEnabled || masanielloOn}
               onChange={(event) =>
                 patch({
                   martingaleMultiplier: Math.max(1, Number(event.target.value) || 2),
@@ -394,7 +494,9 @@ export function RobotControlPanel() {
             foi perdida. Clique em <strong>Iniciar robô</strong> para voltar a operar.
           </p>
         ) : null}
-        {balanceError ? <p className="text-sm text-destructive">{balanceError}</p> : null}
+        {balanceError && !masanielloOn ? (
+          <p className="text-sm text-destructive">{balanceError}</p>
+        ) : null}
         {error && error !== balanceError ? <p className="text-sm text-destructive">{error}</p> : null}
 
         <div className="flex flex-wrap gap-2 pt-1">
@@ -418,6 +520,14 @@ export function RobotControlPanel() {
           </button>
         </div>
       </div>
+
+      {!liveOn && (masanielloOn || masanielloCycle?.status === "ACTIVE") ? (
+        <MasanielloCalculator
+          cycle={masanielloCycle}
+          currency={currency}
+          className="config-surface overflow-hidden !p-0"
+        />
+      ) : null}
     </section>
   );
 }

@@ -12,6 +12,8 @@ interface MoneyInputProps {
   step?: number | string;
   helperText?: string;
   size?: "default" | "compact";
+  /** Esconde o rótulo visível (quem usa desenha o próprio); o `aria-label` fica. */
+  hideLabel?: boolean;
 }
 
 /**
@@ -32,6 +34,7 @@ export function MoneyInput({
   step = 1,
   helperText,
   size = "default",
+  hideLabel = false,
 }: MoneyInputProps) {
   const symbol = currencySymbol(currency);
   const compact = size === "compact";
@@ -41,9 +44,11 @@ export function MoneyInput({
 
   return (
     <label className={compact ? "block" : "block space-y-1.5 text-sm"}>
-      <span className={compact ? "mb-1 block text-xs font-medium text-muted-foreground" : "font-medium"}>
-        {label}
-      </span>
+      {hideLabel ? null : (
+        <span className={compact ? "mb-1 block text-xs font-medium text-muted-foreground" : "font-medium"}>
+          {label}
+        </span>
+      )}
       <div
         className={`flex items-center overflow-hidden border border-border bg-background/40 ring-primary focus-within:ring-2 ${compact ? "rounded-lg" : "rounded-xl"} ${disabled ? "opacity-50" : ""}`}
       >

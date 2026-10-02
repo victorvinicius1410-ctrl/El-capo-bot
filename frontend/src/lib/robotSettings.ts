@@ -1,4 +1,13 @@
 import { formatBullExBalance, normalizeAccountCurrency } from "./bullexConnection.ts";
+import {
+  MASANIELLO_DEFAULT_CAPITAL,
+  MASANIELLO_DEFAULT_PROFILE,
+  MASANIELLO_PROFILES,
+  type MasanielloProfile,
+  cents as masanielloCents,
+  masanielloPlanForProfile,
+  normalizeMasanielloProfile,
+} from "./masaniello.ts";
 import { OPEN_MARKET_UNDER_MAINTENANCE } from "./openMarketMaintenance.ts";
 
 export type RobotTimeframe = "M1" | "M5" | "M15";
@@ -17,6 +26,16 @@ export interface RobotSettings {
   martingaleEnabled: boolean;
   martingaleSteps: number;
   martingaleMultiplier: number;
+  /**
+   * Gerenciamento Consistente (Masaniello): com ele ligado o valor de cada
+   * entrada sai do plano (capital + perfil), não de `entryValue`, e o próprio
+   * ciclo é o stop. Não convive com o gale.
+   */
+  masanielloEnabled: boolean;
+  masanielloCapital: number;
+  masanielloProfile: MasanielloProfile;
+  masanielloOperations: number;
+  masanielloWins: number;
   timeframe: RobotTimeframe;
   marketMode: RobotMarketMode;
   aiAnalysisEnabled: boolean;
@@ -237,6 +256,11 @@ export const DEFAULT_ROBOT_SETTINGS: RobotSettings = {
   martingaleEnabled: false,
   martingaleSteps: 1,
   martingaleMultiplier: 2,
+  masanielloEnabled: false,
+  masanielloCapital: MASANIELLO_DEFAULT_CAPITAL,
+  masanielloProfile: MASANIELLO_DEFAULT_PROFILE,
+  masanielloOperations: MASANIELLO_PROFILES[MASANIELLO_DEFAULT_PROFILE][0],
+  masanielloWins: MASANIELLO_PROFILES[MASANIELLO_DEFAULT_PROFILE][1],
   timeframe: "M1",
   marketMode: "OTC",
   aiAnalysisEnabled: false,
@@ -244,6 +268,32 @@ export const DEFAULT_ROBOT_SETTINGS: RobotSettings = {
   aiMinConfidence: 80,
   narratorEnabled: true,
 };
+
+/**
+ * Campos do Gerenciamento Consistente para o `POST /robot/config`.
+ *
+ * Um lugar só: os dois formulários (diálogo de Iniciar e página de
+ * Configurações) montam o corpo à mão, e campo esquecido em um deles some sem
+ * erro nenhum.
+ */
+export function masanielloConfigPayload(
+  settings: Pick<
+    RobotSettings,
+    | "masanielloEnabled"
+    | "masanielloCapital"
+    | "masanielloProfile"
+    | "masanielloOperations"
+    | "masanielloWins"
+  >,
+): Record<string, unknown> {
+  return {
+    masaniello_enabled: settings.masanielloEnabled,
+    masaniello_capital: settings.masanielloCapital,
+    masaniello_profile: settings.masanielloProfile,
+    masaniello_operations: settings.masanielloOperations,
+    masaniello_wins: settings.masanielloWins,
+  };
+}
 
 /** Retorna a duração da vela/ordem (em minutos) para o timeframe. */
 export function cycleMinutesForTimeframe(value?: string | null): number {
@@ -307,6 +357,15 @@ export function normalizeRobotSettings(
 ): RobotSettings {
   const defaults = DEFAULT_ROBOT_SETTINGS;
   const entryMin = entryLimitsForCurrency(currency).min;
+  const masanielloEnabled = input?.masanielloEnabled === true;
+  const masanielloProfile = normalizeMasanielloProfile(
+    input?.masanielloProfile ?? defaults.masanielloProfile,
+  );
+  const masanielloPlan = masanielloPlanForProfile(
+    masanielloProfile,
+    positiveNumber(input?.masanielloOperations, defaults.masanielloOperations),
+    positiveNumber(input?.masanielloWins, defaults.masanielloWins),
+  );
   return {
     entryValue: moneyAtLeast(input?.entryValue, defaults.entryValue, entryMin),
     stopWin: moneyAtLeast(input?.stopWin, defaults.stopWin, STOP_MONEY_MIN),
@@ -325,9 +384,19 @@ export function normalizeRobotSettings(
       STOP_OPERATIONS_MIN,
       STOP_OPERATIONS_MAX,
     ),
-    martingaleEnabled: input?.martingaleEnabled === true || input?.g1 === true,
+    // Os dois mexem no valor da entrada: com o Gerenciamento Consistente
+    // ligado o gale fica desligado (o backend aplica a mesma regra).
+    martingaleEnabled:
+      !masanielloEnabled && (input?.martingaleEnabled === true || input?.g1 === true),
     martingaleSteps: Math.max(1, Math.floor(positiveNumber(input?.martingaleSteps, defaults.martingaleSteps))),
     martingaleMultiplier: positiveNumber(input?.martingaleMultiplier, defaults.martingaleMultiplier),
+    masanielloEnabled,
+    masanielloCapital: masanielloCents(
+      positiveNumber(input?.masanielloCapital, defaults.masanielloCapital),
+    ),
+    masanielloProfile,
+    masanielloOperations: masanielloPlan.operations,
+    masanielloWins: masanielloPlan.wins,
     timeframe: normalizeTimeframe(input?.timeframe as string | undefined),
     marketMode: normalizeMarketMode(input?.marketMode as string | undefined),
     aiAnalysisEnabled:
@@ -467,6 +536,11 @@ function operationalSettingsEqual(a: RobotSettings, b: RobotSettings): boolean {
     a.martingaleEnabled === b.martingaleEnabled &&
     a.martingaleSteps === b.martingaleSteps &&
     a.martingaleMultiplier === b.martingaleMultiplier &&
+    a.masanielloEnabled === b.masanielloEnabled &&
+    a.masanielloCapital === b.masanielloCapital &&
+    a.masanielloProfile === b.masanielloProfile &&
+    a.masanielloOperations === b.masanielloOperations &&
+    a.masanielloWins === b.masanielloWins &&
     a.timeframe === b.timeframe &&
     a.marketMode === b.marketMode &&
     a.aiAnalysisEnabled === b.aiAnalysisEnabled &&
@@ -531,6 +605,28 @@ function pickPresentRobotSettings(
     present.martingaleMultiplier = positiveNumber(
       input.martingaleMultiplier,
       DEFAULT_ROBOT_SETTINGS.martingaleMultiplier,
+    );
+  }
+  if (typeof input.masanielloEnabled === "boolean") {
+    present.masanielloEnabled = input.masanielloEnabled;
+  }
+  if (input.masanielloCapital != null && input.masanielloCapital !== "") {
+    present.masanielloCapital = positiveNumber(
+      input.masanielloCapital,
+      DEFAULT_ROBOT_SETTINGS.masanielloCapital,
+    );
+  }
+  if (input.masanielloProfile != null && String(input.masanielloProfile).trim() !== "") {
+    present.masanielloProfile = normalizeMasanielloProfile(input.masanielloProfile);
+  }
+  if (input.masanielloOperations != null && input.masanielloOperations !== "") {
+    present.masanielloOperations = Math.floor(
+      positiveNumber(input.masanielloOperations, DEFAULT_ROBOT_SETTINGS.masanielloOperations),
+    );
+  }
+  if (input.masanielloWins != null && input.masanielloWins !== "") {
+    present.masanielloWins = Math.floor(
+      positiveNumber(input.masanielloWins, DEFAULT_ROBOT_SETTINGS.masanielloWins),
     );
   }
   if (input.timeframe != null && String(input.timeframe).trim() !== "") {

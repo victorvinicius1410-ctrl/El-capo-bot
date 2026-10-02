@@ -1,0 +1,1224 @@
+{
+ "comentario": "Gerado por backend/backend/masaniello.py. O gêmeo frontend/src/lib/masaniello.ts tem que devolver exatamente isto.",
+ "simulations": [
+  {
+   "name": "planilha",
+   "input": {
+    "capital": 100,
+    "operations": 38,
+    "wins": 14,
+    "payout_ref": 82,
+    "results": [
+     "L",
+     "W",
+     "L",
+     "W"
+    ],
+    "min_entry": 0,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "ACTIVE",
+    "end_reason": null,
+    "capital_atual": 100.15,
+    "target": 100.81,
+    "wins": 2,
+    "losses": 2,
+    "next_stake": 0.36,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 0.4,
+      "stake_planned": 0.4,
+      "adjusted_to_min": false,
+      "profit": -0.4,
+      "capital_after": 99.6,
+      "hit_rate": 0.0,
+      "errors_left": 23
+     },
+     {
+      "seq": 2,
+      "result": "WIN",
+      "stake": 0.58,
+      "stake_planned": 0.58,
+      "adjusted_to_min": false,
+      "profit": 0.48,
+      "capital_after": 100.08,
+      "hit_rate": 50.0,
+      "errors_left": 23
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 0.38,
+      "stake_planned": 0.38,
+      "adjusted_to_min": false,
+      "profit": -0.38,
+      "capital_after": 99.7,
+      "hit_rate": 33.3,
+      "errors_left": 22
+     },
+     {
+      "seq": 4,
+      "result": "WIN",
+      "stake": 0.55,
+      "stake_planned": 0.55,
+      "adjusted_to_min": false,
+      "profit": 0.45,
+      "capital_after": 100.15,
+      "hit_rate": 50.0,
+      "errors_left": 22
+     }
+    ]
+   }
+  },
+  {
+   "name": "conservador_meta_direta",
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "results": [
+     "W",
+     "W",
+     "W",
+     "W"
+    ],
+    "min_entry": 5,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 117.46,
+    "target": 110.58,
+    "wins": 4,
+    "losses": 0,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "WIN",
+      "stake": 6.82,
+      "stake_planned": 6.82,
+      "adjusted_to_min": false,
+      "profit": 5.46,
+      "capital_after": 105.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 2,
+      "result": "WIN",
+      "stake": 5.0,
+      "stake_planned": 4.09,
+      "adjusted_to_min": true,
+      "profit": 4.0,
+      "capital_after": 109.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 3,
+      "result": "WIN",
+      "stake": 5.0,
+      "stake_planned": 1.85,
+      "adjusted_to_min": true,
+      "profit": 4.0,
+      "capital_after": 113.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 4,
+      "result": "WIN",
+      "stake": 5.0,
+      "stake_planned": 0.49,
+      "adjusted_to_min": true,
+      "profit": 4.0,
+      "capital_after": 117.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "conservador_perde_tudo",
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "results": [
+     "L",
+     "L",
+     "L",
+     "L",
+     "L",
+     "L",
+     "L"
+    ],
+    "min_entry": 5,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "BUST",
+    "end_reason": "ERRORS",
+    "capital_atual": 0.0,
+    "target": 110.58,
+    "wins": 0,
+    "losses": 7,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 6.82,
+      "stake_planned": 6.82,
+      "adjusted_to_min": false,
+      "profit": -6.82,
+      "capital_after": 93.18,
+      "hit_rate": 0.0,
+      "errors_left": 5
+     },
+     {
+      "seq": 2,
+      "result": "LOSS",
+      "stake": 10.23,
+      "stake_planned": 10.23,
+      "adjusted_to_min": false,
+      "profit": -10.23,
+      "capital_after": 82.95,
+      "hit_rate": 0.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 14.39,
+      "stake_planned": 14.39,
+      "adjusted_to_min": false,
+      "profit": -14.39,
+      "capital_after": 68.56,
+      "hit_rate": 0.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 4,
+      "result": "LOSS",
+      "stake": 18.49,
+      "stake_planned": 18.49,
+      "adjusted_to_min": false,
+      "profit": -18.49,
+      "capital_after": 50.07,
+      "hit_rate": 0.0,
+      "errors_left": 2
+     },
+     {
+      "seq": 5,
+      "result": "LOSS",
+      "stake": 20.81,
+      "stake_planned": 20.81,
+      "adjusted_to_min": false,
+      "profit": -20.81,
+      "capital_after": 29.26,
+      "hit_rate": 0.0,
+      "errors_left": 1
+     },
+     {
+      "seq": 6,
+      "result": "LOSS",
+      "stake": 18.73,
+      "stake_planned": 18.73,
+      "adjusted_to_min": false,
+      "profit": -18.73,
+      "capital_after": 10.53,
+      "hit_rate": 0.0,
+      "errors_left": 0
+     },
+     {
+      "seq": 7,
+      "result": "LOSS",
+      "stake": 10.53,
+      "stake_planned": 10.53,
+      "adjusted_to_min": false,
+      "profit": -10.53,
+      "capital_after": 0.0,
+      "hit_rate": 0.0,
+      "errors_left": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "conservador_misto_com_empate",
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "results": [
+     "W",
+     "L",
+     "D",
+     "W",
+     "L",
+     "W",
+     "L",
+     "W"
+    ],
+    "min_entry": 5,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 105.23,
+    "target": 110.58,
+    "wins": 4,
+    "losses": 3,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "WIN",
+      "stake": 6.82,
+      "stake_planned": 6.82,
+      "adjusted_to_min": false,
+      "profit": 5.46,
+      "capital_after": 105.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 2,
+      "result": "LOSS",
+      "stake": 5.0,
+      "stake_planned": 4.09,
+      "adjusted_to_min": true,
+      "profit": -5.0,
+      "capital_after": 100.46,
+      "hit_rate": 50.0,
+      "errors_left": 5
+     },
+     {
+      "seq": null,
+      "result": "DRAW",
+      "stake": 6.84,
+      "stake_planned": 6.84,
+      "adjusted_to_min": false,
+      "profit": 0.0,
+      "capital_after": 100.46,
+      "hit_rate": 50.0,
+      "errors_left": 5
+     },
+     {
+      "seq": 3,
+      "result": "WIN",
+      "stake": 6.84,
+      "stake_planned": 6.84,
+      "adjusted_to_min": false,
+      "profit": 5.47,
+      "capital_after": 105.93,
+      "hit_rate": 66.7,
+      "errors_left": 5
+     },
+     {
+      "seq": 4,
+      "result": "LOSS",
+      "stake": 5.0,
+      "stake_planned": 3.52,
+      "adjusted_to_min": true,
+      "profit": -5.0,
+      "capital_after": 100.93,
+      "hit_rate": 50.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 5,
+      "result": "WIN",
+      "stake": 6.5,
+      "stake_planned": 6.5,
+      "adjusted_to_min": false,
+      "profit": 5.2,
+      "capital_after": 106.13,
+      "hit_rate": 60.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 6,
+      "result": "LOSS",
+      "stake": 5.0,
+      "stake_planned": 2.34,
+      "adjusted_to_min": true,
+      "profit": -5.0,
+      "capital_after": 101.13,
+      "hit_rate": 50.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 7,
+      "result": "WIN",
+      "stake": 5.13,
+      "stake_planned": 5.13,
+      "adjusted_to_min": false,
+      "profit": 4.1,
+      "capital_after": 105.23,
+      "hit_rate": 57.1,
+      "errors_left": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "conservador_capital_alto_sem_ajuste",
+   "input": {
+    "capital": 2000,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "results": [
+     "L",
+     "W",
+     "W",
+     "L",
+     "L",
+     "W",
+     "W"
+    ],
+    "min_entry": 5,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 2211.64,
+    "target": 2211.63,
+    "wins": 4,
+    "losses": 3,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 136.4,
+      "stake_planned": 136.4,
+      "adjusted_to_min": false,
+      "profit": -136.4,
+      "capital_after": 1863.6,
+      "hit_rate": 0.0,
+      "errors_left": 5
+     },
+     {
+      "seq": 2,
+      "result": "WIN",
+      "stake": 204.6,
+      "stake_planned": 204.6,
+      "adjusted_to_min": false,
+      "profit": 163.68,
+      "capital_after": 2027.28,
+      "hit_rate": 50.0,
+      "errors_left": 5
+     },
+     {
+      "seq": 3,
+      "result": "WIN",
+      "stake": 138.1,
+      "stake_planned": 138.1,
+      "adjusted_to_min": false,
+      "profit": 110.48,
+      "capital_after": 2137.76,
+      "hit_rate": 66.7,
+      "errors_left": 5
+     },
+     {
+      "seq": 4,
+      "result": "LOSS",
+      "stake": 71.02,
+      "stake_planned": 71.02,
+      "adjusted_to_min": false,
+      "profit": -71.02,
+      "capital_after": 2066.74,
+      "hit_rate": 50.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 5,
+      "result": "LOSS",
+      "stake": 133.17,
+      "stake_planned": 133.17,
+      "adjusted_to_min": false,
+      "profit": -133.17,
+      "capital_after": 1933.57,
+      "hit_rate": 40.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 6,
+      "result": "WIN",
+      "stake": 239.71,
+      "stake_planned": 239.71,
+      "adjusted_to_min": false,
+      "profit": 191.77,
+      "capital_after": 2125.34,
+      "hit_rate": 50.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 7,
+      "result": "WIN",
+      "stake": 107.87,
+      "stake_planned": 107.87,
+      "adjusted_to_min": false,
+      "profit": 86.3,
+      "capital_after": 2211.64,
+      "hit_rate": 57.1,
+      "errors_left": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "moderado_payout_real_maior",
+   "input": {
+    "capital": 500,
+    "operations": 10,
+    "wins": 5,
+    "payout_ref": 80,
+    "results": [
+     "L",
+     "W",
+     "L",
+     "W",
+     "W",
+     "L",
+     "W",
+     "W"
+    ],
+    "min_entry": 5,
+    "payout_real": 87
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 709.45,
+    "target": 666.55,
+    "wins": 5,
+    "losses": 3,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 77.08,
+      "stake_planned": 77.08,
+      "adjusted_to_min": false,
+      "profit": -77.08,
+      "capital_after": 422.92,
+      "hit_rate": 0.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 2,
+      "result": "WIN",
+      "stake": 96.35,
+      "stake_planned": 96.35,
+      "adjusted_to_min": false,
+      "profit": 83.82,
+      "capital_after": 506.74,
+      "hit_rate": 50.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 87.88,
+      "stake_planned": 87.88,
+      "adjusted_to_min": false,
+      "profit": -87.88,
+      "capital_after": 418.86,
+      "hit_rate": 33.3,
+      "errors_left": 3
+     },
+     {
+      "seq": 4,
+      "result": "WIN",
+      "stake": 112.99,
+      "stake_planned": 112.99,
+      "adjusted_to_min": false,
+      "profit": 98.3,
+      "capital_after": 517.16,
+      "hit_rate": 50.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 5,
+      "result": "WIN",
+      "stake": 103.27,
+      "stake_planned": 103.27,
+      "adjusted_to_min": false,
+      "profit": 89.84,
+      "capital_after": 607.0,
+      "hit_rate": 60.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 6,
+      "result": "LOSS",
+      "stake": 75.25,
+      "stake_planned": 75.25,
+      "adjusted_to_min": false,
+      "profit": -75.25,
+      "capital_after": 531.75,
+      "hit_rate": 50.0,
+      "errors_left": 2
+     },
+     {
+      "seq": 7,
+      "result": "WIN",
+      "stake": 126.99,
+      "stake_planned": 126.99,
+      "adjusted_to_min": false,
+      "profit": 110.48,
+      "capital_after": 642.23,
+      "hit_rate": 57.1,
+      "errors_left": 2
+     },
+     {
+      "seq": 8,
+      "result": "WIN",
+      "stake": 77.26,
+      "stake_planned": 77.26,
+      "adjusted_to_min": false,
+      "profit": 67.22,
+      "capital_after": 709.45,
+      "hit_rate": 62.5,
+      "errors_left": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "agressivo_ultimo_erro",
+   "input": {
+    "capital": 200,
+    "operations": 10,
+    "wins": 6,
+    "payout_ref": 80,
+    "results": [
+     "L",
+     "L",
+     "L",
+     "L",
+     "W",
+     "W",
+     "W",
+     "W",
+     "W",
+     "W"
+    ],
+    "min_entry": 5,
+    "payout_real": 85
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 454.23,
+    "target": 385.46,
+    "wins": 6,
+    "losses": 4,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 55.72,
+      "stake_planned": 55.72,
+      "adjusted_to_min": false,
+      "profit": -55.72,
+      "capital_after": 144.28,
+      "hit_rate": 0.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 2,
+      "result": "LOSS",
+      "stake": 55.72,
+      "stake_planned": 55.72,
+      "adjusted_to_min": false,
+      "profit": -55.72,
+      "capital_after": 88.56,
+      "hit_rate": 0.0,
+      "errors_left": 2
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 47.01,
+      "stake_planned": 47.01,
+      "adjusted_to_min": false,
+      "profit": -47.01,
+      "capital_after": 41.55,
+      "hit_rate": 0.0,
+      "errors_left": 1
+     },
+     {
+      "seq": 4,
+      "result": "LOSS",
+      "stake": 30.22,
+      "stake_planned": 30.22,
+      "adjusted_to_min": false,
+      "profit": -30.22,
+      "capital_after": 11.33,
+      "hit_rate": 0.0,
+      "errors_left": 0
+     },
+     {
+      "seq": 5,
+      "result": "WIN",
+      "stake": 11.33,
+      "stake_planned": 11.33,
+      "adjusted_to_min": false,
+      "profit": 9.63,
+      "capital_after": 20.96,
+      "hit_rate": 20.0,
+      "errors_left": 0
+     },
+     {
+      "seq": 6,
+      "result": "WIN",
+      "stake": 20.96,
+      "stake_planned": 20.96,
+      "adjusted_to_min": false,
+      "profit": 17.82,
+      "capital_after": 38.78,
+      "hit_rate": 33.3,
+      "errors_left": 0
+     },
+     {
+      "seq": 7,
+      "result": "WIN",
+      "stake": 38.78,
+      "stake_planned": 38.78,
+      "adjusted_to_min": false,
+      "profit": 32.96,
+      "capital_after": 71.74,
+      "hit_rate": 42.9,
+      "errors_left": 0
+     },
+     {
+      "seq": 8,
+      "result": "WIN",
+      "stake": 71.74,
+      "stake_planned": 71.74,
+      "adjusted_to_min": false,
+      "profit": 60.98,
+      "capital_after": 132.72,
+      "hit_rate": 50.0,
+      "errors_left": 0
+     },
+     {
+      "seq": 9,
+      "result": "WIN",
+      "stake": 132.72,
+      "stake_planned": 132.72,
+      "adjusted_to_min": false,
+      "profit": 112.81,
+      "capital_after": 245.53,
+      "hit_rate": 55.6,
+      "errors_left": 0
+     },
+     {
+      "seq": 10,
+      "result": "WIN",
+      "stake": 245.53,
+      "stake_planned": 245.53,
+      "adjusted_to_min": false,
+      "profit": 208.7,
+      "capital_after": 454.23,
+      "hit_rate": 60.0,
+      "errors_left": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "agressivo_quebra",
+   "input": {
+    "capital": 200,
+    "operations": 10,
+    "wins": 6,
+    "payout_ref": 80,
+    "results": [
+     "W",
+     "L",
+     "L",
+     "L",
+     "L",
+     "L"
+    ],
+    "min_entry": 5,
+    "payout_real": 85
+   },
+   "expect": {
+    "status": "BUST",
+    "end_reason": "ERRORS",
+    "capital_atual": 0.0,
+    "target": 385.46,
+    "wins": 1,
+    "losses": 5,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "WIN",
+      "stake": 55.72,
+      "stake_planned": 55.72,
+      "adjusted_to_min": false,
+      "profit": 47.36,
+      "capital_after": 247.36,
+      "hit_rate": 100.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 2,
+      "result": "LOSS",
+      "stake": 56.35,
+      "stake_planned": 56.35,
+      "adjusted_to_min": false,
+      "profit": -56.35,
+      "capital_after": 191.01,
+      "hit_rate": 50.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 63.4,
+      "stake_planned": 63.4,
+      "adjusted_to_min": false,
+      "profit": -63.4,
+      "capital_after": 127.61,
+      "hit_rate": 33.3,
+      "errors_left": 2
+     },
+     {
+      "seq": 4,
+      "result": "LOSS",
+      "stake": 61.13,
+      "stake_planned": 61.13,
+      "adjusted_to_min": false,
+      "profit": -61.13,
+      "capital_after": 66.48,
+      "hit_rate": 25.0,
+      "errors_left": 1
+     },
+     {
+      "seq": 5,
+      "result": "LOSS",
+      "stake": 45.85,
+      "stake_planned": 45.85,
+      "adjusted_to_min": false,
+      "profit": -45.85,
+      "capital_after": 20.63,
+      "hit_rate": 20.0,
+      "errors_left": 0
+     },
+     {
+      "seq": 6,
+      "result": "LOSS",
+      "stake": 20.63,
+      "stake_planned": 20.63,
+      "adjusted_to_min": false,
+      "profit": -20.63,
+      "capital_after": 0.0,
+      "hit_rate": 16.7,
+      "errors_left": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "personalizado_dolar",
+   "input": {
+    "capital": 60,
+    "operations": 8,
+    "wins": 3,
+    "payout_ref": 80,
+    "results": [
+     "L",
+     "W",
+     "L",
+     "L",
+     "W",
+     "W"
+    ],
+    "min_entry": 1,
+    "payout_real": 84
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 66.56,
+    "target": 65.46,
+    "wins": 3,
+    "losses": 3,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 4.09,
+      "stake_planned": 4.09,
+      "adjusted_to_min": false,
+      "profit": -4.09,
+      "capital_after": 55.91,
+      "hit_rate": 0.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 2,
+      "result": "WIN",
+      "stake": 6.57,
+      "stake_planned": 6.57,
+      "adjusted_to_min": false,
+      "profit": 5.52,
+      "capital_after": 61.43,
+      "hit_rate": 50.0,
+      "errors_left": 4
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 3.96,
+      "stake_planned": 3.96,
+      "adjusted_to_min": false,
+      "profit": -3.96,
+      "capital_after": 57.47,
+      "hit_rate": 33.3,
+      "errors_left": 3
+     },
+     {
+      "seq": 4,
+      "result": "LOSS",
+      "stake": 7.12,
+      "stake_planned": 7.12,
+      "adjusted_to_min": false,
+      "profit": -7.12,
+      "capital_after": 50.35,
+      "hit_rate": 25.0,
+      "errors_left": 2
+     },
+     {
+      "seq": 5,
+      "result": "WIN",
+      "stake": 12.02,
+      "stake_planned": 12.02,
+      "adjusted_to_min": false,
+      "profit": 10.1,
+      "capital_after": 60.45,
+      "hit_rate": 40.0,
+      "errors_left": 2
+     },
+     {
+      "seq": 6,
+      "result": "WIN",
+      "stake": 7.27,
+      "stake_planned": 7.27,
+      "adjusted_to_min": false,
+      "profit": 6.11,
+      "capital_after": 66.56,
+      "hit_rate": 50.0,
+      "errors_left": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "sobra_resultado_depois_da_meta",
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "results": [
+     "W",
+     "W",
+     "W",
+     "W",
+     "L",
+     "L"
+    ],
+    "min_entry": 5,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "TARGET_HIT",
+    "end_reason": "TARGET",
+    "capital_atual": 117.46,
+    "target": 110.58,
+    "wins": 4,
+    "losses": 0,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "WIN",
+      "stake": 6.82,
+      "stake_planned": 6.82,
+      "adjusted_to_min": false,
+      "profit": 5.46,
+      "capital_after": 105.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 2,
+      "result": "WIN",
+      "stake": 5.0,
+      "stake_planned": 4.09,
+      "adjusted_to_min": true,
+      "profit": 4.0,
+      "capital_after": 109.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 3,
+      "result": "WIN",
+      "stake": 5.0,
+      "stake_planned": 1.85,
+      "adjusted_to_min": true,
+      "profit": 4.0,
+      "capital_after": 113.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     },
+     {
+      "seq": 4,
+      "result": "WIN",
+      "stake": 5.0,
+      "stake_planned": 0.49,
+      "adjusted_to_min": true,
+      "profit": 4.0,
+      "capital_after": 117.46,
+      "hit_rate": 100.0,
+      "errors_left": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "capital_curto_fica_sem_minimo",
+   "input": {
+    "capital": 20,
+    "operations": 10,
+    "wins": 6,
+    "payout_ref": 80,
+    "results": [
+     "L",
+     "L",
+     "L"
+    ],
+    "min_entry": 5,
+    "payout_real": null
+   },
+   "expect": {
+    "status": "BUST",
+    "end_reason": "NO_CAPITAL",
+    "capital_atual": 3.86,
+    "target": 38.55,
+    "wins": 0,
+    "losses": 3,
+    "next_stake": null,
+    "rows": [
+     {
+      "seq": 1,
+      "result": "LOSS",
+      "stake": 5.57,
+      "stake_planned": 5.57,
+      "adjusted_to_min": false,
+      "profit": -5.57,
+      "capital_after": 14.43,
+      "hit_rate": 0.0,
+      "errors_left": 3
+     },
+     {
+      "seq": 2,
+      "result": "LOSS",
+      "stake": 5.57,
+      "stake_planned": 5.57,
+      "adjusted_to_min": false,
+      "profit": -5.57,
+      "capital_after": 8.86,
+      "hit_rate": 0.0,
+      "errors_left": 2
+     },
+     {
+      "seq": 3,
+      "result": "LOSS",
+      "stake": 5.0,
+      "stake_planned": 4.7,
+      "adjusted_to_min": true,
+      "profit": -5.0,
+      "capital_after": 3.86,
+      "hit_rate": 0.0,
+      "errors_left": 1
+     }
+    ]
+   }
+  }
+ ],
+ "plans": [
+  {
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "min_entry": 5
+   },
+   "expect": {
+    "target": 110.58,
+    "target_profit": 10.58,
+    "target_percent": 10.58,
+    "max_errors": 6,
+    "first_stake": 6.82,
+    "min_stake": 0.47,
+    "max_stake": 61.43,
+    "adjusts_to_min": true,
+    "min_capital": 73.32,
+    "full_plan_capital": 1055.99
+   }
+  },
+  {
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 5,
+    "payout_ref": 80,
+    "min_entry": 5
+   },
+   "expect": {
+    "target": 133.31,
+    "target_profit": 33.31,
+    "target_percent": 33.31,
+    "max_errors": 5,
+    "first_stake": 15.42,
+    "min_stake": 1.28,
+    "max_stake": 74.06,
+    "adjusts_to_min": true,
+    "min_capital": 32.44,
+    "full_plan_capital": 389.31
+   }
+  },
+  {
+   "input": {
+    "capital": 100,
+    "operations": 10,
+    "wins": 6,
+    "payout_ref": 80,
+    "min_entry": 5
+   },
+   "expect": {
+    "target": 192.73,
+    "target_profit": 92.73,
+    "target_percent": 92.73,
+    "max_errors": 4,
+    "first_stake": 27.86,
+    "min_stake": 4.18,
+    "max_stake": 107.07,
+    "adjusts_to_min": true,
+    "min_capital": 17.95,
+    "full_plan_capital": 119.68
+   }
+  },
+  {
+   "input": {
+    "capital": 1500,
+    "operations": 10,
+    "wins": 4,
+    "payout_ref": 80,
+    "min_entry": 5
+   },
+   "expect": {
+    "target": 1658.72,
+    "target_profit": 158.72,
+    "target_percent": 10.58,
+    "max_errors": 6,
+    "first_stake": 102.3,
+    "min_stake": 7.1,
+    "max_stake": 921.51,
+    "adjusts_to_min": false,
+    "min_capital": 73.32,
+    "full_plan_capital": 1055.99
+   }
+  },
+  {
+   "input": {
+    "capital": 100,
+    "operations": 38,
+    "wins": 14,
+    "payout_ref": 82,
+    "min_entry": 0
+   },
+   "expect": {
+    "target": 100.81,
+    "target_profit": 0.81,
+    "target_percent": 0.81,
+    "max_errors": 24,
+    "first_stake": 0.4,
+    "min_stake": 0.0,
+    "max_stake": 55.39,
+    "adjusts_to_min": false,
+    "min_capital": 0.0,
+    "full_plan_capital": 0.0
+   }
+  },
+  {
+   "input": {
+    "capital": 50,
+    "operations": 8,
+    "wins": 3,
+    "payout_ref": 85,
+    "min_entry": 1
+   },
+   "expect": {
+    "target": 55.41,
+    "target_profit": 5.41,
+    "target_percent": 10.82,
+    "max_errors": 5,
+    "first_stake": 3.76,
+    "min_stake": 0.61,
+    "max_stake": 29.95,
+    "adjusts_to_min": true,
+    "min_capital": 13.29,
+    "full_plan_capital": 81.53
+   }
+  },
+  {
+   "input": {
+    "capital": 250,
+    "operations": 20,
+    "wins": 9,
+    "payout_ref": 80,
+    "min_entry": 5
+   },
+   "expect": {
+    "target": 284.18,
+    "target_profit": 34.18,
+    "target_percent": 13.67,
+    "max_errors": 11,
+    "first_stake": 14.47,
+    "min_stake": 0.02,
+    "max_stake": 157.88,
+    "adjusts_to_min": true,
+    "min_capital": 86.37,
+    "full_plan_capital": 59236.87
+   }
+  }
+ ]
+}

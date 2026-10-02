@@ -6,6 +6,8 @@
  * painel, overlay e narrador.
  */
 
+import { type MasanielloCycle, normalizeMasanielloCycle } from "./masaniello.ts";
+
 export type RobotDirection = "CALL" | "PUT" | "WAIT";
 
 export interface RobotSignal {
@@ -145,6 +147,20 @@ export interface RobotState {
   martingale_enabled: boolean;
   martingale_multiplier: number;
   martingale_steps: number;
+  /**
+   * Gerenciamento Consistente (Masaniello). Opcionais de propósito: ficam
+   * `undefined` quando o servidor não mandou, para o estado "parado" local
+   * (`getStoppedRobotState`) não apagar o ciclo nem desligar o modo no painel.
+   */
+  masaniello_enabled?: boolean;
+  masaniello_capital?: number | null;
+  masaniello_profile?: string | null;
+  masaniello_operations?: number | null;
+  masaniello_wins?: number | null;
+  /** Ciclo em andamento ou o último encerrado: é a calculadora ao vivo. */
+  masaniello_cycle?: MasanielloCycle | null;
+  /** Payout mínimo aceito pelo robô; é o payout de referência do plano. */
+  min_payout?: number | null;
   cycle_result: string | null;
   gale_step: number | null;
   gale_pending: boolean;
@@ -454,6 +470,9 @@ export function normalizeRobotState(payload: unknown): RobotState {
     raw.current_trade ?? raw.currentTrade ?? raw.pending_trade ?? raw.pendingTrade ??
     raw.operation ?? raw.last_trade ?? raw.lastTrade;
   const trade = asObject(rawTrade);
+  const rawMasanielloEnabled =
+    raw.masaniello_enabled ?? raw.masanielloEnabled ?? config.masaniello_enabled;
+  const rawMasanielloCycle = raw.masaniello_cycle ?? raw.masanielloCycle;
   const status = toText(raw.status, "STOPPED").toUpperCase();
   const connectionSource = toNullableText(
     raw.connection_status_source ?? raw.connectionStatusSource ?? raw.connection_source ?? raw.connectionSource,
@@ -592,6 +611,21 @@ export function normalizeRobotState(payload: unknown): RobotState {
         raw.martingale_steps ?? raw.martingaleSteps ?? config.martingale_steps ?? config.martingaleSteps,
       ) ?? 1,
     ),
+    masaniello_enabled:
+      rawMasanielloEnabled == null ? undefined : toBool(rawMasanielloEnabled),
+    masaniello_capital: toNumber(
+      raw.masaniello_capital ?? raw.masanielloCapital ?? config.masaniello_capital,
+    ),
+    masaniello_profile: toNullableText(
+      raw.masaniello_profile ?? raw.masanielloProfile ?? config.masaniello_profile,
+    ),
+    masaniello_operations: toNumber(
+      raw.masaniello_operations ?? raw.masanielloOperations ?? config.masaniello_operations,
+    ),
+    masaniello_wins: toNumber(raw.masaniello_wins ?? raw.masanielloWins ?? config.masaniello_wins),
+    masaniello_cycle:
+      rawMasanielloCycle === undefined ? undefined : normalizeMasanielloCycle(rawMasanielloCycle),
+    min_payout: toNumber(raw.min_payout ?? raw.minPayout ?? config.min_payout ?? config.minPayout),
     cycle_result: toNullableText(raw.cycle_result ?? raw.cycleResult)?.toUpperCase() ?? null,
     gale_step: toNumber(raw.gale_step ?? raw.galeStep ?? trade.gale_step ?? trade.galeStep),
     gale_pending: galePending,
