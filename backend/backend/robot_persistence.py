@@ -121,6 +121,10 @@ TRADE_ANALYSIS_FIELDS = (
     "wick_entry_reason",
     # Entrada a favor do nível (11/09/2026): é o que mede a estratégia depois.
     "sr_level",
+    # Gerenciamento Consistente (Masaniello): ciclo, número da operação no
+    # ciclo e o valor que o plano pedia. É por esta marca que a calculadora
+    # é reconstruída a partir do Histórico.
+    "masaniello",
     "strategy_summary",
     "analysis_detail",
     "speech_preview",

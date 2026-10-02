@@ -23,9 +23,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from backend import masaniello
 from backend.auto_trader import (
     AutoTrader,
+    MASANIELLO_RESULT_PENDING,
     RobotConfigUpdate,
+    masaniello_active,
+    masaniello_cycle_stop_status,
+    masaniello_pending_ceiling_seconds,
     normalize_stop_mode,
     parse_datetime,
     is_synthetic_trade,
@@ -903,6 +908,12 @@ ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE = (
 INSUFFICIENT_FUNDS_ORDER_MESSAGE = (
     "Saldo insuficiente para a entrada. Deposite na BullEx ou reduza o valor da entrada."
 )
+MASANIELLO_CAPITAL_EXCEEDS_BALANCE_MESSAGE = (
+    "Seu saldo é menor que o capital do ciclo. Deposite ou diminua o capital."
+)
+MASANIELLO_STAKE_EXCEEDS_BALANCE_MESSAGE = (
+    "Seu saldo é menor que a próxima entrada do ciclo. Deposite ou comece um ciclo menor."
+)
 
 
 def normalize_service_payload(
@@ -1078,6 +1089,11 @@ ROBOT_BASIC_CONFIG_FIELDS = {
     "martingale_enabled",
     "martingale_steps",
     "martingale_multiplier",
+    "masaniello_enabled",
+    "masaniello_capital",
+    "masaniello_operations",
+    "masaniello_wins",
+    "masaniello_profile",
 }
 ROBOT_BASIC_CONFIG_ALIASES = {
     "stopWin",
@@ -1098,6 +1114,11 @@ ROBOT_BASIC_CONFIG_ALIASES = {
     "martingaleEnabled",
     "martingaleSteps",
     "martingaleMultiplier",
+    "masanielloEnabled",
+    "masanielloCapital",
+    "masanielloOperations",
+    "masanielloWins",
+    "masanielloProfile",
 }
 
 
@@ -8367,6 +8388,70 @@ async def pause_robot_by_stop(user_id: str, reason: str) -> Any:
     return state
 
 
+async def pause_robot_masaniello_pending(user_id: str) -> Any:
+    """Para o robô porque a ordem do ciclo ficou sem resultado além do prazo.
+
+    O valor da próxima entrada depende do resultado da anterior; sem ele o
+    capital atual é desconhecido e operar seria chutar. O ciclo continua
+    ``ACTIVE``: se o resultado atrasado chegar, entra na linha.
+
+    Args:
+        user_id: Dono da sessão.
+
+    Returns:
+        Estado do robô, parado.
+    """
+    state = auto_trader.stop(user_id)
+    state.last_order_error = MASANIELLO_RESULT_PENDING
+    state.last_rejection_reason = MASANIELLO_RESULT_PENDING
+    logger.warning(
+        "[MASANIELLO_PAUSED_RESULT_PENDING] user_id=%s cycle_id=%s order_id=%s",
+        user_id,
+        (state.masaniello_cycle or {}).get("id"),
+        ((state.masaniello_cycle or {}).get("pending") or {}).get("order_id"),
+    )
+    persist_robot(user_id)
+    await stop_robot_worker(user_id)
+    return state
+
+
+async def masaniello_cycle_gate(user_id: str, state: Any) -> tuple[int, dict[str, Any]] | None:
+    """Portão do Gerenciamento Consistente no começo de cada volta do robô.
+
+    Garante que existe ciclo para operar e que a ordem anterior do ciclo já
+    tem resultado. Só importa depois que ``waiting_result_stale`` recicla uma
+    operação sem resposta: no caminho normal o robô já espera o resultado.
+
+    Args:
+        user_id: Dono da sessão.
+        state: Estado atual do robô.
+
+    Returns:
+        ``None`` para seguir o ciclo, ou a resposta pronta quando o robô tem
+        de esperar (resultado em voo) ou parar (resultado vencido).
+    """
+    cycle = state.masaniello_cycle if isinstance(state.masaniello_cycle, dict) else None
+    if cycle is None or cycle.get("status") == masaniello.STATUS_ABANDONED:
+        auto_trader.masaniello_begin_if_needed(user_id, min_entry=masaniello_min_entry(user_id))
+        persist_robot(user_id)
+        return None
+    pending = cycle.get("pending") if masaniello.is_active(cycle) else None
+    if not isinstance(pending, dict):
+        return None
+    enviada = parse_datetime(pending.get("at"))
+    esperando = (utc_now() - enviada).total_seconds() if enviada is not None else None
+    if esperando is not None and esperando <= masaniello_pending_ceiling_seconds(state):
+        logger.info(
+            "[MASANIELLO_WAITING_RESULT] user_id=%s order_id=%s esperando=%.0fs",
+            user_id,
+            pending.get("order_id"),
+            esperando,
+        )
+        return 200, build_robot_payload(state, user_id=user_id)
+    state = await pause_robot_masaniello_pending(user_id)
+    return 200, build_robot_payload(state, user_id=user_id)
+
+
 def robot_connection_unavailable(connected: bool, active_mode: str | None) -> bool:
     return not connected or active_mode is None
 
@@ -9254,6 +9339,7 @@ def publish_robot_control_snapshot(
     """
     if not trust_local_score:
         adopt_live_session_score_if_blank(user_id)
+    sync_masaniello_cycle_on_gateway(user_id)
     state = auto_trader.get(user_id)
     account_snapshot = get_cached_account_snapshot(user_id)
     if is_manual_disconnect(user_id):
@@ -9751,6 +9837,9 @@ def reconcile_gateway_enabled_from_runtime_snapshot(user_id: str, state: Any) ->
     state.losses = preferred[1]
     state.profit = preferred[2]
 
+    # O fim do ciclo do Gerenciamento Consistente também é stop: sem a cópia
+    # do runtime, o gateway não saberia que o ciclo acabou.
+    sync_masaniello_cycle_on_gateway(user_id, remote_data)
     # O runtime desliga por stop e publica no MESMO snapshot o status de
     # exibição do resultado (`LOSS`/`WIN`). Sem consultar o placar, o gateway
     # caía no `else` e gravava `STOPPED`: o motivo do stop se perdia e o painel
@@ -11395,6 +11484,144 @@ def _trade_for_mirror(user_id: str, trade: dict[str, Any] | None) -> dict[str, A
     return trade
 
 
+def masaniello_min_entry(user_id: str) -> float:
+    """Mínimo da corretora na moeda da conta, para o Gerenciamento Consistente."""
+    return min_real_entry_for_currency(resolve_user_account_currency(user_id))
+
+
+def required_order_amount(state: Any) -> float:
+    """Quanto a conta precisa ter de saldo para o robô operar.
+
+    No valor fixo é a entrada. No Gerenciamento Consistente é a próxima
+    entrada do ciclo em andamento; se o "Iniciar" for abrir um ciclo novo, é o
+    capital inteiro dele.
+
+    Args:
+        state: Estado do robô.
+
+    Returns:
+        Valor na moeda da conta (0 quando o ciclo não tem próxima entrada).
+    """
+    if not masaniello_active(state):
+        return float(getattr(state, "entry_value", 0) or 0)
+    cycle = getattr(state, "masaniello_cycle", None)
+    plano = masaniello.signature(
+        getattr(state, "masaniello_capital", 0),
+        getattr(state, "masaniello_operations", 0),
+        getattr(state, "masaniello_wins", 0),
+        getattr(state, "min_payout", 0),
+    )
+    if masaniello.is_active(cycle) and masaniello.cycle_signature(cycle) == plano:
+        return float(cycle.get("next_stake") or 0)
+    return float(getattr(state, "masaniello_capital", 0) or 0)
+
+
+def balance_shortfall_message(state: Any) -> str:
+    """Texto do aviso de saldo menor que o necessário, conforme o modo."""
+    if not masaniello_active(state):
+        return ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE
+    if masaniello.is_active(getattr(state, "masaniello_cycle", None)):
+        return MASANIELLO_STAKE_EXCEEDS_BALANCE_MESSAGE
+    return MASANIELLO_CAPITAL_EXCEEDS_BALANCE_MESSAGE
+
+
+def sync_masaniello_cycle_on_gateway(
+    user_id: str,
+    live_data: dict[str, Any] | None = None,
+) -> None:
+    """Traz para a memória do gateway a cópia mais nova do ciclo.
+
+    Quem lança resultado no ciclo é o ``robot-runtime``. O gateway tem a
+    própria cópia do estado e, sem isto, gravaria a dele (atrasada) por cima
+    em qualquer ``persist_robot`` — o mesmo defeito que já apagou placar.
+    A decisão é de :func:`masaniello.pick_freshest_cycle` (``rev``).
+
+    Só consulta o Redis, e só para quem usa o Gerenciamento Consistente.
+
+    Args:
+        user_id: Dono da sessão.
+        live_data: ``data`` do snapshot do runtime, se o chamador já leu.
+    """
+    if robot_runtime_mode() != "external":
+        return
+    try:
+        state = auto_trader.get(user_id)
+        if live_data is None:
+            if not (state.masaniello_enabled or state.masaniello_cycle):
+                return
+            remote = robot_bus.get_snapshot(user_id)
+            if not isinstance(remote, dict) or not isinstance(remote.get("data"), dict):
+                return
+            live_data = remote["data"]
+        vivo = live_data.get("masaniello_cycle")
+        if not isinstance(vivo, dict):
+            return
+        escolhido = masaniello.pick_freshest_cycle(state.masaniello_cycle, vivo)
+        if escolhido is vivo:
+            state.masaniello_cycle = deepcopy(vivo)
+    except Exception:
+        logger.warning("[MASANIELLO_GATEWAY_SYNC_FAILED] user_id=%s", user_id, exc_info=True)
+
+
+CONFERIR_CICLO_NO_BANCO = "_conferir_ciclo_no_banco"
+_masaniello_db_refresh_at: dict[str, float] = {}
+MASANIELLO_DB_REFRESH_SECONDS = 30.0
+
+
+def _com_ciclo_mais_novo_do_banco(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Não deixa a gravação regredir o ciclo salvo (roda na thread de gravação)."""
+    try:
+        no_banco = robot_persistence.load_state(user_id)
+    except Exception:
+        logger.warning("[MASANIELLO_PERSIST_READ_FAILED] user_id=%s", user_id, exc_info=True)
+        return payload
+    if not isinstance(no_banco, dict):
+        return payload
+    salvo = no_banco.get("masaniello_cycle")
+    atual = payload.get("masaniello_cycle")
+    escolhido = masaniello.pick_freshest_cycle(atual, salvo)
+    if escolhido is atual:
+        return payload
+    logger.warning(
+        "[MASANIELLO_PERSIST_KEPT_DB] user_id=%s gravando=%s/%s banco=%s/%s",
+        user_id,
+        (atual or {}).get("id") if isinstance(atual, dict) else None,
+        (atual or {}).get("rev") if isinstance(atual, dict) else None,
+        (salvo or {}).get("id"),
+        (salvo or {}).get("rev"),
+    )
+    return {**payload, "masaniello_cycle": salvo}
+
+
+def refresh_masaniello_cycle_from_persistence(user_id: str) -> None:
+    """Relê o ciclo do banco quando o snapshot do runtime já expirou.
+
+    Sem snapshot o gateway responde com a memória dele, que pode ter parado
+    antes do fim do ciclo. Faz leitura síncrona: chamar via
+    ``asyncio.to_thread``. No máximo uma leitura a cada
+    ``MASANIELLO_DB_REFRESH_SECONDS`` por cliente.
+
+    Args:
+        user_id: Dono da sessão.
+    """
+    try:
+        state = auto_trader.get(user_id)
+        if not (state.masaniello_enabled or state.masaniello_cycle):
+            return
+        agora = monotonic()
+        if agora - _masaniello_db_refresh_at.get(user_id, 0.0) < MASANIELLO_DB_REFRESH_SECONDS:
+            return
+        _masaniello_db_refresh_at[user_id] = agora
+        no_banco = robot_persistence.load_state(user_id)
+        if not isinstance(no_banco, dict):
+            return
+        salvo = no_banco.get("masaniello_cycle")
+        if masaniello.pick_freshest_cycle(state.masaniello_cycle, salvo) is salvo and isinstance(salvo, dict):
+            state.masaniello_cycle = salvo
+    except Exception:
+        logger.warning("[MASANIELLO_DB_REFRESH_FAILED] user_id=%s", user_id, exc_info=True)
+
+
 PRESERVAR_PLACAR_DO_BANCO = "_preservar_placar_do_banco"
 CAMPOS_DO_PLACAR = (
     "wins",
@@ -11547,6 +11774,7 @@ def persist_robot(user_id: str) -> Future | None:
     state_payload: dict[str, Any] | None = None
     last_trade: dict[str, Any] | None = None
     try:
+        sync_masaniello_cycle_on_gateway(user_id)
         state = auto_trader.get(user_id)
         state.account_mode = "REAL"
         state.allow_real = True
@@ -11568,6 +11796,10 @@ def persist_robot(user_id: str) -> Future | None:
         state_payload, last_trade = _protect_session_score_on_persist(
             user_id, state_payload, last_trade
         )
+        if state_payload.get("masaniello_enabled") or state_payload.get("masaniello_cycle"):
+            # Gateway e runtime gravam o mesmo `state_json`: a escrita confere
+            # o banco e nunca troca um ciclo mais novo por um mais velho.
+            state_payload = {**state_payload, CONFERIR_CICLO_NO_BANCO: True}
         robot_state_hydrated_users.add(user_id)
         restorable_robot_states[user_id] = deepcopy(state_payload)
         if robot_state_ws_hub.has_connections(user_id):
@@ -11591,6 +11823,8 @@ def persist_robot(user_id: str) -> Future | None:
         with _get_robot_persist_lock(user_id):
             if payload.pop(PRESERVAR_PLACAR_DO_BANCO, False):
                 payload = _com_placar_do_banco(user_id, payload)
+            if payload.pop(CONFERIR_CICLO_NO_BANCO, False):
+                payload = _com_ciclo_mais_novo_do_banco(user_id, payload)
             try:
                 robot_persistence.save_state(user_id, payload)
             except Exception:
@@ -14005,6 +14239,10 @@ async def execute_robot_cycle(
         if initial_stop_reason in {STATUS_STOP_WIN_HIT, STATUS_STOP_LOSS_HIT}:
             state = await pause_robot_by_stop(user_id, initial_stop_reason)
             return 200, build_robot_payload(state, user_id=user_id)
+        if masaniello_active(state) and state.enabled and not state.operation_in_progress:
+            masaniello_wait = await masaniello_cycle_gate(user_id, state)
+            if masaniello_wait is not None:
+                return masaniello_wait
         had_pending_signal = state.pending_signal is not None
         running_analysis = state.analysis_result == "RUNNING" or state.last_analysis_result == "RUNNING"
         if not had_pending_signal and not running_analysis:
@@ -14077,19 +14315,20 @@ async def execute_robot_cycle(
                         balance=real_balance,
                         balance_real=real_balance,
                     )
-                if real_balance is not None and float(state.entry_value) > real_balance:
+                if real_balance is not None and required_order_amount(state) > real_balance:
+                    shortfall_message = balance_shortfall_message(state)
                     state = await stop_real_robot_for_insufficient_balance(
                         user_id,
                         balance=real_balance,
-                        entry_value=float(state.entry_value),
+                        entry_value=required_order_amount(state),
                     )
                     return 200, build_robot_payload(
                         state,
                         user_id=user_id,
                         balance=real_balance,
                         balance_real=real_balance,
-                        operation_message=ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE,
-                        status_message=ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE,
+                        operation_message=shortfall_message,
+                        status_message=shortfall_message,
                     )
 
             status_code, account_payload, entry_window = await refresh_entry_window(user_id, state)
@@ -14147,19 +14386,20 @@ async def execute_robot_cycle(
                         balance=real_balance,
                         balance_real=real_balance,
                     )
-                if active_mode == "REAL" and real_balance is not None and float(state.entry_value) > real_balance:
+                if active_mode == "REAL" and real_balance is not None and required_order_amount(state) > real_balance:
+                    shortfall_message = balance_shortfall_message(state)
                     state = await stop_real_robot_for_insufficient_balance(
                         user_id,
                         balance=real_balance,
-                        entry_value=float(state.entry_value),
+                        entry_value=required_order_amount(state),
                     )
                     return 200, build_robot_payload(
                         state,
                         user_id=user_id,
                         balance=real_balance,
                         balance_real=real_balance,
-                        operation_message=ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE,
-                        status_message=ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE,
+                        operation_message=shortfall_message,
+                        status_message=shortfall_message,
                     )
                 logger.info(
                     "[REAL MODE DETECTED] user_id=%s active_mode=%s connected=%s confirm_real=%s",
@@ -14953,13 +15193,46 @@ async def execute_robot_cycle(
                     is_gale_order=is_gale_order,
                 )
                 payout = selected.get("payout")
-                order_amount = state.gale_amount if is_gale_order else state.entry_value
+                account_currency = resolve_user_account_currency(user_id)
+                min_entry = min_real_entry_for_currency(account_currency)
+                masaniello_order: dict[str, Any] | None = None
+                if masaniello_active(state) and not is_gale_order:
+                    # Gerenciamento Consistente: o valor sai do plano do ciclo,
+                    # não de `entry_value`.
+                    masaniello_order = auto_trader.masaniello_next_order(user_id, min_entry)
+                    if masaniello_order is None:
+                        cycle_stop = masaniello_cycle_stop_status(state)
+                        if cycle_stop is not None:
+                            # O capital que sobrou não paga o mínimo da corretora.
+                            state = await pause_robot_by_stop(user_id, cycle_stop)
+                            return 200, build_robot_payload(state, user_id=user_id)
+                        logger.warning(
+                            "[MASANIELLO_ORDER_SKIPPED] user_id=%s cycle_id=%s motivo=sem_ciclo_ou_resultado_pendente",
+                            user_id,
+                            (state.masaniello_cycle or {}).get("id"),
+                        )
+                        state.last_order_error = MASANIELLO_RESULT_PENDING
+                        state = reset_cycle_after_finish(user_id)
+                        return 200, build_robot_payload(state, user_id=user_id)
+                    order_amount = masaniello_order["stake"]
+                    logger.warning(
+                        "[MASANIELLO_ORDER] user_id=%s cycle_id=%s seq=%s stake=%s planned=%s "
+                        "adjusted_to_min=%s capital=%s payout=%s",
+                        user_id,
+                        masaniello_order["cycle_id"],
+                        masaniello_order["seq"],
+                        masaniello_order["stake"],
+                        masaniello_order["stake_planned"],
+                        masaniello_order["adjusted_to_min"],
+                        masaniello_order["capital_before"],
+                        payout,
+                    )
+                else:
+                    order_amount = state.gale_amount if is_gale_order else state.entry_value
                 try:
                     amount_value = float(order_amount)
                 except (TypeError, ValueError):
                     amount_value = 0.0
-                account_currency = resolve_user_account_currency(user_id)
-                min_entry = min_real_entry_for_currency(account_currency)
                 if amount_value < min_entry:
                     logger.error(
                         "[ORDER_AMOUNT_BELOW_CURRENCY_MIN] user_id=%s amount=%s currency=%s min=%s gale=%s",
@@ -15386,9 +15659,22 @@ async def execute_robot_cycle(
                     "parent_order_id": selected.get("parent_order_id") or state.gale_original_order_id,
                     "cycle_result": None,
                     "final_result": None,
-                    "original_amount": float(selected.get("original_amount") or state.entry_value),
+                    "original_amount": float(
+                        selected.get("original_amount")
+                        or (order_amount if masaniello_order is not None else state.entry_value)
+                    ),
                     "gale_amount": float(selected.get("gale_amount") or order_amount),
                 }
+                if masaniello_order is not None:
+                    # Marca do ciclo: é o que deixa reconstruir a calculadora
+                    # pelo Histórico e conferir, ordem a ordem, o valor do plano.
+                    trade["masaniello"] = {
+                        "cycle_id": masaniello_order["cycle_id"],
+                        "seq": masaniello_order["seq"],
+                        "stake_planned": masaniello_order["stake_planned"],
+                        "adjusted_to_min": masaniello_order["adjusted_to_min"],
+                        "capital_before": masaniello_order["capital_before"],
+                    }
                 trade["timestamp"] = trade["sent_at"]
                 state = auto_trader.record_trade(user_id, trade)
                 logger.info("[STATE] ORDER_OPEN user_id=%s cycle_id=%s order_id=%s", user_id, state.cycle_id, order_id)
@@ -16409,6 +16695,7 @@ async def _robot_state_impl(auth: dict[str, str]) -> JSONResponse:
     if robot_runtime_mode() == "external" and not is_manual_disconnect(user_id):
         remote = robot_bus.get_snapshot(user_id)
         if remote is not None and isinstance(remote, dict) and isinstance(remote.get("data"), dict):
+            sync_masaniello_cycle_on_gateway(user_id, remote["data"])
             remote = enrich_robot_snapshot_session_score(user_id, remote)
             return json_response(
                 200,
@@ -16416,6 +16703,7 @@ async def _robot_state_impl(auth: dict[str, str]) -> JSONResponse:
                 headers=polling_headers(ROBOT_STATE_MIN_POLL_SECONDS),
             )
         rehydrate_score_from_persistence_if_blank(user_id)
+        await asyncio.to_thread(refresh_masaniello_cycle_from_persistence, user_id)
         state = auto_trader.get(user_id)
     else:
         rehydrate_score_from_persistence_if_blank(user_id)
@@ -16963,6 +17251,70 @@ async def debug_robot_settings(
     )
 
 
+def validate_masaniello_config(
+    user_id: str,
+    update: RobotConfigUpdate,
+) -> dict[str, Any] | None:
+    """Confere o plano do Gerenciamento Consistente antes de salvar.
+
+    Só valida quando o modo fica LIGADO depois da gravação: o formulário
+    manda os campos mesmo com o modo desligado.
+
+    Args:
+        user_id: Dono da sessão.
+        update: Mudanças recebidas.
+
+    Returns:
+        ``None`` se pode salvar, ou o corpo do erro (``MASANIELLO_INVALID_PLAN``
+        / ``MASANIELLO_CAPITAL_TOO_LOW``, este com ``data.min_capital``).
+    """
+    current = auto_trader.get(user_id)
+    enabled = (
+        update.masaniello_enabled
+        if update.masaniello_enabled is not None
+        else bool(current.masaniello_enabled)
+    )
+    if not enabled:
+        return None
+    profile = masaniello.normalize_profile(
+        update.masaniello_profile if update.masaniello_profile is not None else current.masaniello_profile
+    )
+    if profile in masaniello.PROFILES:
+        operations, wins = masaniello.PROFILES[profile]
+    else:
+        operations = (
+            update.masaniello_operations
+            if update.masaniello_operations is not None
+            else current.masaniello_operations
+        )
+        wins = update.masaniello_wins if update.masaniello_wins is not None else current.masaniello_wins
+    if not masaniello.valid_plan(operations, wins):
+        logger.info(
+            "[MASANIELLO_INVALID_PLAN] user_id=%s operations=%s wins=%s", user_id, operations, wins
+        )
+        return build_error("MASANIELLO_INVALID_PLAN")
+    capital = float(
+        update.masaniello_capital if update.masaniello_capital is not None else current.masaniello_capital
+    )
+    payout_ref = float(update.min_payout if update.min_payout is not None else current.min_payout)
+    min_entry = masaniello_min_entry(user_id)
+    minimo = masaniello.min_capital(int(operations), int(wins), payout_ref, min_entry)
+    if capital < minimo:
+        logger.info(
+            "[MASANIELLO_CAPITAL_TOO_LOW] user_id=%s capital=%s min_capital=%s min_entry=%s",
+            user_id,
+            capital,
+            minimo,
+            min_entry,
+        )
+        return {
+            "ok": False,
+            "error": "MASANIELLO_CAPITAL_TOO_LOW",
+            "data": {"min_capital": minimo, "min_entry": min_entry},
+        }
+    return None
+
+
 @app.post("/robot/config")
 async def robot_config(
     body: dict[str, Any] | None = Body(default=None),
@@ -17009,6 +17361,13 @@ async def robot_config(
             )
         filtered_body["market_mode"] = selectable
     partial_update = RobotConfigUpdate.model_validate(filtered_body)
+    # Conta marketing também pode ligar o Gerenciamento Consistente (02/10/2026,
+    # a pedido do dono): o ciclo só acompanha ordem real com a marca dele, então
+    # operação do Shift+O não o distorce. O que não convive é o modo LIVE, que
+    # esconde loss — e esse já fica de fora em `masaniello_active`.
+    masaniello_error = validate_masaniello_config(user_id, partial_update)
+    if masaniello_error is not None:
+        return json_response(400, masaniello_error)
     if partial_update.entry_value is not None:
         account_currency = resolve_user_account_currency(user_id)
         min_entry = min_real_entry_for_currency(account_currency)
@@ -17064,6 +17423,14 @@ async def robot_config(
     )
     saved_fields = partial_update.model_dump(exclude_none=True)
     persist_robot(user_id)
+    if robot_runtime_mode() == "external":
+        # O painel lê o snapshot do Redis (TTL 600s). Sem republicar, a
+        # configuração recém-salva voltava com o valor antigo na releitura e o
+        # formulário desfazia a mudança. Config só salva com o robô parado.
+        try:
+            publish_robot_control_snapshot(user_id)
+        except Exception:
+            logger.warning("[ROBOT_CONFIG_SNAPSHOT_FAILED] user_id=%s", user_id, exc_info=True)
     logger.info(
         "[ROBOT_CONFIG_SAVED] user_id=%s saved_fields=%s",
         user_id,
@@ -17117,6 +17484,9 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
     # Mesmo split-brain do config: runtime já pausou (Stop Win/Loss) e o Redis
     # tem enabled=false/STOP_*_HIT, mas o gateway ainda carrega enabled=true.
     state = reconcile_gateway_enabled_from_runtime_snapshot(user_id, state)
+    # O ciclo do Gerenciamento Consistente anda no runtime: o saldo exigido e
+    # a decisão "continua ou abre outro" dependem da cópia mais nova.
+    sync_masaniello_cycle_on_gateway(user_id)
     state.account_mode = "REAL"
     state.allow_real = True
     state.confirm_real = True
@@ -17325,7 +17695,9 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
                 message=INSUFFICIENT_BALANCE_START_MESSAGE,
             ),
         )
-    if float(real_balance) < float(state.entry_value):
+    required_amount = required_order_amount(state)
+    if float(real_balance) < required_amount:
+        shortfall_message = balance_shortfall_message(state)
         state = auto_trader.insufficient_balance(user_id)
         persist_robot(user_id)
         await stop_robot_worker(user_id)
@@ -17333,19 +17705,19 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
             "[ROBOT_START_BLOCKED_INSUFFICIENT_BALANCE] user_id=%s balance=%s entry_value=%s",
             user_id,
             real_balance,
-            state.entry_value,
+            required_amount,
         )
         logger.warning(
             "[INSUFFICIENT_BALANCE_REAL] user_id=%s balance=%s entry_value=%s",
             user_id,
             real_balance,
-            state.entry_value,
+            required_amount,
         )
         return json_response(
             200,
             build_insufficient_balance_start_response(
                 state,
-                message=ENTRY_VALUE_EXCEEDS_BALANCE_MESSAGE,
+                message=shortfall_message,
             ),
         )
     state = auto_trader.sync_connection(
@@ -17382,6 +17754,12 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
         state.entry_value,
     )
     state = auto_trader.start(user_id)
+    # Continua o ciclo em andamento ou abre um novo (meta batida, erros
+    # esgotados, plano alterado). O runtime repete a conferência ao receber o
+    # `start`, já com o estado recarregado.
+    state = auto_trader.masaniello_begin_if_needed(
+        user_id, min_entry=masaniello_min_entry(user_id)
+    )
     robot_worker_restart_attempted.discard(user_id)
     logger.info(
         "[CYCLE_START] user_id=%s cycle_id=%s next_cycle_at=%s cycle_minutes=%s",
@@ -17414,6 +17792,33 @@ async def _robot_start_impl(auth: dict[str, str]) -> JSONResponse:
     )
     logger.info("[ROBOT START] user_id=%s", user_id)
     return json_response(200, control_payload)
+
+
+@app.post("/robot/masaniello/end-cycle")
+async def robot_masaniello_end_cycle(
+    auth: dict[str, str] = Depends(require_headers),
+) -> JSONResponse:
+    """Encerra o ciclo em andamento do Gerenciamento Consistente.
+
+    É a saída do cliente que parou no meio e não quer continuar aquele ciclo:
+    o próximo "Iniciar" abre um novo, com o capital configurado. Só com o robô
+    parado — com ele ligado o ciclo é do runtime e pode haver ordem em voo.
+    Não mexe no placar nem no Histórico.
+    """
+    user_id = auth["user_id"]
+    state = get_user_robot_state(user_id)
+    state = reconcile_gateway_enabled_from_runtime_snapshot(user_id, state)
+    if robot_config_locked(user_id, state):
+        return json_response(409, CONFIG_LOCK_ERROR)
+    sync_masaniello_cycle_on_gateway(user_id)
+    state = auto_trader.masaniello_end_cycle(user_id)
+    persist_robot(user_id)
+    if robot_runtime_mode() == "external":
+        try:
+            publish_robot_control_snapshot(user_id)
+        except Exception:
+            logger.warning("[MASANIELLO_END_SNAPSHOT_FAILED] user_id=%s", user_id, exc_info=True)
+    return json_response(200, build_robot_payload(state, user_id=user_id))
 
 
 @app.post("/robot/live-mode")

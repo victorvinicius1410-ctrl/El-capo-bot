@@ -5,6 +5,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from backend import masaniello
 from backend.placar_janela import conta_no_placar
 from typing import Any, Literal
 
@@ -90,6 +91,14 @@ WAITING_ANALYSIS_MESSAGE = "Buscando melhor oportunidade"
 DISCONNECTED_MESSAGE = "Conta BullEx desconectada"
 STOP_WIN_MESSAGE = "Stop Win atingido. Clique em Reiniciar ciclo para continuar."
 STOP_LOSS_MESSAGE = "Stop Loss atingido. Clique em Reiniciar ciclo para continuar."
+MASANIELLO_TARGET_MESSAGE = (
+    "Meta do ciclo batida. Clique em Nova Operação para começar outro ciclo."
+)
+MASANIELLO_BUST_MESSAGE = (
+    "Erros do ciclo esgotados: o capital do ciclo acabou. "
+    "Clique em Nova Operação para começar outro ciclo."
+)
+MASANIELLO_RESULT_PENDING = "MASANIELLO_RESULT_PENDING"
 INSUFFICIENT_BALANCE_MESSAGE = "Saldo insuficiente na conta REAL"
 REAL_MODE_REQUIRED_MESSAGE = "Entre na conta REAL da BullEx para iniciar o robô."
 SIGNAL_EXPIRED_MESSAGE = "Entrada perdida por atraso. Aguardando novo sinal."
@@ -237,6 +246,50 @@ def normalize_stop_mode(value: Any) -> str:
     return "money"
 
 
+def masaniello_active(state: Any) -> bool:
+    """True quando o Gerenciamento Consistente manda no valor da entrada.
+
+    Com o modo LIVE ligado (conta marketing) o gerenciamento fica suspenso:
+    ali o loss é ocultado e o ciclo não fecharia a conta. A configuração é
+    mantida; o robô volta a usar ``entry_value`` e os stops de sempre até o
+    LIVE ser desligado.
+    """
+    return bool(getattr(state, "masaniello_enabled", False)) and not bool(
+        getattr(state, "live_demo", False)
+    )
+
+
+def masaniello_cycle_stop_status(state: Any) -> str | None:
+    """Status de stop que corresponde ao ciclo encerrado, se houver."""
+    cycle = getattr(state, "masaniello_cycle", None)
+    status = cycle.get("status") if isinstance(cycle, dict) else None
+    if status == masaniello.STATUS_TARGET_HIT:
+        return STATUS_STOP_WIN_HIT
+    if status == masaniello.STATUS_BUST:
+        return STATUS_STOP_LOSS_HIT
+    return None
+
+
+def masaniello_stop_reason(state: Any) -> str | None:
+    """Stop do Gerenciamento Consistente: o fim do ciclo.
+
+    Com o robô parado não há stop pendente: o próximo "Iniciar" abre um ciclo
+    novo, então o bloqueio de ``RESET_CYCLE_REQUIRED`` não se aplica.
+    """
+    if not getattr(state, "enabled", False):
+        return None
+    return masaniello_cycle_stop_status(state)
+
+
+def masaniello_pending_ceiling_seconds(state: Any) -> int:
+    """Quanto tempo a ordem do ciclo pode ficar sem resultado antes de travar."""
+    try:
+        minutes = int(getattr(state, "cycle_minutes", 1) or 1)
+    except (TypeError, ValueError):
+        minutes = 1
+    return max(600, minutes * 60 + 300)
+
+
 def resolve_robot_stop_reason(
     state: Any,
     *,
@@ -264,6 +317,10 @@ def resolve_robot_stop_reason(
     Returns:
         ``STOP_WIN_HIT``, ``STOP_LOSS_HIT`` ou ``None``.
     """
+    if masaniello_active(state):
+        # O plano é o stop: Stop Win/Loss digitados não valem neste modo. Todo
+        # ponto que avalia stop passa por aqui, então basta este desvio.
+        return masaniello_stop_reason(state)
     win_mode = normalize_stop_mode(getattr(state, "stop_win_mode", "money"))
     loss_mode = normalize_stop_mode(getattr(state, "stop_loss_mode", "money"))
     current_wins = int(wins if wins is not None else getattr(state, "wins", 0) or 0)
@@ -494,6 +551,15 @@ class RobotConfigUpdate(BaseModel):
     martingale_enabled: bool | None = Field(default=None, validation_alias=AliasChoices("martingale_enabled", "martingaleEnabled"))
     martingale_steps: int | None = Field(default=None, ge=1, le=10, validation_alias=AliasChoices("martingale_steps", "martingaleSteps"))
     martingale_multiplier: float | None = Field(default=None, gt=0, validation_alias=AliasChoices("martingale_multiplier", "martingaleMultiplier"))
+    # Gerenciamento Consistente. Sem limites aqui de propósito: o formulário
+    # manda os cinco campos mesmo com o modo desligado, e um valor fora da
+    # faixa não pode derrubar o salvamento inteiro. `update_config` ajusta e
+    # `POST /robot/config` valida quando o modo está ligado.
+    masaniello_enabled: bool | None = Field(default=None, validation_alias=AliasChoices("masaniello_enabled", "masanielloEnabled"))
+    masaniello_capital: float | None = Field(default=None, validation_alias=AliasChoices("masaniello_capital", "masanielloCapital"))
+    masaniello_operations: int | None = Field(default=None, validation_alias=AliasChoices("masaniello_operations", "masanielloOperations"))
+    masaniello_wins: int | None = Field(default=None, validation_alias=AliasChoices("masaniello_wins", "masanielloWins"))
+    masaniello_profile: str | None = Field(default=None, validation_alias=AliasChoices("masaniello_profile", "masanielloProfile"))
 
 
 @dataclass
@@ -539,6 +605,18 @@ class RobotState:
     martingale_enabled: bool = False
     martingale_steps: int = 1
     martingale_multiplier: float = 2.0
+    # Gerenciamento Consistente (Masaniello): o valor de cada entrada sai do
+    # plano, não de `entry_value`, e o próprio ciclo é o stop. Não convive com
+    # o gale. Ver `backend/masaniello.py`.
+    masaniello_enabled: bool = False
+    masaniello_capital: float = 100.0
+    masaniello_operations: int = 10
+    masaniello_wins: int = 4
+    masaniello_profile: str = masaniello.DEFAULT_PROFILE
+    # Ciclo em andamento (ou o último encerrado). Quem escreve o progresso é o
+    # runtime; gateway e banco decidem qual cópia vale pelo `rev`
+    # (`masaniello.pick_freshest_cycle`).
+    masaniello_cycle: dict[str, Any] | None = None
     wins: int = 0
     losses: int = 0
     profit: float = 0.0
@@ -874,12 +952,20 @@ class RobotState:
             data["enabled"] = False
             data["operation_in_progress"] = False
             data["result_waiting"] = False
-            data["operation_message"] = STOP_WIN_MESSAGE
+            data["operation_message"] = (
+                MASANIELLO_TARGET_MESSAGE
+                if masaniello_active(self) and masaniello_cycle_stop_status(self) == STATUS_STOP_WIN_HIT
+                else STOP_WIN_MESSAGE
+            )
         elif self.status == STATUS_STOP_LOSS_HIT:
             data["enabled"] = False
             data["operation_in_progress"] = False
             data["result_waiting"] = False
-            data["operation_message"] = STOP_LOSS_MESSAGE
+            data["operation_message"] = (
+                MASANIELLO_BUST_MESSAGE
+                if masaniello_active(self) and masaniello_cycle_stop_status(self) == STATUS_STOP_LOSS_HIT
+                else STOP_LOSS_MESSAGE
+            )
         elif self.status == STATUS_INSUFFICIENT_BALANCE:
             data["enabled"] = False
             data["operation_in_progress"] = False
@@ -1227,6 +1313,7 @@ class AutoTrader:
             if trade.get("order_id") is not None
         }
         self._close_stale_last_trade(state, finalizadas)
+        self._repair_masaniello_cycle(user_id, state, finalizadas)
         # O placar sai da janela INTEIRA (desde o último Reiniciar, pode ser
         # mais de um dia); a memória guarda só as 100 últimas e o dinheiro das
         # que ficaram de fora vai para o acumulado do stop.
@@ -1234,6 +1321,47 @@ class AutoTrader:
         self._zerar_acumulado_do_stop(user_id)
         self._histories[user_id] = self._limitar_historico(user_id, finalizadas)
         return state
+
+    def _repair_masaniello_cycle(
+        self,
+        user_id: str,
+        state: RobotState,
+        trades: list[dict[str, Any]],
+    ) -> None:
+        """Lança no ciclo as operações do Histórico que o estado salvo não tem.
+
+        O ``state_json`` é gravado de forma assíncrona e por dois processos:
+        um resultado pode chegar ao Histórico e o processo cair (ou a cópia do
+        gateway ganhar a gravação) antes de o ciclo ser salvo com ele. As
+        operações levam a marca do ciclo, então dá para completar aqui. É só
+        soma e é idempotente: operação já lançada é ignorada.
+
+        Args:
+            user_id: Dono da sessão (para o log).
+            state: Estado restaurado, alterado no lugar.
+            trades: Operações finais do Histórico, em ordem cronológica.
+        """
+        cycle = state.masaniello_cycle
+        if not isinstance(cycle, dict):
+            return
+        for trade in trades:
+            resultado = str(trade.get("result") or "").strip().upper()
+            marca = trade.get("masaniello")
+            if resultado not in {"WIN", "LOSS", "DRAW"} or not isinstance(marca, dict):
+                continue
+            if marca.get("cycle_id") != cycle.get("id"):
+                continue
+            if masaniello.has_order(state.masaniello_cycle, trade.get("order_id")):
+                continue
+            self._apply_masaniello_result(
+                user_id, state, trade, resultado, float(trade.get("profit") or 0)
+            )
+            logger.warning(
+                "[MASANIELLO_CYCLE_REPAIRED] user_id=%s order_id=%s result=%s",
+                user_id,
+                trade.get("order_id"),
+                resultado,
+            )
 
     @staticmethod
     def _close_stale_last_trade(
@@ -1457,9 +1585,18 @@ class AutoTrader:
             changes["stop_win_operations"] = max(1, min(500, int(changes.get("stop_win_operations") or 1)))
         if "stop_loss_operations" in changes:
             changes["stop_loss_operations"] = max(1, min(500, int(changes.get("stop_loss_operations") or 1)))
+        self._normalize_masaniello_changes(state, changes)
 
         for key, value in changes.items():
             setattr(state, key, value)
+        if not state.masaniello_enabled and masaniello.is_active(state.masaniello_cycle):
+            # Desligou o modo: o ciclo em andamento acabou ali.
+            state.masaniello_cycle = masaniello.close(
+                state.masaniello_cycle,
+                masaniello.STATUS_ABANDONED,
+                masaniello.REASON_USER,
+                at=utc_now().isoformat(),
+            )
 
         if "cycle_minutes" in changes and state.next_cycle_at is not None:
             base = self._next_cycle_base(state) or state.current_cycle_started_at or utc_now()
@@ -1473,6 +1610,241 @@ class AutoTrader:
         if changes:
             self._sources[user_id] = "memory"
         return state
+
+    @staticmethod
+    def _normalize_masaniello_changes(state: RobotState, changes: dict[str, Any]) -> None:
+        """Ajusta os campos do Gerenciamento Consistente antes de gravar.
+
+        Perfil conhecido manda em ``N``/``W``; no personalizado os dois ficam
+        em ``1 <= W < N <= MAX``. O modo e o gale não convivem: o que foi
+        ligado por último nesta gravação desliga o outro.
+
+        Args:
+            state: Estado atual (fonte dos campos que não vieram).
+            changes: Mudanças a aplicar, alteradas no lugar.
+        """
+        touched = any(key.startswith("masaniello_") for key in changes)
+        if touched:
+            if "masaniello_profile" in changes:
+                changes["masaniello_profile"] = masaniello.normalize_profile(
+                    changes.get("masaniello_profile")
+                )
+            profile = changes.get("masaniello_profile", state.masaniello_profile)
+            if profile in masaniello.PROFILES:
+                operations, wins = masaniello.PROFILES[profile]
+            else:
+                operations = int(changes.get("masaniello_operations", state.masaniello_operations) or 0)
+                wins = int(changes.get("masaniello_wins", state.masaniello_wins) or 0)
+                operations = max(2, min(masaniello.MAX_OPERATIONS, operations))
+                wins = max(1, min(operations - 1, wins))
+            changes["masaniello_operations"] = operations
+            changes["masaniello_wins"] = wins
+            if "masaniello_capital" in changes:
+                capital = float(changes.get("masaniello_capital") or 0)
+                changes["masaniello_capital"] = masaniello.cents(max(0.0, capital))
+        if changes.get("masaniello_enabled"):
+            changes["martingale_enabled"] = False
+        elif changes.get("martingale_enabled") and "masaniello_enabled" not in changes:
+            changes["masaniello_enabled"] = False
+
+    def masaniello_begin_if_needed(self, user_id: str, *, min_entry: float = 0.0) -> RobotState:
+        """Garante um ciclo do Gerenciamento Consistente para operar. Idempotente.
+
+        Chamado no "Iniciar" (gateway) e de novo no runtime, logo depois de
+        ele recarregar o estado. Continua o ciclo em andamento quando o plano
+        é o mesmo; abre outro quando não há ciclo, quando o anterior acabou,
+        quando o plano mudou ou quando a ordem pendente passou do prazo sem
+        resultado (o capital do ciclo ficou desconhecido).
+
+        Args:
+            user_id: Dono da sessão.
+            min_entry: Mínimo da corretora na moeda da conta.
+
+        Returns:
+            O estado, com ``masaniello_cycle`` pronto.
+        """
+        state = self.get(user_id)
+        if not masaniello_active(state):
+            return state
+        cycle = state.masaniello_cycle if isinstance(state.masaniello_cycle, dict) else None
+        wanted = masaniello.signature(
+            state.masaniello_capital,
+            state.masaniello_operations,
+            state.masaniello_wins,
+            state.min_payout,
+        )
+        now = utc_now()
+        motivo = "sem_ciclo"
+        if cycle is not None:
+            motivo = "ciclo_encerrado"
+            if masaniello.is_active(cycle):
+                motivo = "plano_mudou"
+                if masaniello.cycle_signature(cycle) == wanted:
+                    pending = cycle.get("pending")
+                    if not isinstance(pending, dict):
+                        return state
+                    enviada = parse_datetime(pending.get("at"))
+                    if (
+                        enviada is not None
+                        and (now - enviada).total_seconds() <= masaniello_pending_ceiling_seconds(state)
+                    ):
+                        return state
+                    motivo = "resultado_desconhecido"
+        state.masaniello_cycle = masaniello.new_cycle(
+            state.masaniello_capital,
+            state.masaniello_operations,
+            state.masaniello_wins,
+            state.min_payout,
+            min_entry=min_entry,
+            at=now.isoformat(),
+        )
+        logger.warning(
+            "[MASANIELLO_CYCLE_STARTED] user_id=%s cycle_id=%s capital=%s n=%s w=%s "
+            "payout_ref=%s target=%s motivo=%s ciclo_anterior=%s",
+            user_id,
+            state.masaniello_cycle["id"],
+            state.masaniello_cycle["capital_inicial"],
+            state.masaniello_cycle["n"],
+            state.masaniello_cycle["w"],
+            state.masaniello_cycle["payout_ref"],
+            state.masaniello_cycle["target"],
+            motivo,
+            (cycle or {}).get("id"),
+        )
+        self._sources[user_id] = "memory"
+        return state
+
+    def masaniello_next_order(self, user_id: str, min_entry: float) -> dict[str, Any] | None:
+        """Valor da próxima ordem pelo plano do ciclo.
+
+        Args:
+            user_id: Dono da sessão.
+            min_entry: Mínimo da corretora na moeda da conta.
+
+        Returns:
+            ``stake``, ``stake_planned``, ``adjusted_to_min`` e a marca do
+            ciclo (``cycle_id``, ``seq``, ``capital_before``). ``None`` quando
+            não dá para enviar agora: sem ciclo ativo, com ordem do ciclo
+            ainda sem resultado, ou sem capital para o mínimo — neste último
+            caso o ciclo é encerrado como perdido e o chamador pausa o robô.
+        """
+        state = self.get(user_id)
+        cycle = state.masaniello_cycle
+        if not masaniello.is_active(cycle):
+            return None
+        assert isinstance(cycle, dict)
+        if isinstance(cycle.get("pending"), dict):
+            return None
+        order = masaniello.next_stake(cycle, min_entry)
+        if order is None:
+            state.masaniello_cycle = masaniello.close(
+                cycle,
+                masaniello.STATUS_BUST,
+                masaniello.REASON_NO_CAPITAL,
+                at=utc_now().isoformat(),
+            )
+            logger.warning(
+                "[MASANIELLO_CYCLE_NO_CAPITAL] user_id=%s cycle_id=%s capital=%s min_entry=%s",
+                user_id,
+                cycle.get("id"),
+                cycle.get("capital_atual"),
+                min_entry,
+            )
+            return None
+        return {
+            **order,
+            "cycle_id": cycle.get("id"),
+            "seq": int(cycle.get("wins") or 0) + int(cycle.get("losses") or 0) + 1,
+            "capital_before": cycle.get("capital_atual"),
+        }
+
+    def masaniello_end_cycle(self, user_id: str, reason: str = masaniello.REASON_USER) -> RobotState:
+        """Encerra o ciclo em andamento sem resultado (abandono). Idempotente."""
+        state = self.get(user_id)
+        if masaniello.is_active(state.masaniello_cycle):
+            state.masaniello_cycle = masaniello.close(
+                state.masaniello_cycle,
+                masaniello.STATUS_ABANDONED,
+                reason,
+                at=utc_now().isoformat(),
+            )
+            logger.warning(
+                "[MASANIELLO_CYCLE_ENDED] user_id=%s cycle_id=%s reason=%s",
+                user_id,
+                state.masaniello_cycle.get("id"),
+                reason,
+            )
+            self._sources[user_id] = "memory"
+        return state
+
+    def _apply_masaniello_result(
+        self,
+        user_id: str,
+        state: RobotState,
+        trade: dict[str, Any],
+        result: str,
+        profit: float,
+    ) -> None:
+        """Lança o resultado de uma ordem no ciclo a que ela pertence.
+
+        Só mexe em ordem que leva a marca do ciclo atual; resultado de ciclo
+        antigo (o cliente já abriu outro) fica só no Histórico. O capital usa
+        o MESMO lucro que vai para o placar.
+
+        Args:
+            user_id: Dono da sessão (para o log).
+            state: Estado do robô, alterado no lugar.
+            trade: Operação fechada (com ``masaniello``, ``amount``, ``payout``).
+            result: WIN, LOSS ou DRAW.
+            profit: Lucro real da operação.
+        """
+        marca = trade.get("masaniello")
+        cycle = state.masaniello_cycle
+        if not isinstance(marca, dict) or not isinstance(cycle, dict):
+            return
+        if marca.get("cycle_id") != cycle.get("id"):
+            return
+        amount = float(trade.get("amount") or 0)
+        updated = masaniello.apply_result(
+            cycle,
+            order_id=trade.get("order_id"),
+            result=result,
+            profit=float(profit or 0),
+            stake=amount,
+            stake_planned=marca.get("stake_planned"),
+            adjusted_to_min=bool(marca.get("adjusted_to_min")),
+            asset=trade.get("active") or trade.get("symbol"),
+            payout=trade.get("payout"),
+            at=str(trade.get("finished_at") or utc_now().isoformat()),
+        )
+        if updated is cycle:
+            return
+        state.masaniello_cycle = updated
+        if result == "WIN" and float(profit or 0) < amount * float(cycle.get("payout_ref") or 0) / 100 - 0.01:
+            # Canal digital/turbo pagou menos que o piso usado na matriz: a
+            # meta do ciclo pode ficar um pouco abaixo do previsto.
+            logger.warning(
+                "[MASANIELLO_PAYOUT_BELOW_REF] user_id=%s order_id=%s amount=%s profit=%s payout_ref=%s",
+                user_id,
+                trade.get("order_id"),
+                amount,
+                profit,
+                cycle.get("payout_ref"),
+            )
+        logger.warning(
+            "[MASANIELLO_RESULT] user_id=%s cycle_id=%s order_id=%s result=%s stake=%s "
+            "profit=%s capital=%s wins=%s losses=%s status=%s",
+            user_id,
+            updated.get("id"),
+            trade.get("order_id"),
+            result,
+            amount,
+            profit,
+            updated.get("capital_atual"),
+            updated.get("wins"),
+            updated.get("losses"),
+            updated.get("status"),
+        )
 
     def start(self, user_id: str) -> RobotState:
         state = self.get(user_id)
@@ -2405,6 +2777,9 @@ class AutoTrader:
         state.block_reasons = []
         state.metrics = {}
         self._clear_gale_state(state)
+        # "Reiniciar ciclo" apaga o Histórico: o ciclo do Gerenciamento
+        # Consistente perderia as linhas e não tem mais de onde se conferir.
+        state.masaniello_cycle = None
 
         if reset_score:
             state.wins = 0
@@ -2726,6 +3101,24 @@ class AutoTrader:
         # desligar o LIVE durante a vela faça um LOSS daquela ordem reaparecer.
         trade.setdefault("live_mode_active", bool(state.live_demo))
         state.last_trade = trade
+        marca = trade.get("masaniello")
+        if (
+            isinstance(marca, dict)
+            and isinstance(state.masaniello_cycle, dict)
+            and marca.get("cycle_id") == state.masaniello_cycle.get("id")
+        ):
+            # Enquanto esta ordem não fechar, o ciclo não manda outra: o valor
+            # da próxima depende do resultado desta.
+            state.masaniello_cycle = masaniello.mark_pending(
+                state.masaniello_cycle,
+                order_id=order_id,
+                stake=float(trade.get("amount") or 0),
+                stake_planned=marca.get("stake_planned"),
+                adjusted_to_min=bool(marca.get("adjusted_to_min")),
+                asset=trade.get("active") or trade.get("symbol"),
+                payout=trade.get("payout"),
+                at=trade["sent_at"],
+            )
         state.last_entry_at = sent_at
         state.consecutive_no_opportunity_cycles = 0
         state.pending_signal = None
@@ -3016,6 +3409,7 @@ class AutoTrader:
                 "cycle_result": normalizado,
             }
         )
+        self._apply_masaniello_result(user_id, state, fechado, normalizado, lucro)
         vai_ao_historico = not should_hide_live_loss(fechado, state)
         if vai_ao_historico:
             historico = self._histories.setdefault(user_id, [])
@@ -3295,6 +3689,7 @@ class AutoTrader:
                 "gale_amount": float(trade.get("gale_amount") or (trade.get("amount") if is_gale_trade else 0) or 0),
             }
         )
+        self._apply_masaniello_result(user_id, state, trade, normalized_result, trade_profit)
         completed.add(normalized_order_id)
         state.last_trade = trade
         state.operation_in_progress = False
@@ -3376,6 +3771,11 @@ class AutoTrader:
         )
         completed.add(normalized_order_id)
         state.last_trade = trade
+        if isinstance(state.masaniello_cycle, dict):
+            # O ciclo continua esperando: sem o resultado não há capital atual.
+            state.masaniello_cycle = masaniello.flag_pending_unknown(
+                state.masaniello_cycle, normalized_order_id
+            )
         state.operation_in_progress = False
         state.status = STATUS_WAITING_NEXT_CYCLE if state.enabled else STATUS_STOPPED
         state.rejection_reason = "TRADE_RESULT_TIMEOUT"

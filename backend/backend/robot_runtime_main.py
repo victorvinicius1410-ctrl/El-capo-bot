@@ -23,6 +23,8 @@ import os
 import signal
 import uuid
 
+from backend import masaniello
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("robot-runtime")
@@ -145,11 +147,15 @@ def _hydrate_user_from_persistence(
     # backend.placar_janela), a memória nunca é "de outro dia": a regra de
     # descartar o placar da véspera (29/09, d353ab80) saiu com ela.
     live_score = None
+    live_cycle = None
     has_state = getattr(auto_trader, "has_state", None)
     if callable(has_state) and has_state(user_id):
         if not force:
             return
         live_score = _capture_live_session_score(auto_trader, user_id)
+        # Ciclo do Gerenciamento Consistente: a memória viva pode estar à
+        # frente do banco (resultado ainda em gravação assíncrona).
+        live_cycle = getattr(auto_trader.get(user_id), "masaniello_cycle", None)  # type: ignore[attr-defined]
     try:
         for uid, state_payload in persistence.load_states():
             if str(uid) != user_id:
@@ -163,6 +169,11 @@ def _hydrate_user_from_persistence(
             auto_trader.restore(user_id, state_payload, trades, source=source)
             if live_score is not None:
                 _prefer_live_session_score(auto_trader, user_id, live_score)
+            if isinstance(live_cycle, dict):
+                restored = auto_trader.get(user_id)  # type: ignore[attr-defined]
+                restored.masaniello_cycle = masaniello.pick_freshest_cycle(
+                    getattr(restored, "masaniello_cycle", None), live_cycle
+                )
             # `restore` recalcula o placar pelo histórico e
             # `_prefer_live_session_score` mantém o MAIOR total: os dois
             # desfaziam uma exclusão recente. A baixa intencional vigente
@@ -213,6 +224,31 @@ def apagar_operacao_do_runtime(gateway: object, user_id: str, removida: dict) ->
         logger.warning("[PATTERN_MEMORY_FORGET_FAILED] user_id=%s order_id=%s", user_id, order_id, exc_info=True)
 
 
+def _begin_masaniello_cycle(gateway: object, user_id: str) -> None:
+    """Confere o ciclo do Gerenciamento Consistente depois de recarregar o estado.
+
+    O gateway abre (ou continua) o ciclo no "Iniciar" com a visão dele, que
+    pode estar atrasada. O runtime é quem lança resultado no ciclo, então a
+    última palavra é daqui: mesma função, idempotente.
+
+    Args:
+        gateway: Módulo ``backend.main`` carregado no runtime.
+        user_id: Cliente alvo.
+    """
+    auto_trader = getattr(gateway, "auto_trader", None)
+    begin = getattr(auto_trader, "masaniello_begin_if_needed", None)
+    if not callable(begin):
+        return
+    try:
+        antes = getattr(auto_trader.get(user_id), "masaniello_cycle", None)  # type: ignore[union-attr]
+        min_entry = gateway.masaniello_min_entry(user_id)  # type: ignore[attr-defined]
+        state = begin(user_id, min_entry=min_entry)
+        if getattr(state, "masaniello_cycle", None) is not antes:
+            gateway.persist_robot(user_id)  # type: ignore[attr-defined]
+    except Exception:
+        logger.warning("[MASANIELLO_RUNTIME_BEGIN_FAILED] user_id=%s", user_id, exc_info=True)
+
+
 async def _handle_command(gateway: object, payload: dict) -> None:
     """Aplica start/stop/ensure no auto_trader local do runtime."""
     user_id = str(payload.get("user_id") or "").strip()
@@ -234,6 +270,8 @@ async def _handle_command(gateway: object, payload: dict) -> None:
         # recarregar. `ensure` = polling do painel a cada ~5s: NÃO pode
         # sobrescrever o placar vivo (ver comentário em _hydrate_user...).
         _hydrate_user_from_persistence(gateway, user_id, force=(action == "start"))
+        if action == "start":
+            _begin_masaniello_cycle(gateway, user_id)
         # Painel online no gateway → marca ativo no runtime para ensure passar.
         mark = getattr(gateway, "mark_user_active", None)
         if callable(mark):
