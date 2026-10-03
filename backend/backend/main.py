@@ -46,6 +46,7 @@ from backend.placar_contador import ContadorDoPlacar
 from backend.placar_janela import (
     MARCA_PLACAR_CONTINUO,
     PLACAR_CONTINUO_DESDE,
+    apagada_fora_do_placar,
     conta_no_placar,
     inicio_do_placar,
     placar_da_regra_atual,
@@ -3467,6 +3468,7 @@ def publish_marketing_score_to_overlay(
     *,
     trust_local_score: bool = False,
     removed_trade: dict[str, Any] | None = None,
+    keep_score: bool = False,
 ) -> dict[str, Any] | None:
     """
     Espelha o placar do gateway no Redis/WS e no robot-runtime.
@@ -3480,6 +3482,9 @@ def publish_marketing_score_to_overlay(
         trust_local_score: Se True, publica o placar já em memória sem
             reconciliar com Redis/DB (obrigatório após exclusão — o
             reconcile “nunca rebaixa” desfazia a baixa de WIN/LOSS).
+        removed_trade: Ordem real apagada, para o runtime esquecê-la.
+        keep_score: True quando a ordem é de antes do placar atual: o runtime
+            só a esquece e mantém o placar dele.
 
     Returns:
         Envelope publicado, ou None se o usuário estiver em branco.
@@ -3517,6 +3522,10 @@ def publish_marketing_score_to_overlay(
                     else removed_trade
                 ),
             }
+        if keep_score:
+            # Operação de antes do placar atual: o runtime só a esquece; o
+            # placar dele (que é o vivo) não pode ser trocado pelo daqui.
+            extra["keep_score"] = True
         robot_bus.publish_command(
             normalized,
             "apply_score",
@@ -3692,6 +3701,9 @@ def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
         adopt_live_session_score_if_blank(normalized_user)
         state = auto_trader.get(normalized_user)
         removida = {**trade, "result": result, "profit": profit}
+        if apagada_fora_do_placar(removida, getattr(state, "stop_reset_at", None)):
+            _remove_trade_outside_score(normalized_user, removida, state)
+            return
         if is_synthetic_trade(removida):
             # Linha gerada no Shift+O: está no placar E em `stop_offset_*`; tirar
             # dos dois mantém o stop contando só ordem real.
@@ -3750,6 +3762,38 @@ def apply_marketing_score_removal(user_id: str, trade: dict[str, Any]) -> None:
             normalized_user,
             trade.get("order_id") or trade.get("id"),
         )
+
+
+def _remove_trade_outside_score(user_id: str, removida: dict[str, Any], state: Any) -> None:
+    """Apaga operação de ANTES do último "Reiniciar placar" sem tocar no placar.
+
+    Ela já não contava no placar nem no stop (ver ``apagada_fora_do_placar``).
+    Some do resto como qualquer exclusão (decisão do dono, 30/09): o Histórico
+    e o espelho o chamador já limpou; aqui sai da memória de padrões. Em
+    mode=external quem tem a memória é o runtime: recebe a operação com
+    ``keep_score`` para esquecê-la sem regravar o placar dele.
+    """
+    logger.warning(
+        "[MARKETING_SCORE_REMOVAL_SKIPPED] user_id=%s order_id=%s result=%s "
+        "reason=BEFORE_RESET finished_at=%s stop_reset_at=%s",
+        user_id,
+        removida.get("order_id") or removida.get("id"),
+        removida.get("result"),
+        removida.get("finished_at") or removida.get("created_at"),
+        getattr(state, "stop_reset_at", None),
+    )
+    if is_synthetic_trade(removida):
+        # Linha do Shift+O não é dinheiro nem aprendizado: nada mais a desfazer.
+        return
+    if robot_runtime_mode() != "external":
+        pattern_memory.forget_outcome(
+            user_id,
+            expand_trade_history_analysis(dict(removida))
+            if isinstance(removida.get("analysis_json"), dict)
+            else removida,
+        )
+        return
+    publish_marketing_score_to_overlay(user_id, removed_trade=removida, keep_score=True)
 
 
 def delete_marketing_robot_history_item(

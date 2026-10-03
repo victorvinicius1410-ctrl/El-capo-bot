@@ -95,3 +95,39 @@ def placar_da_regra_atual(score_day: Any) -> bool:
         return True
     dia_do_deploy = PLACAR_CONTINUO_DESDE.astimezone(BRASILIA_TZ).date().isoformat()
     return score_day == dia_do_deploy
+
+
+def momento_da_operacao(trade: dict[str, Any]) -> datetime | None:
+    """Quando a operação terminou, pelo mesmo campo que o placar usa.
+
+    ``finished_at`` é o campo do recálculo do placar e do stop. A linha do
+    Shift+O devolvida pela exclusão em ``marketing_simulated_trades`` só traz
+    ``created_at`` — para ela é o mesmo instante que vai ao espelho.
+
+    Returns:
+        Instante em UTC, ou ``None`` se a operação não tem data legível.
+    """
+    for campo in ("finished_at", "closed_at", "created_at"):
+        momento = _como_datetime(trade.get(campo))
+        if momento is not None:
+            return momento
+    return None
+
+
+def apagada_fora_do_placar(trade: dict[str, Any], stop_reset_at: Any) -> bool:
+    """True se a operação apagada é de antes do placar atual.
+
+    Caso de 02/10/2026: com o placar recém-reiniciado (0x0), apagar no
+    Histórico 4 LOSS de ANTES do reset descontou cada uma do placar zerado —
+    terminou 0x0 com lucro de +81,89 que nunca existiu. Operação fora da janela
+    já não estava no placar nem no stop: apagá-la não pode mexer em nenhum dos
+    dois. (O contador no banco já fazia certo: ``placar_apagar`` só desfaz
+    lançamentos do período atual.)
+
+    Sem data legível a resposta é False — fica o comportamento de antes
+    (desconta), em vez de esconder do placar uma operação que podia estar nele.
+    """
+    momento = momento_da_operacao(trade)
+    if momento is None:
+        return False
+    return not conta_no_placar(momento, stop_reset_at)

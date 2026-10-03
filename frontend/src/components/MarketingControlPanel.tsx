@@ -36,6 +36,7 @@ import {
 } from "@/lib/marketingPanelTabs";
 import { applyRobotSessionScoreToCache, ROBOT_STATE_QUERY_KEY } from "@/hooks/useLiveTradingData";
 import { ROBOT_HISTORY_QUERY_KEY, ROBOT_STATS_QUERY_KEY } from "@/hooks/useRobotHistory";
+import { deletedTradeCountsInScore } from "@/lib/robotState";
 
 interface MarketingControlPanelProps {
   open: boolean;
@@ -333,7 +334,12 @@ export function MarketingControlPanel({
     onSuccess: async (tradeId) => {
       if (userId) {
         const removed = history.data?.find((trade) => trade.id === tradeId);
-        if (removed) {
+        // Operação de antes do último "Reiniciar placar" já não está no placar.
+        const stopResetAt = queryClient.getQueryData<{ stop_reset_at?: string | null }>([
+          ...ROBOT_STATE_QUERY_KEY,
+          userId,
+        ])?.stop_reset_at;
+        if (removed && deletedTradeCountsInScore(removed.created_at, stopResetAt)) {
           applyRobotSessionScoreToCache(
             queryClient,
             userId,

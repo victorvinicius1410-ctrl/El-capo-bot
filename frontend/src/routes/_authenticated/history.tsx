@@ -52,6 +52,7 @@ import { computeRobotStatsFromItems, filterHistoryByRange } from "@/lib/dashboar
 import { formatBrasiliaDateTime } from "@/lib/brasiliaTime";
 import { rangeFromPreset, type DateRangeValue } from "@/lib/dateRange";
 import { filterStudyHistory, isStudyActive, studyHiddenNotice } from "@/lib/studyMode";
+import { deletedTradeCountsInScore } from "@/lib/robotState";
 
 export const Route = createFileRoute("/_authenticated/history")({
   head: () => ({ meta: [{ title: "Histórico - ElCapo AutoBot" }] }),
@@ -88,13 +89,22 @@ function HistoryPage() {
     marketingPanelOpen && isMarketingSimulationAccount(access.data);
 
   const deleteTrade = useMutation({
-    mutationFn: async (payload: { tradeId: string; result?: string; profit?: number }) => {
+    mutationFn: async (payload: {
+      tradeId: string;
+      result?: string;
+      profit?: number;
+      finishedAt?: string | null;
+    }) => {
       const response = await marketingDeleteTrade(payload.tradeId);
       if (!response.ok) throw new ApiError(response.error, response.code, response.status);
       return payload;
     },
     onSuccess: async (payload) => {
-      if (user?.id) {
+      // Operação de antes do último "Reiniciar placar" já não está no placar.
+      if (
+        user?.id &&
+        deletedTradeCountsInScore(payload.finishedAt, robotState.data?.stop_reset_at)
+      ) {
         applyRobotSessionScoreToCache(
           queryClient,
           user.id,
@@ -243,6 +253,7 @@ function HistoryPage() {
                         tradeId,
                         result: item.result,
                         profit: item.profit,
+                        finishedAt: item.finishedAt ?? item.createdAt,
                       });
                     }
                   }}

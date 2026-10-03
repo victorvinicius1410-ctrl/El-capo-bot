@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   getStoppedRobotState,
+  deletedTradeCountsInScore,
   mergeRobotSessionScore,
   optimisticScoreReset,
   preserveRobotSessionScore,
@@ -216,5 +217,31 @@ describe("optimisticScoreReset", () => {
     assert.equal(merged.wins, 0);
     assert.equal(merged.losses, 0);
     assert.equal(merged.profit, 0);
+  });
+});
+
+describe("deletedTradeCountsInScore", () => {
+  const reset = "2026-10-02T18:18:39.000Z";
+
+  it("operação de antes do Reiniciar placar não sai do placar (caso de 02/10)", () => {
+    // 4 LOSS apagados depois do reset viravam 0x0 com +81,89.
+    assert.equal(deletedTradeCountsInScore("2026-10-02T17:40:00.000Z", reset), false);
+  });
+
+  it("operação depois do reset sai do placar", () => {
+    assert.equal(deletedTradeCountsInScore("2026-10-02T18:30:00.000Z", reset), true);
+    assert.equal(deletedTradeCountsInScore(reset, reset), true);
+  });
+
+  it("sem reset, a janela começa no placar contínuo (01/10)", () => {
+    assert.equal(deletedTradeCountsInScore("2026-09-29T12:00:00.000Z", null), false);
+    assert.equal(deletedTradeCountsInScore("2026-10-01T12:00:00.000Z", null), true);
+    // Reset antigo, de antes da regra, também cai em 01/10 (igual ao servidor).
+    assert.equal(deletedTradeCountsInScore("2026-09-29T12:00:00.000Z", "2026-09-20T00:00:00Z"), false);
+  });
+
+  it("sem data, desconta como antes", () => {
+    assert.equal(deletedTradeCountsInScore(undefined, reset), true);
+    assert.equal(deletedTradeCountsInScore("lixo", reset), true);
   });
 });

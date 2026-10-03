@@ -455,13 +455,19 @@ async def _handle_command(gateway: object, payload: dict) -> None:
                 payload,
             )
             return
+        # Ordem apagada de ANTES do último "Reiniciar placar": já não estava no
+        # placar. Só sai da memória; o placar daqui (o vivo) fica como está —
+        # sobrescrevê-lo com o número do gateway podia trazer de volta um
+        # placar atrasado (02/10/2026).
+        manter_placar = bool(payload.get("keep_score"))
         if isinstance(removida, dict) and removida.get("order_id"):
             # Ordem REAL apagada no Shift+O some de tudo (decisão do dono,
             # 30/09): placar real (sem `stop_offset_*`, então o stop também
             # deixa de contar), histórico em memória e memória de padrões.
             apagar_operacao_do_runtime(gateway, user_id, removida)
-            state.wins, state.losses, state.profit = wins, losses, round(profit, 2)
-        else:
+            if not manter_placar:
+                state.wins, state.losses, state.profit = wins, losses, round(profit, 2)
+        elif not manter_placar:
             # Placar do Shift+O é vitrine: a diferença vai para
             # `stop_offset_*` e o stop segue contando só ordem real. Sem isso
             # um "gerar placar" 8x2 disparava STOP_WIN_HIT (10/09 19:53).
@@ -484,7 +490,7 @@ async def _handle_command(gateway: object, payload: dict) -> None:
         # republicaria o placar antigo se um restore/reconcile promovesse a
         # persistência atrasada antes do próximo comando.
         mark_authority = getattr(gateway, "mark_session_score_authority", None)
-        if callable(mark_authority):
+        if callable(mark_authority) and not manter_placar:
             try:
                 mark_authority(user_id, state.wins, state.losses, state.profit)
             except Exception:

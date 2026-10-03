@@ -828,6 +828,36 @@ export function preserveRobotSessionScore(
 }
 
 /**
+ * Início da regra do placar contínuo (01/10/2026 00:00 em Brasília). Espelho de
+ * `PLACAR_CONTINUO_DESDE` em `backend/placar_janela.py`: quem nunca reiniciou
+ * conta a partir daqui.
+ */
+export const PLACAR_CONTINUO_DESDE_MS = Date.parse("2026-10-01T03:00:00Z");
+
+/**
+ * Diz se a operação apagada estava no placar exibido — e por isso sai dele.
+ *
+ * Mesma regra do servidor (`apagada_fora_do_placar`): conta quem terminou a
+ * partir do último "Reiniciar placar". Em 02/10/2026 apagar 4 LOSS de ANTES
+ * do reset descontou cada um do placar zerado: 0x0 com lucro de +81,89.
+ * Sem data legível, desconta (comportamento de antes).
+ *
+ * @param finishedAt - Fim da operação (ou a criação, na linha do Shift+O)
+ * @param stopResetAt - `stop_reset_at` do estado exibido
+ */
+export function deletedTradeCountsInScore(
+  finishedAt: string | null | undefined,
+  stopResetAt: string | null | undefined,
+): boolean {
+  const fim = Date.parse(String(finishedAt ?? ""));
+  if (!Number.isFinite(fim)) return true;
+  const reset = Date.parse(String(stopResetAt ?? ""));
+  const inicio =
+    Number.isFinite(reset) && reset >= PLACAR_CONTINUO_DESDE_MS ? reset : PLACAR_CONTINUO_DESDE_MS;
+  return fim >= inicio;
+}
+
+/**
  * Estado exibido no instante do clique em "Reiniciar placar".
  *
  * O painel zera na hora, sem esperar o servidor (02/10/2026: o clique só fazia

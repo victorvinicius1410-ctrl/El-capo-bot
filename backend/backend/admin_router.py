@@ -1483,6 +1483,15 @@ def create_admin_router(
                     removed_robot = True
                     if trade_meta is None and isinstance(removed, dict):
                         trade_meta = removed
+                    elif (
+                        trade_meta is not None
+                        and isinstance(removed, dict)
+                        and not trade_meta.get("finished_at")
+                        and removed.get("finished_at")
+                    ):
+                        # A linha do Shift+O só tem `created_at`; o placar
+                        # decide pela data de fim do espelho (`finished_at`).
+                        trade_meta["finished_at"] = removed["finished_at"]
 
         if trade_meta is None and not deleted_marketing and not removed_robot:
             # Idempotente: duplo clique / cache stale após exclusão bem-sucedida.
