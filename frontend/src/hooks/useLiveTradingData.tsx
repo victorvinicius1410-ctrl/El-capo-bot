@@ -11,6 +11,7 @@ import {
   isRobotOperationRunning,
   mergeRobotSessionScore,
   normalizeRobotState,
+  optimisticScoreReset,
   preserveRobotSessionScore,
   registerRobotStateFailure,
   resetRobotStateBackoff,
@@ -186,6 +187,46 @@ export function revertOptimisticOperation(
   if (previous) {
     queryClient.setQueryData([...ROBOT_STATE_QUERY_KEY, userId], previous);
   }
+}
+
+/**
+ * Zera o placar na tela no clique de "Reiniciar placar", sem esperar o servidor.
+ *
+ * Devolve o estado de antes para {@link revertOptimisticScoreReset} desfazer se
+ * o servidor recusar.
+ */
+export function applyOptimisticScoreReset(
+  queryClient: QueryClient,
+  userId: string,
+): RobotState | undefined {
+  const key = [...ROBOT_STATE_QUERY_KEY, userId];
+  const previous = queryClient.getQueryData<RobotState>(key);
+  if (previous) {
+    // "Reiniciar placar" substitui qualquer baixa anterior (mesma regra da
+    // resposta do servidor em `commitRobotStateToCache`).
+    clearSessionScoreAuthority(userId);
+    queryClient.setQueryData(key, optimisticScoreReset(previous, new Date().toISOString()));
+  }
+  return previous;
+}
+
+/** O servidor recusou o reset: o placar de antes volta para a tela. */
+export function revertOptimisticScoreReset(
+  queryClient: QueryClient,
+  userId: string,
+  previous: RobotState | undefined,
+): void {
+  if (!previous) return;
+  const key = [...ROBOT_STATE_QUERY_KEY, userId];
+  const current = queryClient.getQueryData<RobotState>(key);
+  // Só o placar volta: o resto do estado pode ter andado por WS no meio tempo.
+  queryClient.setQueryData(key, {
+    ...(current ?? previous),
+    wins: previous.wins,
+    losses: previous.losses,
+    profit: previous.profit,
+    stop_reset_at: previous.stop_reset_at,
+  });
 }
 
 /**

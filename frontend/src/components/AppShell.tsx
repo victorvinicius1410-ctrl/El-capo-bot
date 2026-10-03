@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -66,8 +66,10 @@ import { TRIAL_DISCOUNT, formatTrialRemaining, remainingMs } from "@/lib/trial";
 import { useAuth, type AuthUser } from "@/lib/useAuth";
 import {
   applyOptimisticOperation,
+  applyOptimisticScoreReset,
   applyRobotMutationToCache,
   revertOptimisticOperation,
+  revertOptimisticScoreReset,
   LiveTradingDataProvider,
   useLiveTradingData,
 } from "@/hooks/useLiveTradingData";
@@ -165,6 +167,7 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const resettingRef = useRef(false);
   const [modelWins, setModelWins] = useState(0);
   const [modelCycleStartedAt, setModelCycleStartedAt] = useState(() => Date.now());
   const [modelResult, setModelResult] = useState<{ at: number; wins: number } | null>(null);
@@ -287,8 +290,16 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
    * este clique, alguns segundos antes do start.
    */
   async function confirmResetScore(): Promise<void> {
-    if (!apiConfig.BASE_URL || resetting || adminModelMode) return;
+    // Ref, não só o estado: dois toques no mesmo quadro (duplo clique no
+    // "Reiniciar") passavam pelo `resetting` antes de o React re-renderizar.
+    if (!apiConfig.BASE_URL || resettingRef.current || adminModelMode) return;
+    resettingRef.current = true;
     setResetting(true);
+    // Instantâneo: o diálogo fecha e o placar zera no clique; o servidor
+    // confirma por trás. Antes a tela só mudava na volta do POST e, em rede
+    // lenta, o usuário clicava de novo (02/10/2026: 6 resets em 25 s).
+    setResetDialogOpen(false);
+    const anterior = userId ? applyOptimisticScoreReset(queryClient, userId) : undefined;
     try {
       const response = await robotResetScore();
       if (!response.ok) throw new ApiError(response.error, response.code);
@@ -302,11 +313,12 @@ function FloatingRobot({ userId }: { userId?: string | null }) {
       void robotState.refetch();
       toast.success("Placar reiniciado");
     } catch (error) {
+      if (userId) revertOptimisticScoreReset(queryClient, userId, anterior);
       const message = error instanceof Error ? error.message : "Não foi possível reiniciar o placar.";
       toast.error(message);
     } finally {
+      resettingRef.current = false;
       setResetting(false);
-      setResetDialogOpen(false);
     }
   }
 

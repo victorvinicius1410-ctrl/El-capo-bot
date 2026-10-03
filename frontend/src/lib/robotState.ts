@@ -828,6 +828,25 @@ export function preserveRobotSessionScore(
 }
 
 /**
+ * Estado exibido no instante do clique em "Reiniciar placar".
+ *
+ * O painel zera na hora, sem esperar o servidor (02/10/2026: o clique só fazia
+ * efeito na volta do POST; em rede lenta o usuário clicava de novo — 6 vezes
+ * em 25 s num caso). O `stop_reset_at` de agora é o que faz
+ * `preserveRobotSessionScore` descartar o snapshot atrasado que ainda traz o
+ * placar antigo enquanto a resposta não chega.
+ *
+ * @param previous - Estado já exibido
+ * @param nowIso - Instante do clique (ISO-8601)
+ * @returns Estado com placar 0-0 e a marca do reset
+ */
+export function optimisticScoreReset<
+  T extends Pick<RobotState, "wins" | "losses" | "profit" | "stop_reset_at">,
+>(previous: T, nowIso: string): T {
+  return { ...previous, wins: 0, losses: 0, profit: 0, stop_reset_at: nowIso };
+}
+
+/**
  * Grava o placar do Shift+O no estado já exibido no overlay.
  *
  * O generate/create do painel marketing não passa por POST /robot/*; sem

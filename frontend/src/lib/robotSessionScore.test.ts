@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   getStoppedRobotState,
   mergeRobotSessionScore,
+  optimisticScoreReset,
   preserveRobotSessionScore,
   SESSION_SCORE_RESET_GUARD_MS,
 } from "./robotState.ts";
@@ -179,6 +180,39 @@ describe("preserveRobotSessionScore", () => {
       { wins: 1, losses: 1, profit: -10 },
       { subtract: true },
     );
+    assert.equal(merged.wins, 0);
+    assert.equal(merged.losses, 0);
+    assert.equal(merged.profit, 0);
+  });
+});
+
+describe("optimisticScoreReset", () => {
+  it("zera o placar no clique e marca o instante do reset", () => {
+    const previous = { ...getStoppedRobotState(), wins: 1, losses: 4, profit: -64.12 };
+    const zerado = optimisticScoreReset(previous, "2026-10-02T18:18:39.000Z");
+    assert.equal(zerado.wins, 0);
+    assert.equal(zerado.losses, 0);
+    assert.equal(zerado.profit, 0);
+    assert.equal(zerado.stop_reset_at, "2026-10-02T18:18:39.000Z");
+    assert.equal(previous.losses, 4);
+  });
+
+  it("snapshot atrasado não devolve o placar antigo antes de o servidor responder", () => {
+    // Caso de 02/10/2026: placar 1x4, reset pedido, e o WS ainda entrega o
+    // snapshot de antes do reset enquanto o POST não volta.
+    const clique = Date.parse("2026-10-02T18:18:39.000Z");
+    const exibido = optimisticScoreReset(
+      { ...getStoppedRobotState(), wins: 1, losses: 4, profit: -64.12, stop_reset_at: "2026-10-02T15:18:08.000Z" },
+      new Date(clique).toISOString(),
+    );
+    const atrasado = {
+      ...getStoppedRobotState(),
+      wins: 1,
+      losses: 4,
+      profit: -64.12,
+      stop_reset_at: "2026-10-02T15:18:08.000Z",
+    };
+    const merged = preserveRobotSessionScore(exibido, atrasado, { now: clique + 800 });
     assert.equal(merged.wins, 0);
     assert.equal(merged.losses, 0);
     assert.equal(merged.profit, 0);

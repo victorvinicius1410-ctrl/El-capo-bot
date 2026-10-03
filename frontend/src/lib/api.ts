@@ -1,11 +1,15 @@
 import { resolveApiBaseUrl } from "./apiBaseUrl";
-import { withAuthRefreshRetry } from "./authSessionKeepAlive";
 import {
   clearSessionIdentityCache,
   readSessionIdentityCache,
   sessionIdentityCacheTtlMs,
   writeSessionIdentityCache,
 } from "./sessionIdentityCache";
+import {
+  createSessionIdentityResolver,
+  singleFlight,
+  type SessionIdentityRead,
+} from "./sessionIdentityResolver";
 import { clearAuthSnapshot, refreshAuthSession, renewAuthSessionCookies } from "./useAuth";
 
 export const apiConfig = {
@@ -364,27 +368,37 @@ export function isKnownApiErrorCode(code: string | undefined | null): boolean {
 
 const PANEL_API_KEY = import.meta.env.VITE_PANEL_API_KEY ?? "";
 
-async function readSessionIdentityOnce(): Promise<{ userId: string; email: string | null } | null> {
-  if (!apiConfig.BASE_URL) return null;
+async function readSessionIdentityOnce(): Promise<SessionIdentityRead> {
+  if (!apiConfig.BASE_URL) return { kind: "anonymous" };
   try {
     const response = await fetch(`${apiConfig.BASE_URL}/auth/session`, {
       credentials: "include",
       headers: { "x-request-id": requestId() },
     });
-    if (!response.ok) return null;
+    // 5xx/502 do proxy é "não consegui perguntar", não "sessão inválida".
+    if (response.status >= 500) return { kind: "unreachable" };
+    if (!response.ok) return { kind: "anonymous" };
     const body = (await response.json()) as {
       ok?: boolean;
       data?: { authenticated?: boolean; user?: { id?: string | number; email?: string | null } };
     };
-    if (!body?.ok || !body.data?.authenticated || body.data.user?.id == null) return null;
+    if (!body?.ok || !body.data?.authenticated || body.data.user?.id == null) {
+      return { kind: "anonymous" };
+    }
     return {
-      userId: String(body.data.user.id),
-      email: body.data.user.email ? String(body.data.user.email) : null,
+      kind: "ok",
+      identity: {
+        userId: String(body.data.user.id),
+        email: body.data.user.email ? String(body.data.user.email) : null,
+      },
     };
   } catch {
-    return null;
+    return { kind: "unreachable" };
   }
 }
+
+/** Uma renovação de cookies por vez, mesmo com vários 401 simultâneos. */
+const renewSessionOnce = singleFlight(renewAuthSessionCookies);
 
 /**
  * Lê a identidade da sessão; se o access expirou, tenta POST /auth/refresh uma vez.
@@ -393,14 +407,19 @@ async function readSessionIdentityOnce(): Promise<{ userId: string; email: strin
  * entre Max-Age do cookie e a primeira leitura falha.
  *
  * Cache em memória (TTL curto) evita um round-trip de `/auth/session` em toda
- * `apiRequest` — crítico na navegação admin e no polling do robô.
+ * `apiRequest` — crítico na navegação admin e no polling do robô. Chamadas
+ * simultâneas dividem UMA leitura, e rede fora do ar não vira "não
+ * autenticado" (ver `sessionIdentityResolver`).
  */
-async function getSessionIdentity(): Promise<{ userId: string; email: string | null } | null> {
-  const cached = readSessionIdentityCache();
-  if (cached !== undefined) return cached;
-  const identity = await withAuthRefreshRetry(readSessionIdentityOnce, renewAuthSessionCookies);
-  writeSessionIdentityCache(identity, sessionIdentityCacheTtlMs());
-  return identity;
+const sessionIdentityResolver = createSessionIdentityResolver({
+  read: readSessionIdentityOnce,
+  renew: renewSessionOnce,
+  readCache: () => readSessionIdentityCache(),
+  writeCache: (value) => writeSessionIdentityCache(value, sessionIdentityCacheTtlMs()),
+});
+
+function getSessionIdentity(): Promise<{ userId: string; email: string | null } | null> {
+  return sessionIdentityResolver.resolve();
 }
 
 function shouldAttachIdentityHeaders(path: string): boolean {
@@ -426,22 +445,31 @@ export async function apiRequest<T = unknown>(
   }
   try {
     const attachIdentity = shouldAttachIdentityHeaders(path);
-    const response = await fetch(`${apiConfig.BASE_URL}${path}`, {
-      credentials: "include",
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...(init.headers ?? {}),
-        ...(attachIdentity
-          ? {
-              "x-api-key": PANEL_API_KEY,
-              "x-user-id": identity.userId,
-              ...(identity.email ? { "x-user-email": identity.email } : {}),
-            }
-          : {}),
-        "x-request-id": requestId(),
-      },
-    });
+    const send = () =>
+      fetch(`${apiConfig.BASE_URL}${path}`, {
+        credentials: "include",
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init.headers ?? {}),
+          ...(attachIdentity
+            ? {
+                "x-api-key": PANEL_API_KEY,
+                "x-user-id": identity.userId,
+                ...(identity.email ? { "x-user-email": identity.email } : {}),
+              }
+            : {}),
+          "x-request-id": requestId(),
+        },
+      });
+    let response = await send();
+    // Access token venceu entre a leitura da identidade e esta chamada (aba
+    // parada há mais de 1h): renova e repete UMA vez. O 401 sai da checagem de
+    // autenticação, antes de a rota executar, então repetir um POST é seguro.
+    // Sem isto o primeiro clique voltava com erro e só o segundo funcionava.
+    if (response.status === 401 && (await renewSessionOnce())) {
+      response = await send();
+    }
     const text = await response.text();
     const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
     const nested = typeof body.error === "object" && body.error

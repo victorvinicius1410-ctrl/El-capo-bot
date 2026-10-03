@@ -62,6 +62,9 @@ async function fetchSessionUser(bypassCache = false): Promise<AuthUser | null> {
     credentials: "include",
     headers: { "x-request-id": crypto.randomUUID() },
   });
+  // 5xx é o gateway reiniciando (deploy), não "sessão inválida": gravar null
+  // aqui deslogava o painel na tela e travava toda chamada por 2 minutos.
+  if (response.status >= 500) throw new Error("AUTH_SESSION_UNREACHABLE");
   if (!response.ok) {
     writeSessionIdentityCache(null, sessionIdentityCacheTtlMs());
     return null;

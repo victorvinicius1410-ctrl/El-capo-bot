@@ -73,14 +73,13 @@ class SupabaseUserStoreTests(unittest.TestCase):
             request=request,
             text='{"code":"PGRST204","message":"Could not find last_connected_at"}',
         )
+        # O store mantém UM cliente aberto (conexão reaproveitada) em vez de
+        # abrir um por chamada com `with`.
         client = Mock()
         client.request.return_value = response
-        context = Mock()
-        context.__enter__ = Mock(return_value=client)
-        context.__exit__ = Mock(return_value=False)
 
         with (
-            patch("backend.user_store.httpx.Client", return_value=context),
+            patch("backend.user_store.httpx.Client", return_value=client),
             self.assertLogs("backend-gateway", level="WARNING") as logs,
             self.assertRaises(httpx.HTTPStatusError),
         ):

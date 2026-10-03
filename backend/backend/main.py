@@ -6073,15 +6073,66 @@ def build_insufficient_balance_start_response(state: Any, *, message: str) -> di
     }
 
 
+# Poll do painel sem ida síncrona ao Supabase (02/10/2026).
+#
+# `/bullex/account` e `/bullex/status` são pedidos a cada 25 s por painel aberto
+# e cada um fazia de 2 a 4 chamadas HTTPS SÍNCRONAS ao Supabase dentro do event
+# loop do gateway: "tem senha salva?", "qual o email?" e um upsert da MESMA
+# linha de `bullex_connections`. São ~80 ms cada, com o gateway inteiro parado
+# — o py-spy mostrou essas três como as maiores ocupações do loop, e o nginx
+# registrou rotas diferentes terminando juntas depois de 1,5 s. O clique em
+# Iniciar/Reiniciar placar que caísse nessa janela esperava atrás.
+#
+# Os três valores quase nunca mudam, então ficam lembrados por pouco tempo e
+# são esquecidos na hora em que o próprio gateway os altera (conectar,
+# desconectar, salvar ou apagar credencial).
+BULLEX_CREDENTIALS_META_TTL_SECONDS = float(os.getenv("BULLEX_CREDENTIALS_META_TTL_SECONDS", "45"))
+BULLEX_CONNECTION_SYNC_TTL_SECONDS = float(os.getenv("BULLEX_CONNECTION_SYNC_TTL_SECONDS", "60"))
+# Campo que muda a cada poll por construção (`now()`): fora da comparação, ele
+# só é regravado junto com a batida de BULLEX_CONNECTION_SYNC_TTL_SECONDS.
+_CONNECTION_SYNC_VOLATILE_FIELDS = frozenset({"last_connected_at"})
+_credentials_saved_memo: dict[str, tuple[float, bool]] = {}
+_stored_bullex_email_memo: dict[str, tuple[float, str | None]] = {}
+_connection_sync_memo: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def forget_bullex_store_memo(user_id: str) -> None:
+    """Esquece o que foi lembrado do Supabase para este usuário.
+
+    Chamar sempre que o gateway muda conexão ou credencial: a resposta
+    seguinte do painel tem de vir do banco, não da memória.
+    """
+    _credentials_saved_memo.pop(user_id, None)
+    _stored_bullex_email_memo.pop(user_id, None)
+    _connection_sync_memo.pop(user_id, None)
+
+
 def credentials_saved_flag(user_id: str) -> bool:
     """Indica se o usuário tem senha Bullex criptografada salva (sem expor segredo)."""
     if bullex_credentials_service is None:
         return False
+    cached = _credentials_saved_memo.get(user_id)
+    if cached is not None and monotonic() - cached[0] < BULLEX_CREDENTIALS_META_TTL_SECONDS:
+        return cached[1]
     try:
-        return bullex_credentials_service.has_saved(user_id)
+        saved = bool(bullex_credentials_service.has_saved(user_id))
     except Exception:
+        # Falha não é lembrada: a próxima chamada pergunta de novo.
         logger.warning("[BULLEX_CREDENTIALS_FLAG_FAILED] user_id=%s", user_id, exc_info=True)
         return False
+    _credentials_saved_memo[user_id] = (monotonic(), saved)
+    return saved
+
+
+def stored_bullex_email(user_id: str) -> str | None:
+    """Email da corretora guardado no Supabase, lembrado por pouco tempo."""
+    cached = _stored_bullex_email_memo.get(user_id)
+    if cached is not None and monotonic() - cached[0] < BULLEX_CREDENTIALS_META_TTL_SECONDS:
+        return cached[1]
+    record = user_store.get_user(user_id)
+    email = (record.bullex_email or None) if record else None
+    _stored_bullex_email_memo[user_id] = (monotonic(), email)
+    return email
 
 
 def persist_bullex_credentials(user_id: str, email: str | None, password: str | None) -> None:
@@ -6096,6 +6147,8 @@ def persist_bullex_credentials(user_id: str, email: str | None, password: str | 
         bullex_credentials_service.save(user_id, clean_email, clean_password)
     except Exception:
         logger.warning("[BULLEX_CREDENTIALS_SAVE_FAILED] user_id=%s", user_id, exc_info=True)
+    finally:
+        forget_bullex_store_memo(user_id)
 
 
 def attach_credentials_meta(payload: dict[str, Any], user_id: str) -> dict[str, Any]:
@@ -6106,9 +6159,9 @@ def attach_credentials_meta(payload: dict[str, Any], user_id: str) -> dict[str, 
     data["credentials_saved"] = credentials_saved_flag(user_id)
     if not data.get("email"):
         try:
-            record = user_store.get_user(user_id)
-            if record and record.bullex_email:
-                data["email"] = record.bullex_email
+            email = stored_bullex_email(user_id)
+            if email:
+                data["email"] = email
         except Exception:
             logger.warning("[BULLEX_CREDENTIALS_EMAIL_LOOKUP_FAILED] user_id=%s", user_id, exc_info=True)
     payload["data"] = data
@@ -6497,6 +6550,7 @@ def sync_user_store_from_payload(
     try:
         if not payload.get("ok"):
             if payload.get("error") in {SESSION_DISCONNECTED, SESSION_NOT_FOUND}:
+                forget_bullex_store_memo(user_id)
                 user_store.disconnect(user_id)
             return
 
@@ -6507,9 +6561,26 @@ def sync_user_store_from_payload(
         updates = build_connection_payload(data, fallback_email)
         if updates:
             if is_new_connection:
+                forget_bullex_store_memo(user_id)
                 user_store.save_connection(user_id, updates)
             else:
+                # O poll do painel repete os mesmos dados a cada 25 s: gravar de
+                # novo é um upsert síncrono por nada. Só grava quando algo mudou
+                # (saldo depois de uma ordem, moeda, conta) ou na batida do TTL.
+                stable = {
+                    key: value
+                    for key, value in updates.items()
+                    if key not in _CONNECTION_SYNC_VOLATILE_FIELDS
+                }
+                last = _connection_sync_memo.get(user_id)
+                if (
+                    last is not None
+                    and last[1] == stable
+                    and monotonic() - last[0] < BULLEX_CONNECTION_SYNC_TTL_SECONDS
+                ):
+                    return
                 user_store.update_connection(user_id, updates)
+                _connection_sync_memo[user_id] = (monotonic(), stable)
     except Exception as exc:
         logger.warning(
             "[SUPABASE PERSISTENCE WARNING] user_id=%s operation=bullex_connection error=%s",
@@ -6522,6 +6593,7 @@ def mark_disconnected_from_payload(user_id: str, payload: dict[str, Any]) -> Non
     payload = normalize_service_payload(payload)
     if payload.get("error") not in {SESSION_DISCONNECTED, SESSION_NOT_FOUND}:
         return
+    forget_bullex_store_memo(user_id)
     try:
         user_store.disconnect(user_id)
     except Exception:
@@ -18925,6 +18997,7 @@ async def bullex_disconnect(auth: dict[str, str] = Depends(require_headers)) -> 
     await stop_robot_worker(user_id)
     await manager.disconnect_user(user_id)
     # Sempre limpa o snapshot local — evita GET /account restaurar "conectado" após o clique.
+    forget_bullex_store_memo(user_id)
     try:
         user_store.disconnect(user_id)
     except Exception:
@@ -18944,6 +19017,8 @@ async def bullex_disconnect(auth: dict[str, str] = Depends(require_headers)) -> 
                 user_id,
                 exc_info=True,
             )
+    # De novo depois de apagar: um poll no meio poderia ter relembrado "tem senha".
+    forget_bullex_store_memo(user_id)
     # NÃO usar mark_session_failure(force_offline): ele preservava /account REAL
     # e o painel voltava para Conectado com email/saldo "—".
     apply_manual_disconnect_session_state(user_id)
@@ -18998,6 +19073,7 @@ async def bullex_credentials_forget(
 ) -> JSONResponse:
     """Esquece email/senha Bullex salvos (esquecimento explícito do cliente)."""
     user_id = auth["user_id"]
+    forget_bullex_store_memo(user_id)
     if bullex_credentials_service is not None:
         try:
             bullex_credentials_service.clear(user_id)

@@ -34,3 +34,6 @@ dist-ssr
 *.sln
 *.sw?
 .vercel
+
+# Id da publicação (gerado no build; ver vite.config.ts)
+.build-id

@@ -23,6 +23,8 @@ import { isBenignRouteLoadError, isQueryCancellationError } from "@/lib/queryCan
 import { clearRejectionMemory } from "@/lib/robotPresentation";
 import { resetRobotSettingsState } from "@/lib/robotSettings";
 import { useAuth } from "@/lib/useAuth";
+import { isChunkLoadError } from "@/lib/appVersion";
+import { reloadForMissingChunk, useAppVersionWatcher } from "@/hooks/useAppVersionWatcher";
 import { cn } from "@/lib/utils";
 import appCss from "@/styles.css?url";
 
@@ -109,6 +111,17 @@ function RootComponent() {
     window.addEventListener("unhandledrejection", onRejection);
     return () => window.removeEventListener("unhandledrejection", onRejection);
   }, []);
+
+  // Aba aberta há dias pede chunk de uma publicação que já foi apagada: sem
+  // isto o clique (menu, aba de configuração) simplesmente não fazia nada.
+  useEffect(() => {
+    const onPreloadError = (event: Event) => {
+      if (reloadForMissingChunk()) event.preventDefault();
+    };
+    window.addEventListener("vite:preloadError", onPreloadError);
+    return () => window.removeEventListener("vite:preloadError", onPreloadError);
+  }, []);
+  useAppVersionWatcher();
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -287,6 +300,11 @@ function RootErrorComponent({ error, reset }: ErrorComponentProps) {
 
   // CancelledError / rejeição vazia não são falha de produto — costumam vir do
   // bind da sessão. Recarrega a rota em vez de prender o usuário na tela azul.
+  useEffect(() => {
+    // Chunk apagado por uma publicação nova: a página inteira precisa vir de novo.
+    if (isChunkLoadError(error)) reloadForMissingChunk();
+  }, [error]);
+
   useEffect(() => {
     if (!isBenign) return;
     console.warn("[ROOT_ERROR_BENIGN_RECOVERY]", error ?? "nullish");
